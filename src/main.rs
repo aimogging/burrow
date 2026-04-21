@@ -12,9 +12,10 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use wgnat::config;
+use wgnat::icmp::IcmpForwarder;
 use wgnat::nat::{NatKey, NatTable};
 use wgnat::proxy::{spawn_tcp_proxy, ProxyMsg};
-use wgnat::rewrite::{self, PROTO_TCP, PROTO_UDP};
+use wgnat::rewrite::{self, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent, SmoltcpHandle};
 use wgnat::tunnel::WgTunnel;
 use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
@@ -85,17 +86,23 @@ async fn main() -> Result<()> {
     // task sends them to (original_dst_ip, local_port) and pushes responses
     // (as fully formed IPv4+UDP packets) onto `udp_outbound_tx`.
     let udp_proxies: UdpProxyMap = Arc::new(Mutex::new(HashMap::new()));
-    let (udp_outbound_tx, mut udp_outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let udp_egress = tokio::spawn({
+    // Single shared egress channel for both UDP and ICMP — they both want to
+    // emit fully formed IPv4 packets back through the tunnel.
+    let (egress_tx, mut egress_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let direct_egress = tokio::spawn({
         let tunnel = Arc::clone(&tunnel);
         async move {
-            while let Some(pkt) = udp_outbound_rx.recv().await {
+            while let Some(pkt) = egress_rx.recv().await {
                 if let Err(e) = tunnel.send_packet(&pkt).await {
-                    warn!(error = %e, "udp egress tunnel send");
+                    warn!(error = %e, "direct egress tunnel send");
                 }
             }
         }
     });
+
+    // Probe at startup; logs which mode we're in and (if Raw) spawns the
+    // raw-socket reader + pending sweeper.
+    let icmp = Arc::new(IcmpForwarder::probe(egress_tx.clone()));
 
     // Spawn the smoltcp egress drainer: pulls packets out of smoltcp's tx
     // queue, runs the source rewrite, encapsulates, sends through WG.
@@ -188,7 +195,8 @@ async fn main() -> Result<()> {
                             &smoltcp,
                             &nat,
                             &udp_proxies,
-                            &udp_outbound_tx,
+                            &egress_tx,
+                            &icmp,
                         ).await;
                     }
                     Ok(None) => { /* control plane */ }
@@ -201,7 +209,7 @@ async fn main() -> Result<()> {
     egress.abort();
     event_loop.abort();
     sweep.abort();
-    udp_egress.abort();
+    direct_egress.abort();
     result
 }
 
@@ -213,7 +221,8 @@ async fn ingest_tunnel_packet(
     smoltcp: &SmoltcpHandle,
     nat: &Arc<NatTable>,
     udp_proxies: &UdpProxyMap,
-    udp_outbound_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    egress_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    icmp: &Arc<IcmpForwarder>,
 ) {
     let view = match rewrite::parse_5tuple(&packet) {
         Ok(v) => v,
@@ -258,7 +267,7 @@ async fn ingest_tunnel_packet(
             let tx = {
                 let mut map = udp_proxies.lock().await;
                 map.entry(key)
-                    .or_insert_with(|| spawn_udp_proxy(key, udp_outbound_tx.clone()))
+                    .or_insert_with(|| spawn_udp_proxy(key, egress_tx.clone()))
                     .clone()
             };
             if tx.send(payload).is_err() {
@@ -267,8 +276,11 @@ async fn ingest_tunnel_packet(
                 udp_proxies.lock().await.remove(&key);
             }
         }
+        PROTO_ICMP => {
+            icmp.handle_inbound(packet).await;
+        }
         other => {
-            debug!(proto = other, "non-TCP/UDP tunnel packet (Phase 6 stub: dropping)");
+            debug!(proto = other, "unsupported proto, dropping");
         }
     }
 }
