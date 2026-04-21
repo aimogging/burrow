@@ -18,13 +18,12 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 
 use crate::rewrite::{parse_5tuple, PROTO_ICMP};
 use crate::udp_proxy::PacketSink;
@@ -122,7 +121,7 @@ impl RawForwarder {
         let id = u16::from_be_bytes([icmp[4], icmp[5]]);
         let seq = u16::from_be_bytes([icmp[6], icmp[7]]);
         // Register pending so the reply can be matched.
-        self.pending.lock().await.insert(
+        self.pending.lock().unwrap().insert(
             (id, seq),
             PendingEcho {
                 peer_ip: view.src_ip,
@@ -134,7 +133,7 @@ impl RawForwarder {
         let dst: SocketAddr = SocketAddrV4::new(view.dst_ip, 0).into();
         if let Err(e) = self.socket.send_to(icmp, dst).await {
             tracing::warn!(error = %e, "icmp: raw send failed; falling back to admin-prohibited");
-            self.pending.lock().await.remove(&(id, seq));
+            self.pending.lock().unwrap().remove(&(id, seq));
             send_admin_prohibited(&self.sink, &packet);
         }
     }
@@ -178,7 +177,7 @@ fn spawn_raw_reader(socket: Arc<UdpSocket>, pending: PendingMap, sink: PacketSin
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((n, _src)) => {
-                    if let Err(e) = handle_raw_recv(&buf[..n], &pending, &sink).await {
+                    if let Err(e) = handle_raw_recv(&buf[..n], &pending, &sink) {
                         tracing::debug!(error = %e, "icmp: raw recv handling");
                     }
                 }
@@ -193,7 +192,7 @@ fn spawn_raw_reader(socket: Arc<UdpSocket>, pending: PendingMap, sink: PacketSin
 
 /// Both Linux and Windows raw IP sockets deliver the full IP packet
 /// (header + payload) on `recvfrom`. Strip the IP header to get to the ICMP.
-async fn handle_raw_recv(buf: &[u8], pending: &PendingMap, sink: &PacketSink) -> Result<()> {
+fn handle_raw_recv(buf: &[u8], pending: &PendingMap, sink: &PacketSink) -> Result<()> {
     if buf.len() < 28 {
         return Ok(());
     }
@@ -213,7 +212,7 @@ async fn handle_raw_recv(buf: &[u8], pending: &PendingMap, sink: &PacketSink) ->
     }
     let id = u16::from_be_bytes([icmp[4], icmp[5]]);
     let seq = u16::from_be_bytes([icmp[6], icmp[7]]);
-    let pe = match pending.lock().await.remove(&(id, seq)) {
+    let pe = match pending.lock().unwrap().remove(&(id, seq)) {
         Some(p) => p,
         None => {
             tracing::debug!(id, seq, "icmp: reply with no pending request, dropping");
@@ -234,7 +233,7 @@ fn spawn_pending_sweeper(pending: PendingMap) {
             let now = Instant::now();
             pending
                 .lock()
-                .await
+                .unwrap()
                 .retain(|_, v| now.duration_since(v.sent_at) < ECHO_PENDING_TTL);
         }
     });

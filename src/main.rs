@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use clap::{Parser, Subcommand};
-use smoltcp::iface::SocketHandle;
 use tokio::signal;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -21,6 +20,10 @@ use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent, SmoltcpHandle};
 use wgnat::tunnel::WgTunnel;
 use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
 
+/// `udp_proxies` is touched on every UDP packet (ingress task) and on the
+/// 10s NAT sweep — real but minimal contention. `std::sync::Mutex` is the
+/// right tool: critical sections are bounded HashMap ops with no `.await`
+/// held; tokio's Mutex pays for park/unpark uncontended for no benefit.
 type UdpProxyMap = Arc<Mutex<HashMap<NatKey, mpsc::UnboundedSender<Vec<u8>>>>>;
 
 #[derive(Parser, Debug)]
@@ -61,7 +64,7 @@ async fn main() -> Result<()> {
 
 fn keygen() -> Result<()> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("OS RNG: {e}"))?;
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("OS RNG: {e}"))?;
     let secret = x25519_dalek::StaticSecret::from(bytes);
     let public = x25519_dalek::PublicKey::from(&secret);
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -103,7 +106,8 @@ async fn run(
     let tunnel = Arc::new(WgTunnel::new(&cfg).await.context("WireGuard tunnel")?);
     info!(local = %tunnel.local_addr()?, peer = %tunnel.endpoint(), "WG socket bound");
 
-    let (smoltcp, mut events) = spawn_smoltcp(Arc::clone(&nat), cfg.interface.address);
+    let (smoltcp, mut events, smoltcp_tx_rx) =
+        spawn_smoltcp(Arc::clone(&nat), cfg.interface.address);
     info!("smoltcp runtime spawned");
 
     tunnel
@@ -112,13 +116,9 @@ async fn run(
         .context("initial handshake")?;
     info!("handshake initiation sent");
 
-    // Per-connection ProxyMsg senders, keyed by smoltcp handle.
-    let proxies: Arc<Mutex<HashMap<SocketHandle, mpsc::UnboundedSender<ProxyMsg>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
     // Per-NAT-entry UDP forwarders. Sender accepts raw payloads; the proxy
     // task sends them to (original_dst_ip, local_port) and pushes responses
-    // (as fully formed IPv4+UDP packets) onto `udp_outbound_tx`.
+    // (as fully formed IPv4+UDP packets) onto `egress_tx`.
     let udp_proxies: UdpProxyMap = Arc::new(Mutex::new(HashMap::new()));
     // Single shared egress channel for both UDP and ICMP — they both want to
     // emit fully formed IPv4 packets back through the tunnel.
@@ -138,40 +138,44 @@ async fn run(
     // raw-socket reader + pending sweeper.
     let icmp = Arc::new(IcmpForwarder::probe(egress_tx.clone()));
 
-    // Spawn the smoltcp egress drainer: pulls packets out of smoltcp's tx
-    // queue, runs the source rewrite, encapsulates, sends through WG.
+    // Spawn the smoltcp egress drainer: receives packets straight off the
+    // device tx channel, runs the source rewrite, encapsulates, sends through WG.
     let egress = tokio::spawn(egress_loop(
         Arc::clone(&tunnel),
-        smoltcp.clone(),
+        smoltcp_tx_rx,
         Arc::clone(&nat),
     ));
 
     // Spawn the smoltcp event consumer: turns runtime events into proxy
-    // task lifecycle.
+    // task lifecycle. The `proxies` map lives entirely inside this closure
+    // — only one task touches it, so plain HashMap is correct.
     let event_loop = tokio::spawn({
         let smoltcp = smoltcp.clone();
         let nat = Arc::clone(&nat);
-        let proxies = Arc::clone(&proxies);
         async move {
+            let mut proxies: HashMap<
+                wgnat::runtime::ConnectionId,
+                mpsc::UnboundedSender<ProxyMsg>,
+            > = HashMap::new();
             while let Some(evt) = events.evt_rx.recv().await {
                 match evt {
-                    SmoltcpEvent::TcpConnected { key, handle } => {
-                        debug!(?key, ?handle, "tcp connected");
-                        let tx = spawn_tcp_proxy(key, handle, smoltcp.clone(), Arc::clone(&nat));
-                        proxies.lock().await.insert(handle, tx);
+                    SmoltcpEvent::TcpConnected { key, id } => {
+                        debug!(?key, ?id, "tcp connected");
+                        let tx = spawn_tcp_proxy(key, id, smoltcp.clone(), Arc::clone(&nat));
+                        proxies.insert(id, tx);
                     }
-                    SmoltcpEvent::TcpData { key: _, handle, data } => {
-                        if let Some(tx) = proxies.lock().await.get(&handle) {
+                    SmoltcpEvent::TcpData { id, data, .. } => {
+                        if let Some(tx) = proxies.get(&id) {
                             let _ = tx.send(ProxyMsg::Data(data));
                         }
                     }
-                    SmoltcpEvent::TcpFinFromPeer { handle, .. } => {
-                        if let Some(tx) = proxies.lock().await.get(&handle) {
+                    SmoltcpEvent::TcpFinFromPeer { id, .. } => {
+                        if let Some(tx) = proxies.get(&id) {
                             let _ = tx.send(ProxyMsg::PeerFin);
                         }
                     }
-                    SmoltcpEvent::TcpClosed { handle, .. } => {
-                        if let Some(tx) = proxies.lock().await.remove(&handle) {
+                    SmoltcpEvent::TcpClosed { id, .. } => {
+                        if let Some(tx) = proxies.remove(&id) {
                             let _ = tx.send(ProxyMsg::Closed);
                         }
                     }
@@ -196,7 +200,7 @@ async fn run(
                 }
                 let removed_udp = nat.sweep_udp_idle(now, wgnat::nat::DEFAULT_UDP_IDLE);
                 if !removed_udp.is_empty() {
-                    let mut map = udp_proxies.lock().await;
+                    let mut map = udp_proxies.lock().unwrap();
                     for k in &removed_udp {
                         map.remove(k);
                     }
@@ -275,7 +279,7 @@ async fn ingest_tunnel_packet(
                 }
             };
             // Ensure listener exists *before* the SYN reaches the smoltcp poll.
-            if nat.get(key).and_then(|e| e.smoltcp_handle).is_none()
+            if nat.get(key).and_then(|e| e.smoltcp_id).is_none()
                 && smoltcp.ensure_listener(key.local_port, key).await.is_err()
             {
                 error!(?key, "smoltcp thread dropped ensure_listener reply");
@@ -299,7 +303,7 @@ async fn ingest_tunnel_packet(
                 }
             };
             let tx = {
-                let mut map = udp_proxies.lock().await;
+                let mut map = udp_proxies.lock().unwrap();
                 map.entry(key)
                     .or_insert_with(|| spawn_udp_proxy(key, egress_tx.clone()))
                     .clone()
@@ -307,7 +311,7 @@ async fn ingest_tunnel_packet(
             if tx.send(payload).is_err() {
                 // Stale proxy sender — its task already exited. Drop the entry
                 // so the next datagram spawns a fresh one.
-                udp_proxies.lock().await.remove(&key);
+                udp_proxies.lock().unwrap().remove(&key);
             }
         }
         PROTO_ICMP => {
@@ -319,19 +323,18 @@ async fn ingest_tunnel_packet(
     }
 }
 
-async fn egress_loop(tunnel: Arc<WgTunnel>, smoltcp: SmoltcpHandle, nat: Arc<NatTable>) {
-    let mut interval = tokio::time::interval(Duration::from_millis(2));
-    loop {
-        interval.tick().await;
-        let pkts = smoltcp.drain_outbound();
-        for mut pkt in pkts {
-            if let Err(e) = nat.rewrite_outbound(&mut pkt) {
-                debug!(error = %e, "egress rewrite (no NAT entry — likely RST for unknown flow)");
-                continue;
-            }
-            if let Err(e) = tunnel.send_packet(&pkt).await {
-                warn!(error = %e, "wg send");
-            }
+async fn egress_loop(
+    tunnel: Arc<WgTunnel>,
+    mut tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    nat: Arc<NatTable>,
+) {
+    while let Some(mut pkt) = tx_rx.recv().await {
+        if let Err(e) = nat.rewrite_outbound(&mut pkt) {
+            debug!(error = %e, "egress rewrite (no NAT entry — likely RST for unknown flow)");
+            continue;
+        }
+        if let Err(e) = tunnel.send_packet(&pkt).await {
+            warn!(error = %e, "wg send");
         }
     }
 }

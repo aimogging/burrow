@@ -1,20 +1,24 @@
-//! smoltcp `Device` implementation backed by two shared queues. Inbound
-//! packets (from the WireGuard tunnel after destination rewrite) get pushed
-//! into `rx`; outbound packets emitted by smoltcp land in `tx` and are
-//! drained by the caller for src-IP rewrite + WireGuard encapsulation.
+//! smoltcp `Device` implementation backed by tokio mpsc channels. Inbound
+//! packets (from the WireGuard tunnel after destination rewrite) are pushed
+//! into the rx sender; outbound packets emitted by smoltcp are forwarded out
+//! the tx sender for src-IP rewrite + WireGuard encapsulation.
 //!
 //! smoltcp's `Interface::poll` is single-threaded and pull-based — the
-//! `SmoltcpRuntime` (Phase 4) wraps everything in a dedicated thread plus
-//! a command channel. For Phase 2 we expose the building blocks so tests
-//! can drive `Interface::poll` directly.
+//! `SmoltcpRuntime` (Phase 4) wraps everything in a dedicated thread plus a
+//! command channel. For Phase 2 we expose the building blocks so tests can
+//! drive `Interface::poll` directly.
+//!
+//! Tokio `UnboundedSender::send` is sync; `UnboundedReceiver::try_recv` is
+//! sync. That's exactly the shape smoltcp's blocking poll loop needs, while
+//! still letting tokio tasks consume the receiver asynchronously.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use core::net::Ipv4Addr;
 
 use smoltcp::iface::{Config as IfaceConfig, Interface};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr as SmolIpv4Cidr};
+use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Cidr as SmolIpv4Cidr};
+use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use crate::config::Ipv4Cidr;
 
@@ -22,30 +26,21 @@ use crate::config::Ipv4Cidr;
 /// byte underlying MTU; we round to a safe 1420.
 pub const MTU: usize = 1420;
 
-pub type PacketQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
+pub type PacketSender = mpsc::UnboundedSender<Vec<u8>>;
+pub type PacketReceiver = mpsc::UnboundedReceiver<Vec<u8>>;
 
-pub fn new_queue() -> PacketQueue {
-    Arc::new(Mutex::new(VecDeque::new()))
-}
-
-/// `Device` implementation that reads from / writes to shared queues.
+/// `Device` implementation that reads inbound packets from `rx` (a receiver
+/// owned by the smoltcp thread) and emits outbound packets via `tx` (a
+/// sender shared with the egress task).
 pub struct ChannelDevice {
-    rx: PacketQueue,
-    tx: PacketQueue,
+    rx: PacketReceiver,
+    tx: PacketSender,
     mtu: usize,
 }
 
 impl ChannelDevice {
-    pub fn new(rx: PacketQueue, tx: PacketQueue) -> Self {
+    pub fn new(rx: PacketReceiver, tx: PacketSender) -> Self {
         Self { rx, tx, mtu: MTU }
-    }
-
-    pub fn rx_queue(&self) -> PacketQueue {
-        Arc::clone(&self.rx)
-    }
-
-    pub fn tx_queue(&self) -> PacketQueue {
-        Arc::clone(&self.tx)
     }
 }
 
@@ -54,16 +49,16 @@ pub struct ChannelRxToken {
 }
 
 impl phy::RxToken for ChannelRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(&mut self.buffer)
+        f(&self.buffer)
     }
 }
 
 pub struct ChannelTxToken {
-    tx: PacketQueue,
+    tx: PacketSender,
 }
 
 impl phy::TxToken for ChannelTxToken {
@@ -73,7 +68,8 @@ impl phy::TxToken for ChannelTxToken {
     {
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
-        self.tx.lock().unwrap().push_back(buf);
+        // Receiver hangs up only on shutdown; failure here is harmless.
+        let _ = self.tx.send(buf);
         r
     }
 }
@@ -92,19 +88,17 @@ impl phy::Device for ChannelDevice {
         &mut self,
         _ts: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let buf = self.rx.lock().unwrap().pop_front()?;
-        Some((
-            ChannelRxToken { buffer: buf },
-            ChannelTxToken {
-                tx: Arc::clone(&self.tx),
-            },
-        ))
+        match self.rx.try_recv() {
+            Ok(buf) => Some((
+                ChannelRxToken { buffer: buf },
+                ChannelTxToken { tx: self.tx.clone() },
+            )),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        }
     }
 
     fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(ChannelTxToken {
-            tx: Arc::clone(&self.tx),
-        })
+        Some(ChannelTxToken { tx: self.tx.clone() })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -120,7 +114,7 @@ pub fn build_interface(addr: &Ipv4Cidr, device: &mut ChannelDevice) -> Interface
     let config = IfaceConfig::new(HardwareAddress::Ip);
     let mut iface = Interface::new(config, device, SmolInstant::now());
     iface.update_ip_addrs(|addrs| {
-        let ip = Ipv4Address::from_bytes(&addr.address.octets());
+        let ip = Ipv4Addr::from(addr.address.octets());
         let cidr = SmolIpv4Cidr::new(ip, addr.prefix_len);
         addrs
             .push(IpCidr::Ipv4(cidr))
@@ -202,9 +196,9 @@ mod tests {
         let smoltcp_addr = Ipv4Addr::new(10, 0, 0, 2);
         let cidr: crate::config::Ipv4Cidr = "10.0.0.2/24".parse().unwrap();
 
-        let rx = new_queue();
-        let tx = new_queue();
-        let mut device = ChannelDevice::new(Arc::clone(&rx), Arc::clone(&tx));
+        let (rx_tx, rx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx_tx, mut tx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut device = ChannelDevice::new(rx_rx, tx_tx);
         let mut iface = build_interface(&cidr, &mut device);
 
         let mut sockets = SocketSet::new(vec![]);
@@ -229,13 +223,13 @@ mod tests {
         let key = table.rewrite_inbound(&mut syn).unwrap();
         assert_eq!(key.original_dst_ip, Ipv4Addr::new(192, 168, 1, 50));
 
-        rx.lock().unwrap().push_back(syn);
+        rx_tx.send(syn).unwrap();
 
         // Poll smoltcp until it produces output.
         let mut produced = None;
         for _ in 0..16 {
             iface.poll(SmolInstant::now(), &mut device, &mut sockets);
-            if let Some(p) = tx.lock().unwrap().pop_front() {
+            if let Ok(p) = tx_rx.try_recv() {
                 produced = Some(p);
                 break;
             }

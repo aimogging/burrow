@@ -118,7 +118,6 @@ If raw socket creation fails at startup, ICMP echo requests from peers receive *
 | `boringtun` (no `device` feature) | WireGuard noise protocol (encap/decap) |
 | `smoltcp` | Userspace TCP/IP stack |
 | `tokio` | Async runtime, UDP/TCP I/O |
-| `etherparse` | IP/TCP/UDP header parsing |
 | `clap` | CLI argument parsing |
 
 ## Key Design Decisions

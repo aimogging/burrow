@@ -13,15 +13,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-smoltcp = { version = "0.11", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp"] }
-etherparse = "0.14"
-socket2 = { version = "0.5", features = ["all"] }
-getrandom = "0.2"
+smoltcp = { version = "0.13", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp"] }
+socket2 = { version = "0.6", features = ["all"] }
+getrandom = "0.4"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -18,9 +18,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
-use smoltcp::iface::SocketHandle;
 
 use crate::rewrite::{parse_5tuple, rewrite_dst_ip, rewrite_src_ip, PROTO_TCP, PROTO_UDP};
+use crate::runtime::ConnectionId;
 
 /// Grace period after a TCP connection's smoltcp socket reports closed
 /// before the entry is swept.
@@ -56,7 +56,10 @@ pub enum ConnectionState {
 #[derive(Debug, Clone, Copy)]
 pub struct NatEntry {
     pub original_dst_ip: Ipv4Addr,
-    pub smoltcp_handle: Option<SocketHandle>,
+    /// Set once the smoltcp thread has issued a `ConnectionId` for this NAT
+    /// entry. `None` until the first `EnsureTcpListener` reply lands. Used by
+    /// the ingress dispatcher to skip redundant listener-creation requests.
+    pub smoltcp_id: Option<ConnectionId>,
     pub state: ConnectionState,
     pub created: Instant,
     pub last_activity: Instant,
@@ -122,7 +125,7 @@ impl NatTable {
             }
             let entry = inner.entries.entry(key).or_insert(NatEntry {
                 original_dst_ip: view.dst_ip,
-                smoltcp_handle: None,
+                smoltcp_id: None,
                 state: ConnectionState::Pending,
                 created: now,
                 last_activity: now,
@@ -164,10 +167,10 @@ impl NatTable {
         Ok(key)
     }
 
-    pub fn set_handle(&self, key: NatKey, handle: SocketHandle) {
+    pub fn set_id(&self, key: NatKey, id: ConnectionId) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(entry) = inner.entries.get_mut(&key) {
-            entry.smoltcp_handle = Some(handle);
+            entry.smoltcp_id = Some(id);
         }
     }
 
@@ -347,7 +350,7 @@ mod tests {
 
         let entry = table.get(key).unwrap();
         assert_eq!(entry.state, ConnectionState::Pending);
-        assert!(entry.smoltcp_handle.is_none());
+        assert!(entry.smoltcp_id.is_none());
     }
 
     #[test]

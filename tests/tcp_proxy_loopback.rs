@@ -8,16 +8,15 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use smoltcp::iface::SocketHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 use wgnat::config::Ipv4Cidr;
 use wgnat::nat::NatTable;
 use wgnat::proxy::{spawn_tcp_proxy, ProxyMsg};
 use wgnat::rewrite::PROTO_TCP;
-use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent, SmoltcpHandle};
+use wgnat::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent};
 
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -172,11 +171,11 @@ async fn start_echo() -> SocketAddr {
     addr
 }
 
-/// Drain everything currently outbound from the runtime, return the parsed
-/// TCP segments after running each through `nat.rewrite_outbound`.
-fn drain_parsed(runtime: &SmoltcpHandle, nat: &NatTable) -> Vec<ParsedTcp> {
+/// Drain everything currently outbound from the device tx channel, return
+/// the parsed TCP segments after running each through `nat.rewrite_outbound`.
+fn drain_parsed(tx_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>, nat: &NatTable) -> Vec<ParsedTcp> {
     let mut out = Vec::new();
-    for mut pkt in runtime.drain_outbound() {
+    while let Ok(mut pkt) = tx_rx.try_recv() {
         if nat.rewrite_outbound(&mut pkt).is_err() {
             continue;
         }
@@ -189,7 +188,7 @@ fn drain_parsed(runtime: &SmoltcpHandle, nat: &NatTable) -> Vec<ParsedTcp> {
 /// keeping every parsed segment for inspection. Returns ALL segments seen
 /// before (and including) the matching one.
 async fn wait_for(
-    runtime: &SmoltcpHandle,
+    tx_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     nat: &NatTable,
     timeout: Duration,
     mut pred: impl FnMut(&ParsedTcp) -> bool,
@@ -197,7 +196,7 @@ async fn wait_for(
     let deadline = std::time::Instant::now() + timeout;
     let mut all = Vec::new();
     while std::time::Instant::now() < deadline {
-        let parsed = drain_parsed(runtime, nat);
+        let parsed = drain_parsed(tx_rx, nat);
         for p in parsed {
             let matched = pred(&p);
             all.push(p);
@@ -226,35 +225,34 @@ async fn tcp_proxy_round_trips_via_loopback_echo() {
 
     let nat = Arc::new(NatTable::new(GATEWAY_IP));
     let cidr: Ipv4Cidr = "10.0.0.2/24".parse().unwrap();
-    let (runtime, mut events) = spawn_smoltcp(Arc::clone(&nat), cidr);
+    let (runtime, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), cidr);
 
-    // Wire the same event-loop logic as main.rs. A proxies map shares the
-    // ProxyMsg sender across event types.
-    let proxies: Arc<Mutex<HashMap<SocketHandle, mpsc::UnboundedSender<ProxyMsg>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // Wire the same event-loop logic as main.rs. The proxies map lives
+    // entirely inside this task — single-owner, no Mutex needed.
     let event_task = tokio::spawn({
         let runtime = runtime.clone();
         let nat = Arc::clone(&nat);
-        let proxies = Arc::clone(&proxies);
         async move {
+            let mut proxies: HashMap<ConnectionId, mpsc::UnboundedSender<ProxyMsg>> =
+                HashMap::new();
             while let Some(evt) = events.evt_rx.recv().await {
                 match evt {
-                    SmoltcpEvent::TcpConnected { key, handle } => {
-                        let tx = spawn_tcp_proxy(key, handle, runtime.clone(), Arc::clone(&nat));
-                        proxies.lock().await.insert(handle, tx);
+                    SmoltcpEvent::TcpConnected { key, id } => {
+                        let tx = spawn_tcp_proxy(key, id, runtime.clone(), Arc::clone(&nat));
+                        proxies.insert(id, tx);
                     }
-                    SmoltcpEvent::TcpData { handle, data, .. } => {
-                        if let Some(tx) = proxies.lock().await.get(&handle) {
+                    SmoltcpEvent::TcpData { id, data, .. } => {
+                        if let Some(tx) = proxies.get(&id) {
                             let _ = tx.send(ProxyMsg::Data(data));
                         }
                     }
-                    SmoltcpEvent::TcpFinFromPeer { handle, .. } => {
-                        if let Some(tx) = proxies.lock().await.get(&handle) {
+                    SmoltcpEvent::TcpFinFromPeer { id, .. } => {
+                        if let Some(tx) = proxies.get(&id) {
                             let _ = tx.send(ProxyMsg::PeerFin);
                         }
                     }
-                    SmoltcpEvent::TcpClosed { handle, .. } => {
-                        if let Some(tx) = proxies.lock().await.remove(&handle) {
+                    SmoltcpEvent::TcpClosed { id, .. } => {
+                        if let Some(tx) = proxies.remove(&id) {
                             let _ = tx.send(ProxyMsg::Closed);
                         }
                     }
@@ -283,7 +281,7 @@ async fn tcp_proxy_round_trips_via_loopback_echo() {
     peer.seq = peer.seq.wrapping_add(1); // SYN consumes seq
 
     // 2. Wait for SYN-ACK.
-    let segs = wait_for(&runtime, &nat, Duration::from_secs(2), |p| {
+    let segs = wait_for(&mut tx_rx, &nat, Duration::from_secs(2), |p| {
         p.flags & 0x12 == 0x12
     })
     .await;
@@ -298,7 +296,7 @@ async fn tcp_proxy_round_trips_via_loopback_echo() {
     send_inbound(peer.psh_ack(payload));
 
     // 5. Wait for echoed data to come back.
-    let segs = wait_for(&runtime, &nat, Duration::from_secs(3), |p| {
+    let segs = wait_for(&mut tx_rx, &nat, Duration::from_secs(3), |p| {
         p.payload == payload
     })
     .await;
@@ -320,7 +318,7 @@ async fn tcp_proxy_round_trips_via_loopback_echo() {
 
     // The echo server closes its half once we close ours, which propagates
     // back. Ensure smoltcp emits at least an ACK or FIN for our FIN.
-    let segs = wait_for(&runtime, &nat, Duration::from_secs(3), |p| {
+    let segs = wait_for(&mut tx_rx, &nat, Duration::from_secs(3), |p| {
         // ACK of our FIN: ack == peer.seq
         p.ack == peer.seq && (p.flags & 0x10 != 0)
     })

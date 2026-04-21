@@ -4,6 +4,24 @@
 //! changes and inbound data flow back to the tokio runtime through an event
 //! channel.
 //!
+//! ## Why `ConnectionId`, not `SocketHandle`
+//!
+//! `smoltcp::iface::SocketHandle` is a bare `pub struct SocketHandle(usize)`
+//! — an index into a slot table with no generation counter. When the smoltcp
+//! thread evicts a closed socket via `sockets.remove(handle)`, the slot is
+//! freed and may be reused on the next `sockets.add(...)`. But cross-thread
+//! commands (`WriteTcp`, `CloseTcp`, ...) sit in the cmd channel after their
+//! socket is gone — at best smoltcp panics on `get_mut` on the freed slot,
+//! at worst a brand new connection silently receives stale writes.
+//!
+//! The fix: bare `SocketHandle`s never leave this thread. Every connection
+//! is also issued a monotonically increasing `ConnectionId(u64)` — the
+//! opaque token that crosses the channel. `handle_command` resolves
+//! `ConnectionId → SocketHandle` against an internal map; if the id is gone
+//! (because we already emitted `TcpClosed` and tore down the entry), the
+//! command is silently no-op'd. Slot reuse is harmless because the new
+//! socket gets a fresh `ConnectionId`.
+//!
 //! This module is the *plumbing* for the smoltcp side. The actual proxying
 //! (open OS TcpStream, shuffle bytes both ways) lives in `crate::proxy`.
 
@@ -20,7 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Ipv4Cidr;
 use crate::nat::{ConnectionState, NatKey, NatTable, DEFAULT_TCP_GRACE};
-use crate::smoltcp_iface::{build_interface, new_queue, ChannelDevice, PacketQueue};
+use crate::smoltcp_iface::{build_interface, ChannelDevice, PacketReceiver, PacketSender};
 
 /// Per-socket smoltcp buffer size. 64 KiB matches a typical Linux default
 /// and avoids stalling large transfers.
@@ -35,73 +53,74 @@ const RECV_CHUNK: usize = 16 * 1024;
 /// CPU at idle low.
 const IDLE_SLEEP: Duration = Duration::from_millis(2);
 
+/// Opaque token identifying a single smoltcp connection across thread
+/// boundaries. Never reused — even if smoltcp recycles the underlying
+/// `SocketHandle` slot, a new connection gets a new `ConnectionId`.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct ConnectionId(u64);
+
 pub enum SmoltcpCmd {
     /// Idempotently create a TCP listener bound to `port` and tag it with
     /// `key` so the runtime can route the eventual ESTABLISHED event to the
-    /// right NAT entry. Replies once with the chosen `SocketHandle`.
+    /// right NAT entry. Replies once with the issued `ConnectionId`.
     EnsureTcpListener {
         port: u16,
         key: NatKey,
-        ready: oneshot::Sender<SocketHandle>,
+        ready: oneshot::Sender<ConnectionId>,
     },
     /// Append `data` to the smoltcp socket's tx buffer. Replies with the
     /// number of bytes accepted (0 if the buffer is full or the socket is
-    /// not in a sendable state — caller should retry).
+    /// not in a sendable state — caller should retry). Replies with 0 if
+    /// the connection has already been torn down.
     WriteTcp {
-        handle: SocketHandle,
+        id: ConnectionId,
         data: Vec<u8>,
         ack: oneshot::Sender<usize>,
     },
     /// Initiate a graceful close (FIN). Returns when the command is
-    /// dispatched, not when the close completes.
-    CloseTcp { handle: SocketHandle },
-    /// Send RST.
-    AbortTcp { handle: SocketHandle },
+    /// dispatched, not when the close completes. Silently no-op if the
+    /// connection has already been torn down.
+    CloseTcp { id: ConnectionId },
+    /// Send RST. Silently no-op if the connection has already been torn down.
+    AbortTcp { id: ConnectionId },
 }
 
 #[derive(Debug)]
 pub enum SmoltcpEvent {
     /// Socket transitioned to ESTABLISHED. Spawn a proxy task here.
-    TcpConnected { key: NatKey, handle: SocketHandle },
+    TcpConnected { key: NatKey, id: ConnectionId },
     /// Bytes were received on a socket. May arrive in many small chunks.
     TcpData {
         key: NatKey,
-        handle: SocketHandle,
+        id: ConnectionId,
         data: Vec<u8>,
     },
     /// Socket entered a closing state (FIN from peer). Caller should
     /// half-close the OS-side stream's write half.
-    TcpFinFromPeer { key: NatKey, handle: SocketHandle },
-    /// Socket reached terminal CLOSED state. The `SocketHandle` is no longer
-    /// valid after this event.
-    TcpClosed { key: NatKey, handle: SocketHandle },
+    TcpFinFromPeer { key: NatKey, id: ConnectionId },
+    /// Socket reached terminal CLOSED state. The `ConnectionId` is no longer
+    /// valid after this event; subsequent commands referencing it no-op.
+    TcpClosed { key: NatKey, id: ConnectionId },
 }
 
-/// Cheap-to-clone handle for issuing commands and feeding packets to/from
+/// Cheap-to-clone handle for issuing commands and feeding inbound packets to
 /// the smoltcp thread.
 #[derive(Clone)]
 pub struct SmoltcpHandle {
     cmd_tx: mpsc::UnboundedSender<SmoltcpCmd>,
-    pub rx_queue: PacketQueue,
-    pub tx_queue: PacketQueue,
+    rx_tx: PacketSender,
 }
 
 impl SmoltcpHandle {
     /// Push an inbound packet (already dst-rewritten by the NAT table) into
     /// the smoltcp Device's rx queue.
     pub fn enqueue_inbound(&self, packet: Vec<u8>) {
-        self.rx_queue.lock().unwrap().push_back(packet);
+        // If the smoltcp thread has gone, drop silently — the rest of the
+        // system will surface that elsewhere.
+        let _ = self.rx_tx.send(packet);
     }
 
-    /// Drain all currently queued outbound packets from the smoltcp Device.
-    /// Returned packets still have `src = smoltcp_addr` — caller must run
-    /// them through `NatTable::rewrite_outbound` before encapsulation.
-    pub fn drain_outbound(&self) -> Vec<Vec<u8>> {
-        let mut q = self.tx_queue.lock().unwrap();
-        q.drain(..).collect()
-    }
-
-    pub fn ensure_listener(&self, port: u16, key: NatKey) -> oneshot::Receiver<SocketHandle> {
+    pub fn ensure_listener(&self, port: u16, key: NatKey) -> oneshot::Receiver<ConnectionId> {
         let (tx, rx) = oneshot::channel();
         let _ = self.cmd_tx.send(SmoltcpCmd::EnsureTcpListener {
             port,
@@ -111,25 +130,21 @@ impl SmoltcpHandle {
         rx
     }
 
-    pub async fn write_tcp(&self, handle: SocketHandle, data: Vec<u8>) -> Result<usize> {
+    pub async fn write_tcp(&self, id: ConnectionId, data: Vec<u8>) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(SmoltcpCmd::WriteTcp {
-                handle,
-                data,
-                ack: tx,
-            })
+            .send(SmoltcpCmd::WriteTcp { id, data, ack: tx })
             .map_err(|_| anyhow!("smoltcp thread terminated"))?;
         rx.await
             .map_err(|_| anyhow!("smoltcp thread dropped reply"))
     }
 
-    pub fn close_tcp(&self, handle: SocketHandle) {
-        let _ = self.cmd_tx.send(SmoltcpCmd::CloseTcp { handle });
+    pub fn close_tcp(&self, id: ConnectionId) {
+        let _ = self.cmd_tx.send(SmoltcpCmd::CloseTcp { id });
     }
 
-    pub fn abort_tcp(&self, handle: SocketHandle) {
-        let _ = self.cmd_tx.send(SmoltcpCmd::AbortTcp { handle });
+    pub fn abort_tcp(&self, id: ConnectionId) {
+        let _ = self.cmd_tx.send(SmoltcpCmd::AbortTcp { id });
     }
 }
 
@@ -137,35 +152,43 @@ pub struct SmoltcpEvents {
     pub evt_rx: mpsc::UnboundedReceiver<SmoltcpEvent>,
 }
 
-pub fn spawn_smoltcp(nat: Arc<NatTable>, addr: Ipv4Cidr) -> (SmoltcpHandle, SmoltcpEvents) {
-    let rx_queue = new_queue();
-    let tx_queue = new_queue();
+/// Spawn the smoltcp poll thread. Returns the cmd handle, an event stream,
+/// and the receiver end of the device's tx queue (drained by the egress
+/// task to encapsulate and send through the WG tunnel).
+pub fn spawn_smoltcp(
+    nat: Arc<NatTable>,
+    addr: Ipv4Cidr,
+) -> (SmoltcpHandle, SmoltcpEvents, PacketReceiver) {
+    let (rx_tx, rx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx_tx, tx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel();
 
-    let rxq = Arc::clone(&rx_queue);
-    let txq = Arc::clone(&tx_queue);
     let nat_thread = Arc::clone(&nat);
 
     thread::Builder::new()
         .name("wgnat-smoltcp".into())
-        .spawn(move || run_smoltcp_thread(addr, rxq, txq, cmd_rx, evt_tx, nat_thread))
+        .spawn(move || run_smoltcp_thread(addr, rx_rx, tx_tx, cmd_rx, evt_tx, nat_thread))
         .expect("spawn smoltcp thread");
 
     (
-        SmoltcpHandle {
-            cmd_tx,
-            rx_queue,
-            tx_queue,
-        },
+        SmoltcpHandle { cmd_tx, rx_tx },
         SmoltcpEvents { evt_rx },
+        tx_rx,
     )
+}
+
+/// The smoltcp thread's view of an open connection. Owned exclusively by
+/// the smoltcp thread; never crosses a channel.
+struct ConnState {
+    handle: SocketHandle,
+    key: NatKey,
 }
 
 fn run_smoltcp_thread(
     addr: Ipv4Cidr,
-    rx_queue: PacketQueue,
-    tx_queue: PacketQueue,
+    rx_queue: PacketReceiver,
+    tx_queue: PacketSender,
     mut cmd_rx: mpsc::UnboundedReceiver<SmoltcpCmd>,
     evt_tx: mpsc::UnboundedSender<SmoltcpEvent>,
     nat: Arc<NatTable>,
@@ -174,8 +197,10 @@ fn run_smoltcp_thread(
     let mut iface = build_interface(&addr, &mut device);
     let mut sockets: SocketSet<'static> = SocketSet::new(vec![]);
 
-    let mut handle_to_key: HashMap<SocketHandle, NatKey> = HashMap::new();
-    let mut last_states: HashMap<SocketHandle, tcp::State> = HashMap::new();
+    let mut conns: HashMap<ConnectionId, ConnState> = HashMap::new();
+    let mut by_handle: HashMap<SocketHandle, ConnectionId> = HashMap::new();
+    let mut last_states: HashMap<ConnectionId, tcp::State> = HashMap::new();
+    let mut next_id: u64 = 0;
 
     tracing::info!(addr = ?addr, "smoltcp thread started");
 
@@ -183,42 +208,46 @@ fn run_smoltcp_thread(
         // 1. Drain commands first so a freshly registered listener is in place
         //    before its triggering SYN reaches `iface.poll`.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            handle_command(cmd, &mut sockets, &mut handle_to_key, &nat);
+            handle_command(cmd, &mut sockets, &mut conns, &mut by_handle, &mut next_id, &nat);
         }
 
-        // 2. Drive the stack. This consumes `device.rx`, runs state machines,
-        //    fills `device.tx`.
+        // 2. Drive the stack. This consumes packets from the rx channel,
+        //    runs state machines, emits packets onto the tx channel.
         let _ = iface.poll(SmolInstant::now(), &mut device, &mut sockets);
 
         // 3. Inspect each socket; emit events on transitions / data.
-        let mut to_drop: Vec<SocketHandle> = Vec::new();
+        let mut to_drop: Vec<ConnectionId> = Vec::new();
         for (handle, socket) in sockets.iter_mut() {
             let smoltcp::socket::Socket::Tcp(tcp_sock) = socket else {
                 continue;
             };
-            let Some(&key) = handle_to_key.get(&handle) else {
+            let Some(&id) = by_handle.get(&handle) else {
                 continue;
             };
+            let Some(state) = conns.get(&id) else {
+                continue;
+            };
+            let key = state.key;
 
             let new_state = tcp_sock.state();
-            let prev = last_states.get(&handle).copied();
+            let prev = last_states.get(&id).copied();
 
             if prev != Some(new_state) {
-                last_states.insert(handle, new_state);
-                tracing::trace!(?handle, ?key, ?prev, ?new_state, "tcp state change");
+                last_states.insert(id, new_state);
+                tracing::trace!(?id, ?key, ?prev, ?new_state, "tcp state change");
 
                 if matches!(new_state, tcp::State::Established)
                     && !matches!(prev, Some(tcp::State::Established))
                 {
                     nat.set_state(key, ConnectionState::Established);
-                    let _ = evt_tx.send(SmoltcpEvent::TcpConnected { key, handle });
+                    let _ = evt_tx.send(SmoltcpEvent::TcpConnected { key, id });
                 }
 
                 // CLOSE_WAIT means peer has FIN'd us. Half-close signal.
                 if matches!(new_state, tcp::State::CloseWait)
                     && !matches!(prev, Some(tcp::State::CloseWait))
                 {
-                    let _ = evt_tx.send(SmoltcpEvent::TcpFinFromPeer { key, handle });
+                    let _ = evt_tx.send(SmoltcpEvent::TcpFinFromPeer { key, id });
                 }
             }
 
@@ -227,22 +256,24 @@ fn run_smoltcp_thread(
                 if let Ok(n) = tcp_sock.recv_slice(&mut buf) {
                     if n > 0 {
                         buf.truncate(n);
-                        let _ = evt_tx.send(SmoltcpEvent::TcpData { key, handle, data: buf });
+                        let _ = evt_tx.send(SmoltcpEvent::TcpData { key, id, data: buf });
                     }
                 }
             }
 
             if matches!(new_state, tcp::State::Closed) {
-                let _ = evt_tx.send(SmoltcpEvent::TcpClosed { key, handle });
+                let _ = evt_tx.send(SmoltcpEvent::TcpClosed { key, id });
                 nat.mark_closing(key, DEFAULT_TCP_GRACE);
-                to_drop.push(handle);
+                to_drop.push(id);
             }
         }
 
-        for handle in to_drop {
-            sockets.remove(handle);
-            handle_to_key.remove(&handle);
-            last_states.remove(&handle);
+        for id in to_drop {
+            if let Some(state) = conns.remove(&id) {
+                sockets.remove(state.handle);
+                by_handle.remove(&state.handle);
+            }
+            last_states.remove(&id);
         }
 
         thread::sleep(IDLE_SLEEP);
@@ -252,17 +283,19 @@ fn run_smoltcp_thread(
 fn handle_command(
     cmd: SmoltcpCmd,
     sockets: &mut SocketSet<'static>,
-    handle_to_key: &mut HashMap<SocketHandle, NatKey>,
+    conns: &mut HashMap<ConnectionId, ConnState>,
+    by_handle: &mut HashMap<SocketHandle, ConnectionId>,
+    next_id: &mut u64,
     nat: &NatTable,
 ) {
     match cmd {
         SmoltcpCmd::EnsureTcpListener { port, key, ready } => {
             // If we already have a listener for this key, hand back the same
-            // handle. Idempotent: callers can fire this on every inbound
-            // packet without growing the socket set.
-            if let Some(existing) = handle_to_key
+            // id. Idempotent: callers can fire this on every inbound packet
+            // without growing the socket set.
+            if let Some(existing) = conns
                 .iter()
-                .find_map(|(h, k)| (*k == key).then_some(*h))
+                .find_map(|(id, st)| (st.key == key).then_some(*id))
             {
                 let _ = ready.send(existing);
                 return;
@@ -272,24 +305,38 @@ fn handle_command(
             let mut sock = tcp::Socket::new(rx_buf, tx_buf);
             if let Err(e) = sock.listen(port) {
                 tracing::warn!(port, ?e, "tcp listen failed");
+                // Drop `ready` so the caller's await wakes up with an error.
+                drop(ready);
                 return;
             }
             let handle = sockets.add(sock);
-            handle_to_key.insert(handle, key);
-            nat.set_handle(key, handle);
-            let _ = ready.send(handle);
+            let id = ConnectionId(*next_id);
+            *next_id += 1;
+            conns.insert(id, ConnState { handle, key });
+            by_handle.insert(handle, id);
+            nat.set_id(key, id);
+            let _ = ready.send(id);
         }
-        SmoltcpCmd::WriteTcp { handle, data, ack } => {
-            let sock = sockets.get_mut::<tcp::Socket>(handle);
+        SmoltcpCmd::WriteTcp { id, data, ack } => {
+            // Stale id (already torn down). No-op with 0 bytes accepted —
+            // the proxy task's pump will treat it as backpressure and exit
+            // its loop on the next channel error.
+            let Some(state) = conns.get(&id) else {
+                let _ = ack.send(0);
+                return;
+            };
+            let sock = sockets.get_mut::<tcp::Socket>(state.handle);
             let n = sock.send_slice(&data).unwrap_or(0);
             let _ = ack.send(n);
         }
-        SmoltcpCmd::CloseTcp { handle } => {
-            let sock = sockets.get_mut::<tcp::Socket>(handle);
+        SmoltcpCmd::CloseTcp { id } => {
+            let Some(state) = conns.get(&id) else { return };
+            let sock = sockets.get_mut::<tcp::Socket>(state.handle);
             sock.close();
         }
-        SmoltcpCmd::AbortTcp { handle } => {
-            let sock = sockets.get_mut::<tcp::Socket>(handle);
+        SmoltcpCmd::AbortTcp { id } => {
+            let Some(state) = conns.get(&id) else { return };
+            let sock = sockets.get_mut::<tcp::Socket>(state.handle);
             sock.abort();
         }
     }
@@ -356,7 +403,7 @@ mod tests {
     async fn runtime_emits_synack_for_listened_port() {
         let nat = Arc::new(NatTable::new(Ipv4Addr::new(10, 0, 0, 2)));
         let cidr: Ipv4Cidr = "10.0.0.2/24".parse().unwrap();
-        let (handle, _events) = spawn_smoltcp(Arc::clone(&nat), cidr);
+        let (handle, _events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), cidr);
 
         let mut syn = build_tcp_syn(
             Ipv4Addr::new(10, 0, 0, 1),
@@ -367,8 +414,8 @@ mod tests {
         let key = nat.rewrite_inbound(&mut syn).unwrap();
 
         // Set up listener BEFORE enqueueing the packet so the SYN finds it.
-        let h = handle.ensure_listener(8080, key).await.unwrap();
-        assert_eq!(nat.get(key).unwrap().smoltcp_handle, Some(h));
+        let id = handle.ensure_listener(8080, key).await.unwrap();
+        assert_eq!(nat.get(key).unwrap().smoltcp_id, Some(id));
 
         handle.enqueue_inbound(syn);
 
@@ -376,8 +423,7 @@ mod tests {
         let mut found = None;
         for _ in 0..200 {
             tokio::time::sleep(StdDuration::from_millis(5)).await;
-            let pkts = handle.drain_outbound();
-            if let Some(p) = pkts.into_iter().next() {
+            if let Ok(p) = tx_rx.try_recv() {
                 found = Some(p);
                 break;
             }

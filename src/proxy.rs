@@ -3,36 +3,36 @@
 //! shuffles bytes between the two and propagates close/reset.
 //!
 //! Architecture: we never touch the smoltcp `TcpSocket` directly here — all
-//! reads/writes funnel through `SmoltcpHandle` to the smoltcp thread. The
+//! reads/writes funnel through `SmoltcpHandle` to the smoltcp thread, keyed
+//! by the opaque `ConnectionId` issued at listener-creation time. The
 //! per-connection task owns:
 //!   * the OS-side `TcpStream` (reads to forward to smoltcp, writes from
 //!     smoltcp)
 //!   * an `mpsc::UnboundedReceiver` of `Vec<u8>` chunks the runtime forwards
-//!     when smoltcp emits `TcpData` for our handle.
+//!     when smoltcp emits `TcpData` for our id.
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use smoltcp::iface::SocketHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::nat::{ConnectionState, NatKey, NatTable};
-use crate::runtime::SmoltcpHandle;
+use crate::runtime::{ConnectionId, SmoltcpHandle};
 
 /// Spawn a task that connects to the original destination and proxies data
 /// in both directions. Returns immediately with the inbound data sender —
 /// the caller (event loop) hands smoltcp `TcpData` chunks to it.
 pub fn spawn_tcp_proxy(
     key: NatKey,
-    handle: SocketHandle,
+    id: ConnectionId,
     smoltcp: SmoltcpHandle,
     nat: Arc<NatTable>,
 ) -> mpsc::UnboundedSender<ProxyMsg> {
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        if let Err(e) = run_tcp_proxy(key, handle, smoltcp, nat, msg_rx).await {
+        if let Err(e) = run_tcp_proxy(key, id, smoltcp, nat, msg_rx).await {
             tracing::warn!(?key, error = %e, "tcp proxy task failed");
         }
     });
@@ -51,7 +51,7 @@ pub enum ProxyMsg {
 
 async fn run_tcp_proxy(
     key: NatKey,
-    handle: SocketHandle,
+    id: ConnectionId,
     smoltcp: SmoltcpHandle,
     nat: Arc<NatTable>,
     mut msg_rx: mpsc::UnboundedReceiver<ProxyMsg>,
@@ -63,7 +63,7 @@ async fn run_tcp_proxy(
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(?key, error = %e, "proxy: OS connect failed; aborting smoltcp side");
-            smoltcp.abort_tcp(handle);
+            smoltcp.abort_tcp(id);
             nat.set_state(key, ConnectionState::Closed);
             return Ok(());
         }
@@ -82,7 +82,7 @@ async fn run_tcp_proxy(
                 Ok(n) => {
                     let mut to_send = buf[..n].to_vec();
                     while !to_send.is_empty() {
-                        match smoltcp_for_os_pump.write_tcp(handle, to_send.clone()).await {
+                        match smoltcp_for_os_pump.write_tcp(id, to_send.clone()).await {
                             Ok(0) => {
                                 // smoltcp tx buffer is full — back off briefly.
                                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -105,7 +105,7 @@ async fn run_tcp_proxy(
         }
         // OS-side hit EOF or error. Close the smoltcp side gracefully so
         // the peer sees a FIN.
-        smoltcp_for_os_pump.close_tcp(handle);
+        smoltcp_for_os_pump.close_tcp(id);
     });
 
     // smoltcp → OS pump runs inline.
@@ -115,7 +115,7 @@ async fn run_tcp_proxy(
             ProxyMsg::Data(data) => {
                 if let Err(e) = os_write.write_all(&data).await {
                     tracing::debug!(error = %e, "os write failed; aborting smoltcp side");
-                    smoltcp.abort_tcp(handle);
+                    smoltcp.abort_tcp(id);
                     break;
                 }
             }
