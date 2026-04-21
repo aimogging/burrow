@@ -1,113 +1,14 @@
-//! Destination-IP rewrite shim sitting between the WireGuard tunnel and
-//! smoltcp. smoltcp only accepts packets addressed to its configured
-//! interface IP, but our peers send packets destined for arbitrary internal
-//! hosts. We rewrite `dst_ip → smoltcp_iface_ip` on ingress, remember the
-//! original destination, and rewrite `src_ip → original_dst_ip` on egress.
-//!
-//! Per-protocol checksum recompute is done in place so the same buffer can
-//! be handed to smoltcp without an allocation.
+//! Low-level packet rewrite primitives. The actual stateful destination
+//! tracking lives in `crate::nat::NatTable`; this module only provides
+//! parsing and in-place IP/transport rewrites with checksum updates.
 
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::Mutex;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
 pub const PROTO_UDP: u8 = 17;
-
-/// Lookup key for the rewrite table. `dst_ip` is *not* part of the key
-/// because by the time we look up on egress we've already rewritten it to
-/// smoltcp's address — the original is what we're trying to recover.
-#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
-pub struct RewriteKey {
-    pub proto: u8,
-    pub peer_ip: Ipv4Addr,
-    pub peer_port: u16,
-    pub local_port: u16,
-}
-
-/// Records `(peer_ip, peer_port, local_port) → original_dst_ip` so that
-/// outbound packets from smoltcp can have their `src_ip` rewritten back.
-///
-/// "Local" here means the smoltcp side (the gateway address), "peer" is the
-/// remote WireGuard client. On ingress (peer → local), `peer_*` come from the
-/// IP/transport header `src_*` and `local_port` from `dst_port`. On egress
-/// (local → peer), `peer_*` come from `dst_*` and `local_port` from `src_port`.
-pub struct RewriteTable {
-    inner: Mutex<HashMap<RewriteKey, Ipv4Addr>>,
-    smoltcp_addr: Ipv4Addr,
-}
-
-impl RewriteTable {
-    pub fn new(smoltcp_addr: Ipv4Addr) -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-            smoltcp_addr,
-        }
-    }
-
-    pub fn smoltcp_addr(&self) -> Ipv4Addr {
-        self.smoltcp_addr
-    }
-
-    /// Returns the number of entries currently tracked. Test helper.
-    pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().is_empty()
-    }
-
-    /// Inbound (peer → smoltcp): record original dst, rewrite to smoltcp addr.
-    /// Returns the original destination so callers can log/track.
-    pub fn rewrite_inbound(&self, packet: &mut [u8]) -> Result<Ipv4Addr> {
-        let view = parse_5tuple(packet)?;
-        let key = RewriteKey {
-            proto: view.proto,
-            peer_ip: view.src_ip,
-            peer_port: view.src_port,
-            local_port: view.dst_port,
-        };
-        let original_dst = view.dst_ip;
-        self.inner.lock().unwrap().insert(key, original_dst);
-        rewrite_dst_ip(packet, self.smoltcp_addr)?;
-        Ok(original_dst)
-    }
-
-    /// Outbound (smoltcp → peer): look up original dst, rewrite src back.
-    /// Returns the original destination IP that was substituted, or an error
-    /// if the table has no entry for this 4-tuple.
-    pub fn rewrite_outbound(&self, packet: &mut [u8]) -> Result<Ipv4Addr> {
-        let view = parse_5tuple(packet)?;
-        // On the egress path, src_* identify the smoltcp side and dst_* the peer.
-        let key = RewriteKey {
-            proto: view.proto,
-            peer_ip: view.dst_ip,
-            peer_port: view.dst_port,
-            local_port: view.src_port,
-        };
-        let original_dst = self
-            .inner
-            .lock()
-            .unwrap()
-            .get(&key)
-            .copied()
-            .ok_or_else(|| {
-                anyhow!(
-                    "rewrite_outbound: no entry for proto={} peer={}:{} local_port={}",
-                    view.proto,
-                    view.dst_ip,
-                    view.dst_port,
-                    view.src_port
-                )
-            })?;
-        rewrite_src_ip(packet, original_dst)?;
-        Ok(original_dst)
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct PacketView {
@@ -386,49 +287,6 @@ mod tests {
         assert!(verify_tcp_checksum_zero(&pkt));
         let view = parse_5tuple(&pkt).unwrap();
         assert_eq!(view.src_ip, Ipv4Addr::new(192, 168, 1, 50));
-    }
-
-    #[test]
-    fn round_trip_through_table() {
-        let table = RewriteTable::new(Ipv4Addr::new(10, 0, 0, 2));
-        // Inbound: peer 10.0.0.1:54321 → 192.168.1.50:80
-        let mut inbound = build_tcp_syn(
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(192, 168, 1, 50),
-            54321,
-            80,
-        );
-        let original = table.rewrite_inbound(&mut inbound).unwrap();
-        assert_eq!(original, Ipv4Addr::new(192, 168, 1, 50));
-        let view = parse_5tuple(&inbound).unwrap();
-        assert_eq!(view.dst_ip, Ipv4Addr::new(10, 0, 0, 2));
-        assert!(verify_tcp_checksum_zero(&inbound));
-
-        // Outbound: smoltcp produces 10.0.0.2:80 → 10.0.0.1:54321 (SYN-ACK shape)
-        let mut outbound = build_tcp_syn(
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(10, 0, 0, 1),
-            80,
-            54321,
-        );
-        let restored = table.rewrite_outbound(&mut outbound).unwrap();
-        assert_eq!(restored, Ipv4Addr::new(192, 168, 1, 50));
-        let view = parse_5tuple(&outbound).unwrap();
-        assert_eq!(view.src_ip, Ipv4Addr::new(192, 168, 1, 50));
-        assert!(verify_tcp_checksum_zero(&outbound));
-    }
-
-    #[test]
-    fn outbound_without_entry_errors() {
-        let table = RewriteTable::new(Ipv4Addr::new(10, 0, 0, 2));
-        let mut pkt = build_tcp_syn(
-            Ipv4Addr::new(10, 0, 0, 2),
-            Ipv4Addr::new(10, 0, 0, 1),
-            80,
-            54321,
-        );
-        let err = table.rewrite_outbound(&mut pkt).unwrap_err();
-        assert!(err.to_string().contains("no entry"));
     }
 
     #[test]

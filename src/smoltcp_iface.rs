@@ -136,7 +136,8 @@ mod tests {
     use smoltcp::socket::tcp;
     use std::net::Ipv4Addr;
 
-    use crate::rewrite::{self, RewriteTable};
+    use crate::nat::NatTable;
+    use crate::rewrite;
 
     fn build_tcp_syn(
         src: Ipv4Addr,
@@ -215,7 +216,7 @@ mod tests {
         listener.listen(80).expect("listen ok");
         let _handle = sockets.add(listener);
 
-        let table = RewriteTable::new(smoltcp_addr);
+        let table = NatTable::new(smoltcp_addr);
 
         // Build a SYN from peer 10.0.0.1:54321 → 192.168.1.50:80 (original dst).
         let mut syn = build_tcp_syn(
@@ -225,8 +226,8 @@ mod tests {
             80,
             1000,
         );
-        let original = table.rewrite_inbound(&mut syn).unwrap();
-        assert_eq!(original, Ipv4Addr::new(192, 168, 1, 50));
+        let key = table.rewrite_inbound(&mut syn).unwrap();
+        assert_eq!(key.original_dst_ip, Ipv4Addr::new(192, 168, 1, 50));
 
         rx.lock().unwrap().push_back(syn);
 
@@ -254,7 +255,7 @@ mod tests {
 
         // Outbound rewrite restores the peer's view: src = original dst.
         let restored = table.rewrite_outbound(&mut out).unwrap();
-        assert_eq!(restored, Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(restored.original_dst_ip, Ipv4Addr::new(192, 168, 1, 50));
         let view_after = rewrite::parse_5tuple(&out).unwrap();
         assert_eq!(view_after.src_ip, Ipv4Addr::new(192, 168, 1, 50));
     }
