@@ -185,6 +185,7 @@ impl WgTunnel {
             SocketAddr::V6(_) => "[::]:0",
         };
         let socket = UdpSocket::bind(bind_addr).await?;
+        disable_udp_connreset(&socket)?;
         let core = WgCore::new(config);
         Ok(Self {
             core,
@@ -249,6 +250,44 @@ async fn resolve_endpoint(addr: &str) -> Result<SocketAddr> {
     let mut iter = lookup_host(addr).await?;
     iter.find(|a| a.is_ipv4())
         .ok_or_else(|| anyhow!("no IPv4 address resolved for endpoint {addr}"))
+}
+
+/// On Windows, a UDP `recv()` returns `WSAECONNRESET` (10054) after a previous
+/// `send_to()` provoked an ICMP port-unreachable. That permanently breaks the
+/// recv loop here even though the WG socket is supposed to be connectionless —
+/// any single misrouted packet would kill the tunnel. The `SIO_UDP_CONNRESET`
+/// ioctl with FALSE suppresses this behavior. No-op everywhere else.
+#[cfg(windows)]
+fn disable_udp_connreset(socket: &UdpSocket) -> Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, WSAIoctl, SIO_UDP_CONNRESET};
+
+    let raw = socket.as_raw_socket() as windows_sys::Win32::Networking::WinSock::SOCKET;
+    let value: u32 = 0; // FALSE
+    let mut bytes_returned: u32 = 0;
+    let rc = unsafe {
+        WSAIoctl(
+            raw,
+            SIO_UDP_CONNRESET,
+            &value as *const _ as *const _,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if rc != 0 {
+        let err = unsafe { WSAGetLastError() };
+        bail!("WSAIoctl(SIO_UDP_CONNRESET) failed: WSAError {err}");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn disable_udp_connreset(_socket: &UdpSocket) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

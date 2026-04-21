@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use base64::Engine;
+use clap::{Parser, Subcommand};
 use smoltcp::iface::SocketHandle;
 use tokio::signal;
 use tokio::sync::{mpsc, Mutex};
@@ -25,21 +26,55 @@ type UdpProxyMap = Arc<Mutex<HashMap<NatKey, mpsc::UnboundedSender<Vec<u8>>>>>;
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
-    /// Path to a wg-quick style configuration file.
-    #[arg(short, long)]
-    config: PathBuf,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
 
-    /// Override the peer endpoint from the config file (host:port).
-    #[arg(long)]
-    endpoint: Option<String>,
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Run the NAT gateway against a wg-quick style config.
+    Run {
+        /// Path to a wg-quick style configuration file.
+        #[arg(short, long)]
+        config: PathBuf,
 
-    /// Override PersistentKeepalive (seconds; 0 disables).
-    #[arg(long)]
-    keepalive: Option<u16>,
+        /// Override the peer endpoint from the config file (host:port).
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// Override PersistentKeepalive (seconds; 0 disables).
+        #[arg(long)]
+        keepalive: Option<u16>,
+    },
+    /// Generate an x25519 keypair (base64) for use in a wg-quick config.
+    Keygen,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Cmd::Keygen => return keygen(),
+        Cmd::Run { config, endpoint, keepalive } => run(config, endpoint, keepalive).await,
+    }
+}
+
+fn keygen() -> Result<()> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("OS RNG: {e}"))?;
+    let secret = x25519_dalek::StaticSecret::from(bytes);
+    let public = x25519_dalek::PublicKey::from(&secret);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    println!("PrivateKey = {}", b64.encode(secret.to_bytes()));
+    println!("PublicKey  = {}", b64.encode(public.as_bytes()));
+    Ok(())
+}
+
+async fn run(
+    config_path: PathBuf,
+    endpoint: Option<String>,
+    keepalive: Option<u16>,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -47,14 +82,13 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
-    let mut cfg = config::load(&cli.config)
-        .with_context(|| format!("loading config from {}", cli.config.display()))?;
+    let mut cfg = config::load(&config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
 
-    if let Some(ep) = cli.endpoint {
+    if let Some(ep) = endpoint {
         cfg.peer.endpoint = ep;
     }
-    if let Some(ka) = cli.keepalive {
+    if let Some(ka) = keepalive {
         cfg.peer.persistent_keepalive = if ka == 0 { None } else { Some(ka) };
     }
 
