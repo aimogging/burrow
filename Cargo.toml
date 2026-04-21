@@ -1,0 +1,21 @@
+[package]
+name = "wgnat"
+version = "0.1.0"
+edition = "2021"
+description = "WireGuard userspace NAT gateway - no TUN, no kernel drivers"
+license = "BSD-3-Clause"
+
+[dependencies]
+boringtun = "0.7"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "fs", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+anyhow = "1"
+thiserror = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
