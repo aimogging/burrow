@@ -5,3 +5,4 @@ pub mod rewrite;
 pub mod runtime;
 pub mod smoltcp_iface;
 pub mod tunnel;
+pub mod udp_proxy;

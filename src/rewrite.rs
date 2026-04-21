@@ -95,6 +95,52 @@ fn rewrite_ip_checksum(packet: &mut [u8], ihl: usize) {
     packet[10..12].copy_from_slice(&csum.to_be_bytes());
 }
 
+/// Build a fully-checksummed IPv4 + UDP datagram from scratch. Used by the
+/// UDP proxy to construct response packets injected back into the tunnel.
+pub fn build_udp_packet(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let total_len = 20 + 8 + payload.len();
+    let mut pkt = vec![0u8; total_len];
+    // IP header
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    pkt[8] = 64; // TTL
+    pkt[9] = PROTO_UDP;
+    pkt[12..16].copy_from_slice(&src_ip.octets());
+    pkt[16..20].copy_from_slice(&dst_ip.octets());
+    rewrite_ip_checksum(&mut pkt, 20);
+    // UDP header
+    let udp_len = (8 + payload.len()) as u16;
+    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[24..26].copy_from_slice(&udp_len.to_be_bytes());
+    // checksum left at 0,0 then computed
+    pkt[28..28 + payload.len()].copy_from_slice(payload);
+    let csum = compute_udp_checksum(&pkt);
+    let csum = if csum == 0 { 0xFFFF } else { csum };
+    pkt[26..28].copy_from_slice(&csum.to_be_bytes());
+    pkt
+}
+
+fn compute_udp_checksum(pkt: &[u8]) -> u16 {
+    // pseudo-header: src(4) + dst(4) + zero(1) + proto(1) + udp_len(2)
+    let udp_len = (pkt.len() - 20) as u16;
+    let mut buf = Vec::with_capacity(12 + pkt.len() - 20);
+    buf.extend_from_slice(&pkt[12..16]);
+    buf.extend_from_slice(&pkt[16..20]);
+    buf.push(0);
+    buf.push(PROTO_UDP);
+    buf.extend_from_slice(&udp_len.to_be_bytes());
+    buf.extend_from_slice(&pkt[20..]);
+    // checksum field already zero in pkt[26..28]
+    ones_complement_checksum(&buf)
+}
+
 /// Apply RFC 1624 incremental checksum update for changing an IP address that
 /// participates in the TCP/UDP pseudo-header.
 fn update_transport_checksum_for_addr_change(
@@ -308,6 +354,39 @@ mod tests {
         rewrite_dst_ip(&mut pkt, Ipv4Addr::new(10, 0, 0, 2)).unwrap();
         assert_eq!(&pkt[26..28], &[0, 0], "UDP checksum 0 must remain 0");
         assert!(verify_ip_checksum_zero(&pkt));
+    }
+
+    #[test]
+    fn build_udp_roundtrips_through_parse() {
+        let payload = b"hello";
+        let pkt = build_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 50),
+            Ipv4Addr::new(10, 0, 0, 1),
+            53,
+            33333,
+            payload,
+        );
+        assert!(verify_ip_checksum_zero(&pkt));
+        let view = parse_5tuple(&pkt).unwrap();
+        assert_eq!(view.proto, PROTO_UDP);
+        assert_eq!(view.src_ip, Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(view.dst_ip, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(view.src_port, 53);
+        assert_eq!(view.dst_port, 33333);
+        // Payload is intact.
+        assert_eq!(&pkt[28..], payload);
+        // UDP checksum is non-zero (payload non-empty so result wasn't 0).
+        assert_ne!(&pkt[26..28], &[0, 0]);
+        // And it actually verifies.
+        let udp_len = (pkt.len() - 20) as u16;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&pkt[12..16]);
+        buf.extend_from_slice(&pkt[16..20]);
+        buf.push(0);
+        buf.push(PROTO_UDP);
+        buf.extend_from_slice(&udp_len.to_be_bytes());
+        buf.extend_from_slice(&pkt[20..]);
+        assert_eq!(ones_complement_checksum(&buf), 0);
     }
 
     #[test]

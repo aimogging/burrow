@@ -12,11 +12,14 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use wgnat::config;
-use wgnat::nat::NatTable;
+use wgnat::nat::{NatKey, NatTable};
 use wgnat::proxy::{spawn_tcp_proxy, ProxyMsg};
-use wgnat::rewrite::{self, PROTO_TCP};
+use wgnat::rewrite::{self, PROTO_TCP, PROTO_UDP};
 use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent, SmoltcpHandle};
 use wgnat::tunnel::WgTunnel;
+use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
+
+type UdpProxyMap = Arc<Mutex<HashMap<NatKey, mpsc::UnboundedSender<Vec<u8>>>>>;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -78,6 +81,22 @@ async fn main() -> Result<()> {
     let proxies: Arc<Mutex<HashMap<SocketHandle, mpsc::UnboundedSender<ProxyMsg>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    // Per-NAT-entry UDP forwarders. Sender accepts raw payloads; the proxy
+    // task sends them to (original_dst_ip, local_port) and pushes responses
+    // (as fully formed IPv4+UDP packets) onto `udp_outbound_tx`.
+    let udp_proxies: UdpProxyMap = Arc::new(Mutex::new(HashMap::new()));
+    let (udp_outbound_tx, mut udp_outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let udp_egress = tokio::spawn({
+        let tunnel = Arc::clone(&tunnel);
+        async move {
+            while let Some(pkt) = udp_outbound_rx.recv().await {
+                if let Err(e) = tunnel.send_packet(&pkt).await {
+                    warn!(error = %e, "udp egress tunnel send");
+                }
+            }
+        }
+    });
+
     // Spawn the smoltcp egress drainer: pulls packets out of smoltcp's tx
     // queue, runs the source rewrite, encapsulates, sends through WG.
     let egress = tokio::spawn(egress_loop(
@@ -120,9 +139,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Periodic NAT sweep.
+    // Periodic NAT sweep. Idle UDP entries also drop their proxy sender,
+    // which closes the channel and lets the proxy task wind down.
     let sweep = tokio::spawn({
         let nat = Arc::clone(&nat);
+        let udp_proxies = Arc::clone(&udp_proxies);
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -134,6 +155,10 @@ async fn main() -> Result<()> {
                 }
                 let removed_udp = nat.sweep_udp_idle(now, wgnat::nat::DEFAULT_UDP_IDLE);
                 if !removed_udp.is_empty() {
+                    let mut map = udp_proxies.lock().await;
+                    for k in &removed_udp {
+                        map.remove(k);
+                    }
                     debug!(count = removed_udp.len(), "NAT entries swept (udp idle)");
                 }
             }
@@ -158,7 +183,13 @@ async fn main() -> Result<()> {
             res = tunnel.recv_step() => {
                 match res {
                     Ok(Some(pkt)) => {
-                        ingest_tunnel_packet(pkt.data, &smoltcp, &nat).await;
+                        ingest_tunnel_packet(
+                            pkt.data,
+                            &smoltcp,
+                            &nat,
+                            &udp_proxies,
+                            &udp_outbound_tx,
+                        ).await;
                     }
                     Ok(None) => { /* control plane */ }
                     Err(e) => error!(error = %e, "wg recv"),
@@ -170,14 +201,20 @@ async fn main() -> Result<()> {
     egress.abort();
     event_loop.abort();
     sweep.abort();
+    udp_egress.abort();
     result
 }
 
-/// Take a decrypted IPv4 packet from the WG tunnel, run NAT rewrite, ensure
-/// a TCP listener exists for the destination port (Phase 4: TCP only), and
-/// hand the packet to smoltcp.
-async fn ingest_tunnel_packet(mut packet: Vec<u8>, smoltcp: &SmoltcpHandle, nat: &Arc<NatTable>) {
-    // Pre-parse the proto so we can branch (UDP/ICMP land in later phases).
+/// Take a decrypted IPv4 packet from the WG tunnel, run NAT rewrite, and
+/// dispatch by protocol: TCP into smoltcp, UDP into the per-entry forwarder.
+/// ICMP lands in Phase 6.
+async fn ingest_tunnel_packet(
+    mut packet: Vec<u8>,
+    smoltcp: &SmoltcpHandle,
+    nat: &Arc<NatTable>,
+    udp_proxies: &UdpProxyMap,
+    udp_outbound_tx: &mpsc::UnboundedSender<Vec<u8>>,
+) {
     let view = match rewrite::parse_5tuple(&packet) {
         Ok(v) => v,
         Err(e) => {
@@ -185,30 +222,55 @@ async fn ingest_tunnel_packet(mut packet: Vec<u8>, smoltcp: &SmoltcpHandle, nat:
             return;
         }
     };
-    if view.proto != PROTO_TCP {
-        debug!(proto = view.proto, "non-TCP tunnel packet (Phase 4 stub: dropping)");
-        return;
-    }
-
-    let key = match nat.rewrite_inbound(&mut packet) {
-        Ok(k) => k,
-        Err(e) => {
-            warn!(error = %e, "nat rewrite_inbound failed");
-            return;
-        }
-    };
-
-    // Ensure listener exists *before* the SYN reaches the smoltcp poll.
-    if nat.get(key).and_then(|e| e.smoltcp_handle).is_none() {
-        match smoltcp.ensure_listener(key.local_port, key).await {
-            Ok(_) => {}
-            Err(_) => {
+    match view.proto {
+        PROTO_TCP => {
+            let key = match nat.rewrite_inbound(&mut packet) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!(error = %e, "nat rewrite_inbound (tcp) failed");
+                    return;
+                }
+            };
+            // Ensure listener exists *before* the SYN reaches the smoltcp poll.
+            if nat.get(key).and_then(|e| e.smoltcp_handle).is_none()
+                && smoltcp.ensure_listener(key.local_port, key).await.is_err()
+            {
                 error!(?key, "smoltcp thread dropped ensure_listener reply");
                 return;
             }
+            smoltcp.enqueue_inbound(packet);
+        }
+        PROTO_UDP => {
+            let key = match nat.rewrite_inbound(&mut packet) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!(error = %e, "nat rewrite_inbound (udp) failed");
+                    return;
+                }
+            };
+            let payload = match extract_udp_payload(&packet) {
+                Some(p) => p,
+                None => {
+                    debug!(?key, "malformed udp datagram");
+                    return;
+                }
+            };
+            let tx = {
+                let mut map = udp_proxies.lock().await;
+                map.entry(key)
+                    .or_insert_with(|| spawn_udp_proxy(key, udp_outbound_tx.clone()))
+                    .clone()
+            };
+            if tx.send(payload).is_err() {
+                // Stale proxy sender — its task already exited. Drop the entry
+                // so the next datagram spawns a fresh one.
+                udp_proxies.lock().await.remove(&key);
+            }
+        }
+        other => {
+            debug!(proto = other, "non-TCP/UDP tunnel packet (Phase 6 stub: dropping)");
         }
     }
-    smoltcp.enqueue_inbound(packet);
 }
 
 async fn egress_loop(tunnel: Arc<WgTunnel>, smoltcp: SmoltcpHandle, nat: Arc<NatTable>) {
