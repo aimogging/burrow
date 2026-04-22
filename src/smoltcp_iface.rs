@@ -12,12 +12,10 @@
 //! sync. That's exactly the shape smoltcp's blocking poll loop needs, while
 //! still letting tokio tasks consume the receiver asynchronously.
 
-use core::net::Ipv4Addr;
-
 use smoltcp::iface::{Config as IfaceConfig, Interface};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Cidr as SmolIpv4Cidr};
+use smoltcp::wire::{HardwareAddress, IpCidr};
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use crate::config::Ipv4Cidr;
@@ -114,10 +112,8 @@ pub fn build_interface(addr: &Ipv4Cidr, device: &mut ChannelDevice) -> Interface
     let config = IfaceConfig::new(HardwareAddress::Ip);
     let mut iface = Interface::new(config, device, SmolInstant::now());
     iface.update_ip_addrs(|addrs| {
-        let ip = Ipv4Addr::from(addr.address.octets());
-        let cidr = SmolIpv4Cidr::new(ip, addr.prefix_len);
         addrs
-            .push(IpCidr::Ipv4(cidr))
+            .push(IpCidr::Ipv4(*addr))
             .expect("IP address vec full — should hold at least one");
     });
     iface
@@ -194,7 +190,7 @@ mod tests {
     #[test]
     fn syn_through_pipeline_yields_synack() {
         let smoltcp_addr = Ipv4Addr::new(10, 0, 0, 2);
-        let cidr: crate::config::Ipv4Cidr = "10.0.0.2/24".parse().unwrap();
+        let cidr = crate::config::parse_ipv4_cidr("10.0.0.2/24").unwrap();
 
         let (rx_tx, rx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (tx_tx, mut tx_rx) = mpsc::unbounded_channel::<Vec<u8>>();

@@ -1212,7 +1212,6 @@ dependencies = [
  "base64 0.22.1",
  "boringtun",
  "clap",
- "getrandom 0.4.2",
  "smoltcp",
  "socket2",
  "tempfile",

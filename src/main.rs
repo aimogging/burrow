@@ -70,9 +70,7 @@ async fn main() -> Result<()> {
 }
 
 fn keygen() -> Result<()> {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("OS RNG: {e}"))?;
-    let secret = x25519_dalek::StaticSecret::from(bytes);
+    let secret = x25519_dalek::StaticSecret::random();
     let public = x25519_dalek::PublicKey::from(&secret);
     let b64 = base64::engine::general_purpose::STANDARD;
     println!("PrivateKey = {}", b64.encode(secret.to_bytes()));
@@ -122,7 +120,7 @@ async fn run(
         "starting wgnat"
     );
 
-    let nat = Arc::new(NatTable::new(cfg.interface.address.address));
+    let nat = Arc::new(NatTable::new(cfg.interface.address.address()));
     let tunnel = Arc::new(WgTunnel::new(&cfg).await.context("WireGuard tunnel")?);
     info!(local = %tunnel.local_addr()?, peer = %tunnel.endpoint(), "WG socket bound");
 

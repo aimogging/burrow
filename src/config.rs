@@ -1,60 +1,37 @@
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ipv4Cidr {
-    pub address: Ipv4Addr,
-    pub prefix_len: u8,
-}
+pub use smoltcp::wire::Ipv4Cidr;
 
-impl fmt::Display for Ipv4Cidr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.address, self.prefix_len)
+/// Parse a wg-quick `Address` / `AllowedIPs` entry like `10.0.0.2/24` (or a
+/// bare host address, treated as `/32`) into an `Ipv4Cidr`. smoltcp's
+/// `Ipv4Cidr` has no `FromStr` impl in 0.13, so this helper bridges that gap
+/// while still letting the rest of the codebase use smoltcp's typed CIDR
+/// directly.
+pub fn parse_ipv4_cidr(s: &str) -> Result<Ipv4Cidr> {
+    let s = s.trim();
+    let (addr_str, prefix_str) = match s.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s, None),
+    };
+    let address: Ipv4Addr = addr_str
+        .parse()
+        .with_context(|| format!("invalid IPv4 address: {addr_str}"))?;
+    let prefix_len = match prefix_str {
+        Some(p) => p
+            .parse::<u8>()
+            .with_context(|| format!("invalid CIDR prefix: {p}"))?,
+        None => 32,
+    };
+    if prefix_len > 32 {
+        bail!("CIDR prefix length out of range: {prefix_len}");
     }
-}
-
-impl FromStr for Ipv4Cidr {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        let s = s.trim();
-        let (addr_str, prefix_str) = match s.split_once('/') {
-            Some((a, p)) => (a, Some(p)),
-            None => (s, None),
-        };
-        let address: Ipv4Addr = addr_str
-            .parse()
-            .with_context(|| format!("invalid IPv4 address: {addr_str}"))?;
-        let prefix_len = match prefix_str {
-            Some(p) => p
-                .parse::<u8>()
-                .with_context(|| format!("invalid CIDR prefix: {p}"))?,
-            None => 32,
-        };
-        if prefix_len > 32 {
-            bail!("CIDR prefix length out of range: {prefix_len}");
-        }
-        Ok(Ipv4Cidr {
-            address,
-            prefix_len,
-        })
-    }
-}
-
-impl Ipv4Cidr {
-    pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        if self.prefix_len == 0 {
-            return true;
-        }
-        let mask = u32::MAX << (32 - self.prefix_len);
-        u32::from(ip) & mask == u32::from(self.address) & mask
-    }
+    Ok(Ipv4Cidr::new(address, prefix_len))
 }
 
 #[derive(Clone)]
@@ -226,9 +203,8 @@ fn apply_interface_kv(
             builder.private_key = Some(StaticSecret::from(bytes));
         }
         "address" => {
-            let cidr = value
-                .parse::<Ipv4Cidr>()
-                .with_context(|| format!("line {lineno}: invalid Address"))?;
+            let cidr =
+                parse_ipv4_cidr(value).with_context(|| format!("line {lineno}: invalid Address"))?;
             builder.address = Some(cidr);
         }
         "listenport" | "dns" | "mtu" | "fwmark" | "table" | "preup" | "postup" | "predown"
@@ -271,8 +247,7 @@ fn apply_peer_kv(
                     );
                     continue;
                 }
-                let cidr = entry
-                    .parse::<Ipv4Cidr>()
+                let cidr = parse_ipv4_cidr(entry)
                     .with_context(|| format!("line {lineno}: invalid AllowedIP `{entry}`"))?;
                 builder.allowed_ips.push(cidr);
             }
@@ -329,8 +304,8 @@ mod tests {
     #[test]
     fn parses_minimal_valid_config() {
         let cfg = parse_str(&sample_config()).expect("should parse");
-        assert_eq!(cfg.interface.address.prefix_len, 24);
-        assert_eq!(cfg.interface.address.address, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(cfg.interface.address.prefix_len(), 24);
+        assert_eq!(cfg.interface.address.address(), Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(cfg.peer.endpoint, "198.51.100.1:51820");
         assert_eq!(cfg.peer.allowed_ips.len(), 2);
         assert_eq!(cfg.peer.persistent_keepalive, Some(25));
@@ -457,15 +432,15 @@ mod tests {
 
     #[test]
     fn ipv4_cidr_contains() {
-        let net: Ipv4Cidr = "192.168.1.0/24".parse().unwrap();
-        assert!(net.contains(Ipv4Addr::new(192, 168, 1, 50)));
-        assert!(!net.contains(Ipv4Addr::new(192, 168, 2, 50)));
-        let any: Ipv4Cidr = "0.0.0.0/0".parse().unwrap();
-        assert!(any.contains(Ipv4Addr::new(8, 8, 8, 8)));
-        let host: Ipv4Cidr = "10.0.0.1".parse().unwrap();
-        assert_eq!(host.prefix_len, 32);
-        assert!(host.contains(Ipv4Addr::new(10, 0, 0, 1)));
-        assert!(!host.contains(Ipv4Addr::new(10, 0, 0, 2)));
+        let net = parse_ipv4_cidr("192.168.1.0/24").unwrap();
+        assert!(net.contains_addr(&Ipv4Addr::new(192, 168, 1, 50)));
+        assert!(!net.contains_addr(&Ipv4Addr::new(192, 168, 2, 50)));
+        let any = parse_ipv4_cidr("0.0.0.0/0").unwrap();
+        assert!(any.contains_addr(&Ipv4Addr::new(8, 8, 8, 8)));
+        let host = parse_ipv4_cidr("10.0.0.1").unwrap();
+        assert_eq!(host.prefix_len(), 32);
+        assert!(host.contains_addr(&Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(!host.contains_addr(&Ipv4Addr::new(10, 0, 0, 2)));
     }
 
     #[test]

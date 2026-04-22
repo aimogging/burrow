@@ -429,7 +429,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_emits_synack_for_listened_port() {
         let nat = Arc::new(NatTable::new(Ipv4Addr::new(10, 0, 0, 2)));
-        let cidr: Ipv4Cidr = "10.0.0.2/24".parse().unwrap();
+        let cidr = crate::config::parse_ipv4_cidr("10.0.0.2/24").unwrap();
         let (handle, _events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), cidr);
 
         let mut syn = build_tcp_syn(
