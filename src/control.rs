@@ -22,6 +22,7 @@ use crate::proxy::ProxyMsg;
 use crate::reverse_registry::{RegisterError, ReverseRegistry, UnregisterError};
 use crate::rewrite::PROTO_TCP;
 use crate::runtime::{ConnectionId, SmoltcpHandle};
+use crate::shell_handler::handle_shell_request;
 use crate::wire::{ClientReq, ErrorKind, Proto, ServerResp, MAX_FRAME_LEN};
 
 /// Build a unique synthetic `NatKey` for a service listener on
@@ -159,6 +160,11 @@ async fn handle_request(
             },
         },
         ClientReq::ListReverse => ServerResp::ReverseList(registry.list()),
+        ClientReq::RequestShell {
+            mode,
+            program,
+            args,
+        } => handle_shell_request(mode, program, args).await,
     }
 }
 

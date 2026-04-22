@@ -70,6 +70,24 @@ pub enum ErrorKind {
     Internal,
 }
 
+/// Execution mode for `RequestShell`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellMode {
+    /// Run the program to completion, capture stdout/stderr/status,
+    /// return everything in a single `ShellResult`. No PTY — use for
+    /// scripted / non-interactive callers.
+    Oneshot,
+    /// Spawn the program detached. Server returns `ShellSpawned{pid}`
+    /// immediately; no output is captured. The program outlives the
+    /// control flow that launched it.
+    FireAndForget,
+    /// Interactive PTY session. Server responds `ShellReady`; the flow
+    /// then switches to a framed stdio protocol for the session
+    /// lifetime. Lands in Phase 17 (requires PTY crate + client-side
+    /// terminal handling). Phase 16 returns `Error{NotYetSupported}`.
+    Interactive,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientReq {
     RegisterReverse {
@@ -81,9 +99,15 @@ pub enum ClientReq {
         tunnel_id: TunnelId,
     },
     ListReverse,
-    // Phase 16 will add `RequestShell { program, args, cols, rows }`.
-    // Reserved tag slot so clients can feature-detect by attempting the
-    // request and matching `Error{NotYetSupported}`.
+    RequestShell {
+        mode: ShellMode,
+        /// Executable to run. `None` → per-OS default (`cmd.exe` on
+        /// Windows, `$SHELL` or `/bin/sh` on Unix).
+        program: Option<String>,
+        /// Argv passed verbatim to the child. No shell interpolation
+        /// server-side.
+        args: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -91,6 +115,20 @@ pub enum ServerResp {
     Ok { tunnel_id: TunnelId },
     Unregistered,
     ReverseList(Vec<ReverseEntry>),
+    /// Response for `ShellMode::Oneshot`. `exit_code` is `None` if the
+    /// process was terminated by a signal (Unix) or stopped via an
+    /// unhandled exception (Windows).
+    ShellResult {
+        exit_code: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    /// Response for `ShellMode::FireAndForget`.
+    ShellSpawned { pid: u32 },
+    /// Response for `ShellMode::Interactive` (Phase 17). After
+    /// sending, the server switches the flow into a framed stdio
+    /// protocol for the session lifetime.
+    ShellReady,
     Error { kind: ErrorKind, msg: String },
 }
 
