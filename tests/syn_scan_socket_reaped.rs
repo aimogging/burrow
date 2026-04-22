@@ -109,7 +109,7 @@ fn build_pkt(
 #[tokio::test]
 async fn syn_scan_style_rst_reaps_listener_and_nat_entry() {
     let nat = Arc::new(NatTable::new());
-    let (handle, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat));
+    let (handle, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), std::net::Ipv4Addr::new(10, 0, 0, 2));
 
     // Ingress: SYN from peer to ORIGINAL_DST:ORIGINAL_DST_PORT, NAT rewrites
     // dst to GATEWAY_IP:gateway_port.

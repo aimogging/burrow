@@ -222,7 +222,7 @@ async fn tcp_proxy_round_trips_via_loopback_echo() {
     let dst_port = echo_addr.port();
 
     let nat = Arc::new(NatTable::new());
-    let (runtime, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat));
+    let (runtime, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), std::net::Ipv4Addr::new(10, 0, 0, 2));
 
     // Wire the same event-loop logic as main.rs. The proxies map lives
     // entirely inside this task — single-owner, no Mutex needed.

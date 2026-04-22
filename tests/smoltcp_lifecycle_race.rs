@@ -26,7 +26,7 @@ use wgnat::runtime::spawn_smoltcp;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_write_after_close_does_not_panic() {
     let nat = Arc::new(NatTable::new());
-    let (handle, _events, _tx_rx) = spawn_smoltcp(Arc::clone(&nat));
+    let (handle, _events, _tx_rx) = spawn_smoltcp(Arc::clone(&nat), std::net::Ipv4Addr::new(10, 0, 0, 2));
 
     // Many short-lived listeners. Each one is registered, immediately
     // aborted, and then we *intentionally* try to write to its (now-stale)

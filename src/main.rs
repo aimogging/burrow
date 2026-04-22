@@ -177,7 +177,8 @@ async fn run(
     let tunnel = Arc::new(WgTunnel::new(&cfg).await.context("WireGuard tunnel")?);
     info!(local = %tunnel.local_addr()?, peer = %tunnel.endpoint(), "WG socket bound");
 
-    let (smoltcp, mut events, smoltcp_tx_rx) = spawn_smoltcp(Arc::clone(&nat));
+    let wg_ip = cfg.interface.address.address();
+    let (smoltcp, mut events, smoltcp_tx_rx) = spawn_smoltcp(Arc::clone(&nat), wg_ip);
     info!("smoltcp runtime spawned");
 
     tunnel
@@ -214,6 +215,7 @@ async fn run(
         Arc::clone(&tunnel),
         smoltcp_tx_rx,
         Arc::clone(&nat),
+        wg_ip,
     ));
 
     // Channel that connect_probe uses to hand a successfully-connected OS
@@ -347,6 +349,7 @@ async fn run(
                             &egress_tx,
                             &arm_tx,
                             &icmp,
+                            wg_ip,
                         ).await;
                     }
                     Ok(None) => { /* control plane */ }
@@ -374,6 +377,7 @@ async fn ingest_tunnel_packet(
     egress_tx: &mpsc::UnboundedSender<Vec<u8>>,
     arm_tx: &mpsc::UnboundedSender<(NatKey, TcpStream)>,
     icmp: &Arc<IcmpForwarder>,
+    wg_ip: std::net::Ipv4Addr,
 ) {
     let view = match rewrite::parse_5tuple(&packet) {
         Ok(v) => v,
@@ -382,6 +386,17 @@ async fn ingest_tunnel_packet(
             return;
         }
     };
+    // Packets addressed to wgnat's WG IP belong to smoltcp directly:
+    //   - TCP: responses to originated outbound flows (Phase 12), or
+    //     future connections to reverse-tunnel / control listeners
+    //     (Phase 13+).
+    //   - UDP: same shape, including the future DNS service (Phase 15).
+    // Skip NAT entirely — smoltcp is already the address owner with
+    // `set_any_ip(true)` + wg_ip/32 on the interface.
+    if view.dst_ip == wg_ip && matches!(view.proto, PROTO_TCP | PROTO_UDP) {
+        smoltcp.enqueue_inbound(packet);
+        return;
+    }
     match view.proto {
         PROTO_TCP => {
             // Compute the prospective NatKey from the packet's natural
@@ -475,11 +490,22 @@ async fn egress_loop(
     tunnel: Arc<WgTunnel>,
     mut tx_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     nat: Arc<NatTable>,
+    wg_ip: std::net::Ipv4Addr,
 ) {
     while let Some(mut pkt) = tx_rx.recv().await {
-        if let Err(e) = nat.rewrite_outbound(&mut pkt) {
-            debug!(error = %e, "egress rewrite (no NAT entry — likely RST for unknown flow)");
-            continue;
+        // Originated flows (reverse tunnels, DNS, control channel) already
+        // have src=wg_ip — they bypass the NAT rewrite. Everything else
+        // comes from the synthetic 198.18.0.0/15 pool and needs src
+        // restored to original_dst_ip before the peer sees it.
+        let src_is_wg = match rewrite::parse_5tuple(&pkt) {
+            Ok(v) => v.src_ip == wg_ip,
+            Err(_) => false,
+        };
+        if !src_is_wg {
+            if let Err(e) = nat.rewrite_outbound(&mut pkt) {
+                debug!(error = %e, "egress rewrite (no NAT entry — likely RST for unknown flow)");
+                continue;
+            }
         }
         if let Err(e) = tunnel.send_packet(&pkt).await {
             warn!(error = %e, "wg send");

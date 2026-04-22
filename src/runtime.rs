@@ -26,7 +26,7 @@
 //! (open OS TcpStream, shuffle bytes both ways) lives in `crate::proxy`.
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -36,8 +36,10 @@ use anyhow::{anyhow, Result};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{IpAddress, IpListenEndpoint, Ipv4Cidr};
+use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Cidr};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::rewrite::PROTO_TCP;
 
 use crate::nat::{
     ConnectionState, NatKey, NatTable, DEFAULT_TCP_GRACE, VIRTUAL_CIDR_PREFIX, VIRTUAL_IFACE_ADDR,
@@ -80,6 +82,23 @@ pub enum SmoltcpCmd {
         port: u16,
         key: NatKey,
         ready: oneshot::Sender<ConnectionId>,
+    },
+    /// Open an outbound TCP connection originated by wgnat itself (reverse
+    /// tunnels, future DNS/control flows). smoltcp binds the socket on
+    /// `local` (which should be `(wg_ip, ephemeral_port)`) and calls
+    /// `connect` to `remote`. Replies once the SYN has been dispatched with
+    /// the `ConnectionId`; the caller then awaits `SmoltcpEvent::TcpConnected`
+    /// on the same id to know the remote completed the handshake.
+    ///
+    /// The stored `NatKey` is synthetic — it carries `remote` in the
+    /// peer-side fields and `local` in the original_dst-side fields — and
+    /// is NOT inserted into the NAT table. It's only used for event routing
+    /// and diagnostics. Egress packets from this socket have src==wg_ip and
+    /// MUST bypass `rewrite_outbound` in the egress loop.
+    OpenOutboundTcp {
+        local: SocketAddrV4,
+        remote: SocketAddrV4,
+        ready: oneshot::Sender<Result<ConnectionId>>,
     },
     /// Append `data` to the smoltcp socket's tx buffer. Replies with the
     /// number of bytes accepted (0 if the buffer is full or the socket is
@@ -156,6 +175,30 @@ impl SmoltcpHandle {
         rx
     }
 
+    /// Originate an outbound TCP connection. `local` should typically be
+    /// `(wg_ip, 0)` — the runtime picks an ephemeral local port if the
+    /// port is 0. Returns the `ConnectionId` once the socket is registered;
+    /// the caller awaits `SmoltcpEvent::TcpConnected { id, .. }` to know the
+    /// handshake completed. The synthetic `NatKey` attached to events has
+    /// `peer_* = remote`, `original_dst_* = local` — useful for debug
+    /// output; NOT a real NAT-table entry.
+    pub async fn open_outbound_tcp(
+        &self,
+        local: SocketAddrV4,
+        remote: SocketAddrV4,
+    ) -> Result<ConnectionId> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SmoltcpCmd::OpenOutboundTcp {
+                local,
+                remote,
+                ready: tx,
+            })
+            .map_err(|_| anyhow!("smoltcp thread terminated"))?;
+        rx.await
+            .map_err(|_| anyhow!("smoltcp thread dropped reply"))?
+    }
+
     pub async fn write_tcp(&self, id: ConnectionId, data: Vec<u8>) -> Result<usize> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
@@ -181,10 +224,16 @@ pub struct SmoltcpEvents {
 /// Spawn the smoltcp poll thread. Returns the cmd handle, an event stream,
 /// and the receiver end of the device's tx queue (drained by the egress
 /// task to encapsulate and send through the WG tunnel). The smoltcp
-/// interface's IP configuration is fixed at the synthetic `198.18.0.0/15`
-/// range (see `nat::VIRTUAL_*`), and `set_any_ip(true)` makes smoltcp
-/// accept packets to any address in that prefix.
-pub fn spawn_smoltcp(nat: Arc<NatTable>) -> (SmoltcpHandle, SmoltcpEvents, PacketReceiver) {
+/// interface is configured with the synthetic `198.18.0.0/15` range (see
+/// `nat::VIRTUAL_*`) plus `wg_ip/32` — the WG IP is required for
+/// originated outbound flows (reverse tunnels, DNS, control channel) so
+/// smoltcp can produce packets with the right src address and accept
+/// responses to it. `set_any_ip(true)` makes the interface accept packets
+/// to any address in that pool.
+pub fn spawn_smoltcp(
+    nat: Arc<NatTable>,
+    wg_ip: Ipv4Addr,
+) -> (SmoltcpHandle, SmoltcpEvents, PacketReceiver) {
     let (rx_tx, rx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (tx_tx, tx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -194,7 +243,7 @@ pub fn spawn_smoltcp(nat: Arc<NatTable>) -> (SmoltcpHandle, SmoltcpEvents, Packe
 
     thread::Builder::new()
         .name("wgnat-smoltcp".into())
-        .spawn(move || run_smoltcp_thread(rx_rx, tx_tx, cmd_rx, evt_tx, nat_thread))
+        .spawn(move || run_smoltcp_thread(rx_rx, tx_tx, cmd_rx, evt_tx, nat_thread, wg_ip))
         .expect("spawn smoltcp thread");
 
     (
@@ -217,14 +266,25 @@ fn run_smoltcp_thread(
     mut cmd_rx: mpsc::UnboundedReceiver<SmoltcpCmd>,
     evt_tx: mpsc::UnboundedSender<SmoltcpEvent>,
     nat: Arc<NatTable>,
+    wg_ip: Ipv4Addr,
 ) {
     let addr = Ipv4Cidr::new(VIRTUAL_IFACE_ADDR, VIRTUAL_CIDR_PREFIX);
     let mut device = ChannelDevice::new(rx_queue, tx_queue);
     let mut iface = build_interface(&addr, &mut device);
+    // Add wg_ip as a second interface address so originated outbound sockets
+    // can bind src=wg_ip and smoltcp accepts the replies. /32 keeps it a
+    // host route — we don't want to accidentally shadow the virtual /15.
+    iface.update_ip_addrs(|addrs| {
+        let wg_cidr = Ipv4Cidr::new(wg_ip, 32);
+        addrs
+            .push(IpCidr::Ipv4(wg_cidr))
+            .expect("interface address vec full — should hold wg_ip alongside virtual CIDR");
+    });
     // `any_ip=true` makes `has_ip_addr` return true unconditionally, so the
     // interface accepts packets addressed to any virtual_ip in the pool
     // without needing to enumerate 131K addresses on the interface vec.
     iface.set_any_ip(true);
+    tracing::debug!(?wg_ip, "smoltcp interface bound with wg_ip");
     let mut sockets: SocketSet<'static> = SocketSet::new(vec![]);
 
     let mut conns: HashMap<ConnectionId, ConnState> = HashMap::new();
@@ -256,7 +316,15 @@ fn run_smoltcp_thread(
         // 1. Drain commands first so a freshly registered listener is in place
         //    before its triggering SYN reaches `iface.poll`.
         while let Ok(cmd) = cmd_rx.try_recv() {
-            handle_command(cmd, &mut sockets, &mut conns, &mut by_handle, &mut next_id, &nat);
+            handle_command(
+                cmd,
+                &mut iface,
+                &mut sockets,
+                &mut conns,
+                &mut by_handle,
+                &mut next_id,
+                &nat,
+            );
         }
 
         // 2. Drive the stack. `poll` returns whether anything changed —
@@ -389,6 +457,7 @@ fn run_smoltcp_thread(
 
 fn handle_command(
     cmd: SmoltcpCmd,
+    iface: &mut smoltcp::iface::Interface,
     sockets: &mut SocketSet<'static>,
     conns: &mut HashMap<ConnectionId, ConnState>,
     by_handle: &mut HashMap<SocketHandle, ConnectionId>,
@@ -436,6 +505,57 @@ fn handle_command(
             by_handle.insert(handle, id);
             nat.set_id(key, id);
             let _ = ready.send(id);
+        }
+        SmoltcpCmd::OpenOutboundTcp {
+            local,
+            remote,
+            ready,
+        } => {
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
+            let sock = tcp::Socket::new(rx_buf, tx_buf);
+            let handle = sockets.add(sock);
+            // Grab a mutable ref back out so we can call connect with
+            // iface.context(). This mirrors how listeners are set up — add
+            // first, configure after.
+            let connect_result = {
+                let sock_mut = sockets.get_mut::<tcp::Socket>(handle);
+                let local_ep = IpListenEndpoint {
+                    addr: Some(IpAddress::Ipv4(*local.ip())),
+                    port: local.port(),
+                };
+                let remote_ep = IpEndpoint {
+                    addr: IpAddress::Ipv4(*remote.ip()),
+                    port: remote.port(),
+                };
+                sock_mut.connect(iface.context(), remote_ep, local_ep)
+            };
+            if let Err(e) = connect_result {
+                sockets.remove(handle);
+                let _ = ready.send(Err(anyhow!("tcp connect: {e:?}")));
+                return;
+            }
+            let id = ConnectionId(*next_id);
+            *next_id += 1;
+            // Synthetic NatKey: carries remote in peer_* and local in
+            // original_dst_*. Never inserted into the NAT table; used only
+            // for event routing + tracing output.
+            let synth_key = NatKey {
+                proto: PROTO_TCP,
+                peer_ip: *remote.ip(),
+                peer_port: remote.port(),
+                original_dst_ip: *local.ip(),
+                original_dst_port: local.port(),
+            };
+            conns.insert(
+                id,
+                ConnState {
+                    handle,
+                    key: synth_key,
+                },
+            );
+            by_handle.insert(handle, id);
+            let _ = ready.send(Ok(id));
         }
         SmoltcpCmd::WriteTcp { id, data, ack } => {
             // Stale id (already torn down). No-op with 0 bytes accepted —
@@ -522,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_emits_synack_for_listened_port() {
         let nat = Arc::new(NatTable::new());
-        let (handle, _events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat));
+        let (handle, _events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), Ipv4Addr::new(10, 0, 0, 2));
 
         let mut syn = build_tcp_syn(
             Ipv4Addr::new(10, 0, 0, 1),
