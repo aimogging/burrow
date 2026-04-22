@@ -32,7 +32,6 @@ use wgnat::rewrite::PROTO_TCP;
 use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent};
 
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
-const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const ORIGINAL_DST: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 50);
 const PEER_PORT: u16 = 54321;
 const ORIGINAL_DST_PORT: u16 = 8080;
@@ -109,9 +108,8 @@ fn build_pkt(
 
 #[tokio::test]
 async fn syn_scan_style_rst_reaps_listener_and_nat_entry() {
-    let nat = Arc::new(NatTable::new(GATEWAY_IP));
-    let cidr = wgnat::config::parse_ipv4_cidr("10.0.0.2/24").unwrap();
-    let (handle, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), cidr);
+    let nat = Arc::new(NatTable::new());
+    let (handle, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat));
 
     // Ingress: SYN from peer to ORIGINAL_DST:ORIGINAL_DST_PORT, NAT rewrites
     // dst to GATEWAY_IP:gateway_port.
@@ -124,10 +122,10 @@ async fn syn_scan_style_rst_reaps_listener_and_nat_entry() {
         0,
         0x02,
     );
-    let (key, gateway_port) = nat.rewrite_inbound(&mut syn).unwrap();
+    let (key, virtual_ip, gateway_port) = nat.rewrite_inbound(&mut syn).unwrap();
 
     // Register the listener BEFORE enqueueing — same ordering as connect_probe.
-    let _id = handle.ensure_listener(gateway_port, key).await.unwrap();
+    let _id = handle.ensure_listener(virtual_ip, gateway_port, key).await.unwrap();
     assert_eq!(nat.len(), 1, "NAT entry created on rewrite_inbound");
 
     handle.enqueue_inbound(syn);
@@ -224,10 +222,10 @@ async fn syn_scan_style_rst_reaps_listener_and_nat_entry() {
         0,
         0x02,
     );
-    let (_, new_gw) = nat.rewrite_inbound(&mut probe_syn).unwrap();
+    let (_, new_vip, new_gw) = nat.rewrite_inbound(&mut probe_syn).unwrap();
     let _new_id = timeout(
         Duration::from_secs(1),
-        handle.ensure_listener(new_gw, new_key),
+        handle.ensure_listener(new_vip, new_gw, new_key),
     )
     .await
     .expect("ensure_listener didn't reply within 1s")

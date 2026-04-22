@@ -12,14 +12,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use wgnat::config::Ipv4Cidr;
 use wgnat::nat::NatTable;
 use wgnat::proxy::{spawn_tcp_proxy, ProxyMsg};
 use wgnat::rewrite::PROTO_TCP;
 use wgnat::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent};
 
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
-const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const PEER_PORT: u16 = 54321;
 
 /// Minimal hand-rolled TCP peer state — enough to do a 3-way handshake,
@@ -223,9 +221,8 @@ async fn tcp_proxy_round_trips_via_loopback_echo() {
     };
     let dst_port = echo_addr.port();
 
-    let nat = Arc::new(NatTable::new(GATEWAY_IP));
-    let cidr: Ipv4Cidr = "10.0.0.2/24".parse().unwrap();
-    let (runtime, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), cidr);
+    let nat = Arc::new(NatTable::new());
+    let (runtime, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat));
 
     // Wire the same event-loop logic as main.rs. The proxies map lives
     // entirely inside this task — single-owner, no Mutex needed.
@@ -278,8 +275,8 @@ async fn tcp_proxy_round_trips_via_loopback_echo() {
 
     // 1. Send SYN.
     let mut syn = peer.syn();
-    let (key, gateway_port) = nat.rewrite_inbound(&mut syn).unwrap();
-    let _ = runtime.ensure_listener(gateway_port, key).await.unwrap();
+    let (key, virtual_ip, gateway_port) = nat.rewrite_inbound(&mut syn).unwrap();
+    let _ = runtime.ensure_listener(virtual_ip, gateway_port, key).await.unwrap();
     runtime.enqueue_inbound(syn);
     peer.seq = peer.seq.wrapping_add(1); // SYN consumes seq
 

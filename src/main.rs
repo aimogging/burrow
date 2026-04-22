@@ -9,23 +9,20 @@ use clap::{Parser, Subcommand};
 use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use wgnat::config;
-use wgnat::icmp::IcmpForwarder;
+use wgnat::icmp::{
+    send_dest_unreachable, IcmpForwarder, ICMP_CODE_HOST_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE,
+};
 use wgnat::nat::{NatKey, NatTable};
+use wgnat::probe::{classify_connect_error, ConnectClass};
 use wgnat::proxy::{spawn_tcp_proxy_with_stream, ProxyMsg};
 use wgnat::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent, SmoltcpHandle};
 use wgnat::tunnel::WgTunnel;
 use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
-
-/// How long to wait on the OS-side TCP connect during the probe before
-/// giving up and synthesizing a RST back to the peer. Roughly matches the
-/// first SYN-ACK retransmit window so we don't keep peers waiting.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Optional config baked in at build time via the `embedded-config` feature.
 /// The path is taken from `WGNAT_EMBEDDED_CONFIG` at build time; `build.rs`
@@ -169,13 +166,18 @@ async fn run(
         keepalive = ?cfg.peer.persistent_keepalive,
         "starting wgnat"
     );
+    // Phase 11: the `Address` field is parsed for wg-quick file-format
+    // compatibility but plays no runtime role. The smoltcp interface uses a
+    // fixed synthetic CIDR (198.18.0.0/15) as opaque identifier space; the
+    // egress rewrite restores the peer-visible src_ip before any packet
+    // leaves wgnat, so the configured Address never appears on the wire.
+    info!("interface Address is informational under Phase 11 (smoltcp side uses 198.18.0.0/15 internally)");
 
-    let nat = Arc::new(NatTable::new(cfg.interface.address.address()));
+    let nat = Arc::new(NatTable::new());
     let tunnel = Arc::new(WgTunnel::new(&cfg).await.context("WireGuard tunnel")?);
     info!(local = %tunnel.local_addr()?, peer = %tunnel.endpoint(), "WG socket bound");
 
-    let (smoltcp, mut events, smoltcp_tx_rx) =
-        spawn_smoltcp(Arc::clone(&nat), cfg.interface.address);
+    let (smoltcp, mut events, smoltcp_tx_rx) = spawn_smoltcp(Arc::clone(&nat));
     info!("smoltcp runtime spawned");
 
     tunnel
@@ -434,8 +436,8 @@ async fn ingest_tunnel_packet(
             }
         }
         PROTO_UDP => {
-            let (key, _gateway_port) = match nat.rewrite_inbound(&mut packet) {
-                Ok(k) => k,
+            let key = match nat.rewrite_inbound(&mut packet) {
+                Ok((k, _, _)) => k,
                 Err(e) => {
                     warn!(error = %e, "nat rewrite_inbound (udp) failed");
                     return;
@@ -485,15 +487,27 @@ async fn egress_loop(
     }
 }
 
-/// Phase 9 fix #1: try to dial the OS-side destination *before* letting
-/// smoltcp answer the peer's SYN. Outcomes:
+/// Phase 9 fix #1 + Phase 11 probe-error fidelity: try to dial the OS-side
+/// destination *before* letting smoltcp answer the peer's SYN. Outcomes,
+/// classified by the kernel's connect() errno so the peer observes the same
+/// port-state nmap would see on a direct route:
+///
 ///   * Connect succeeds → arm the stream for the event loop, register the
 ///     smoltcp listener, enqueue the original SYN. Smoltcp emits SYN-ACK
 ///     and the proxy task takes over once `TcpConnected` fires.
-///   * Connect fails or times out → synthesize a TCP RST in userspace and
-///     send it straight back through the tunnel. The peer correctly sees
-///     the destination port as closed, instead of a SYN-ACK + delayed RST
-///     (which gets reported as `open` by tools like nmap).
+///   * ECONNREFUSED → synthesize a TCP RST and tunnel it back. Peer sees
+///     `closed`.
+///   * EHOSTUNREACH / ENETUNREACH → synthesize ICMP Type 3 Code 1 / 0. Peer
+///     sees `filtered` (or the specific unreach code, if it cares).
+///   * ETIMEDOUT / other → drop silently, let the peer's own SYN retries
+///     time out. Peer sees `filtered`.
+///
+/// Pre-Phase-11 every failure synthesized a RST, which misreported firewall
+/// drops as closed ports (the exact nmap-is-through-wgnat tell Phase 11
+/// closes). We also no longer wrap connect in `tokio::time::timeout`: the
+/// kernel's native SYN-retry budget (~21s Windows / ~127s Linux) is the
+/// right upper bound, and truncating it would reintroduce the same
+/// misclassification issue.
 ///
 /// `try_reserve_pending` claims the NAT slot up-front, so SYN retransmits
 /// arriving while this probe is in flight see a Pending entry and are
@@ -523,7 +537,7 @@ async fn connect_probe(
 
     // Claim the NAT slot first so concurrent retransmits short-circuit.
     match nat.try_reserve_pending(key) {
-        Ok(Some(_gw)) => { /* fresh — proceed */ }
+        Ok(Some(_)) => { /* fresh — proceed */ }
         Ok(None) => {
             // Lost a race — another task is already probing for this exact
             // 5-tuple. Drop this duplicate.
@@ -537,17 +551,21 @@ async fn connect_probe(
     };
 
     let dst = (key.original_dst_ip, key.original_dst_port);
-    let stream = match timeout(PROBE_TIMEOUT, TcpStream::connect(dst)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            debug!(?key, error = %e, "probe: OS connect refused/failed → RST to peer");
-            send_rst(&egress_tx, key, peer_seq);
-            nat.evict_key(key);
-            return;
-        }
-        Err(_) => {
-            debug!(?key, ?PROBE_TIMEOUT, "probe: OS connect timed out → RST to peer");
-            send_rst(&egress_tx, key, peer_seq);
+    let stream = match TcpStream::connect(dst).await {
+        Ok(s) => s,
+        Err(e) => {
+            let class = classify_connect_error(&e);
+            debug!(?key, ?class, error = %e, "probe: OS connect failed");
+            match class {
+                ConnectClass::Refused => send_rst(&egress_tx, key, peer_seq),
+                ConnectClass::HostUnreachable => {
+                    send_dest_unreachable(&egress_tx, &packet, ICMP_CODE_HOST_UNREACHABLE);
+                }
+                ConnectClass::NetUnreachable => {
+                    send_dest_unreachable(&egress_tx, &packet, ICMP_CODE_NET_UNREACHABLE);
+                }
+                ConnectClass::Filtered => { /* drop silently — peer times out */ }
+            }
             nat.evict_key(key);
             return;
         }
@@ -564,15 +582,19 @@ async fn connect_probe(
 
     // Now actually rewrite the SYN and register the listener. Idempotent
     // against the slot try_reserve_pending already created.
-    let gateway_port = match nat.rewrite_inbound(&mut packet) {
-        Ok((_, gw)) => gw,
+    let (virtual_ip, gateway_port) = match nat.rewrite_inbound(&mut packet) {
+        Ok((_, vip, gw)) => (vip, gw),
         Err(e) => {
             warn!(?key, error = %e, "probe: rewrite_inbound failed post-connect");
             nat.evict_key(key);
             return;
         }
     };
-    if smoltcp.ensure_listener(gateway_port, key).await.is_err() {
+    if smoltcp
+        .ensure_listener(virtual_ip, gateway_port, key)
+        .await
+        .is_err()
+    {
         error!(?key, "probe: smoltcp dropped ensure_listener reply");
         nat.evict_key(key);
         return;

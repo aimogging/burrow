@@ -62,48 +62,50 @@ fn build_tcp_syn(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16) -> 
 
 #[test]
 fn nmap_style_syn_storm_preserves_every_flow() {
-    let smoltcp_addr = Ipv4Addr::new(10, 0, 0, 2);
     let peer_ip = Ipv4Addr::new(10, 0, 0, 1);
     let peer_port: u16 = 54321;
     let dst_port: u16 = 80;
-    let nat = NatTable::new(smoltcp_addr);
+    let nat = NatTable::new();
 
     // 256 distinct destinations, ONE peer source port, SAME dst_port.
     // This is exactly the nmap -sS pattern that broke pre-Phase-9.
-    let mut gateway_ports = std::collections::HashSet::new();
+    // Phase 11: each flow now gets a unique (virtual_ip, gateway_port) —
+    // all 256 MUST be distinct pairs.
+    let mut endpoints = std::collections::HashSet::new();
     let mut packets_per_dst = Vec::new();
     for i in 0..=255u8 {
         let dst = Ipv4Addr::new(192, 168, 1, i);
         let mut syn = build_tcp_syn(peer_ip, dst, peer_port, dst_port);
-        let (key, gw) = nat
+        let (key, vip, gw) = nat
             .rewrite_inbound(&mut syn)
             .expect("rewrite must succeed");
         assert_eq!(key.original_dst_ip, dst);
         assert_eq!(key.original_dst_port, dst_port);
         assert!(
-            gateway_ports.insert(gw),
-            "gateway_port {} reused for dst {} (collides with prior flow)",
+            endpoints.insert((vip, gw)),
+            "endpoint ({}, {}) reused for dst {} (collides with prior flow)",
+            vip,
             gw,
             dst
         );
-        packets_per_dst.push((dst, gw, syn));
+        packets_per_dst.push((dst, vip, gw, syn));
     }
 
     // All 256 flows must coexist.
     assert_eq!(nat.len(), 256, "every distinct flow must have its own NAT entry");
 
     // Egress: simulate smoltcp emitting a SYN-ACK for each flow. Outbound
-    // packet has src=(smoltcp_addr, gateway_port), dst=(peer_ip, peer_port).
+    // packet has src=(virtual_ip, gateway_port), dst=(peer_ip, peer_port).
     // After rewrite_outbound, src must be restored to the ORIGINAL dst_ip
     // for that specific flow — proves the egress lookup picks the right
     // entry out of 256 candidates.
-    for (expected_dst_ip, gw, _syn) in &packets_per_dst {
-        let mut eg = build_tcp_syn(smoltcp_addr, peer_ip, *gw, peer_port);
+    for (expected_dst_ip, vip, gw, _syn) in &packets_per_dst {
+        let mut eg = build_tcp_syn(*vip, peer_ip, *gw, peer_port);
         let restored = nat.rewrite_outbound(&mut eg).expect("egress lookup");
         assert_eq!(
             restored.original_dst_ip, *expected_dst_ip,
-            "egress on gateway_port {} should restore src to {}",
-            gw, expected_dst_ip
+            "egress on ({}, {}) should restore src to {}",
+            vip, gw, expected_dst_ip
         );
         let view = parse_5tuple(&eg).unwrap();
         assert_eq!(view.src_ip, *expected_dst_ip);

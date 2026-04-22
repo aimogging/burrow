@@ -19,16 +19,14 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use wgnat::config::Ipv4Cidr;
-use wgnat::nat::{NatKey, NatTable};
+use wgnat::nat::{NatKey, NatTable, VIRTUAL_IFACE_ADDR};
 use wgnat::rewrite::PROTO_TCP;
 use wgnat::runtime::spawn_smoltcp;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_write_after_close_does_not_panic() {
-    let nat = Arc::new(NatTable::new(Ipv4Addr::new(10, 0, 0, 2)));
-    let cidr: Ipv4Cidr = "10.0.0.2/24".parse().unwrap();
-    let (handle, _events, _tx_rx) = spawn_smoltcp(Arc::clone(&nat), cidr);
+    let nat = Arc::new(NatTable::new());
+    let (handle, _events, _tx_rx) = spawn_smoltcp(Arc::clone(&nat));
 
     // Many short-lived listeners. Each one is registered, immediately
     // aborted, and then we *intentionally* try to write to its (now-stale)
@@ -44,7 +42,10 @@ async fn stale_write_after_close_does_not_panic() {
         // Register (issues a fresh ConnectionId) and tear down immediately.
         // Listener port can be anything stable for this test — it's never
         // actually receiving real packets.
-        let id = handle.ensure_listener(50000 + (i as u16 & 0x3FFF), key).await.unwrap();
+        let id = handle
+            .ensure_listener(VIRTUAL_IFACE_ADDR, 50000 + (i as u16 & 0x3FFF), key)
+            .await
+            .unwrap();
         handle.abort_tcp(id);
 
         // Race: fire writes against the id without waiting for TcpClosed.
@@ -66,7 +67,7 @@ async fn stale_write_after_close_does_not_panic() {
     };
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        handle.ensure_listener(8080, key),
+        handle.ensure_listener(VIRTUAL_IFACE_ADDR, 8080, key),
     )
     .await
     .expect("smoltcp thread must still respond to commands")

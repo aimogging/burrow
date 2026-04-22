@@ -26,7 +26,7 @@ use wgnat::rewrite::{build_tcp_rst, parse_5tuple, PROTO_TCP};
 
 #[tokio::test]
 async fn probe_failure_synthesizes_rst_and_releases_slot() {
-    let nat = NatTable::new(Ipv4Addr::new(10, 0, 0, 2));
+    let nat = NatTable::new();
 
     // Find a guaranteed-closed loopback port: bind, capture, drop. The OS
     // usually leaves the port unbound long enough for the connect attempt
@@ -44,7 +44,7 @@ async fn probe_failure_synthesizes_rst_and_releases_slot() {
     };
 
     // Reserve the NAT slot like connect_probe does.
-    let gw = nat
+    let (vip, gw) = nat
         .try_reserve_pending(key)
         .expect("reservation result")
         .expect("slot must be fresh");
@@ -104,9 +104,9 @@ async fn probe_failure_synthesizes_rst_and_releases_slot() {
         original_dst_ip: Ipv4Addr::new(127, 0, 0, 1),
         original_dst_port: closed_port,
     };
-    let gw2 = nat
+    let (vip2, gw2) = nat
         .try_reserve_pending(key2)
         .expect("reservation result")
         .expect("post-eviction reservation");
-    let _ = (gw, gw2);
+    let _ = (vip, gw, vip2, gw2);
 }

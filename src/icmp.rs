@@ -31,7 +31,11 @@ use crate::udp_proxy::PacketSink;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 const ICMP_DEST_UNREACHABLE: u8 = 3;
-const ICMP_CODE_ADMIN_PROHIBITED: u8 = 13;
+/// RFC 792 Type 3 codes used by the probe-failure path (Phase 11 fix #1)
+/// and the raw-socket fallback.
+pub const ICMP_CODE_NET_UNREACHABLE: u8 = 0;
+pub const ICMP_CODE_HOST_UNREACHABLE: u8 = 1;
+pub const ICMP_CODE_ADMIN_PROHIBITED: u8 = 13;
 
 /// Inbound echo requests that we've forwarded; reply lookup is by (id, seq).
 const ECHO_PENDING_TTL: Duration = Duration::from_secs(30);
@@ -239,9 +243,14 @@ fn spawn_pending_sweeper(pending: PendingMap) {
     });
 }
 
-/// Build an ICMP Type 3 / Code 13 (Communication Administratively Prohibited)
-/// reply, wrap it in an IPv4 header, and push it onto the sink.
-fn send_admin_prohibited(sink: &PacketSink, original: &[u8]) {
+/// Build an ICMP Type 3 reply with the given code (RFC 792), wrap it in an
+/// IPv4 header whose src is the intended destination (we're speaking for it)
+/// and dst is the peer, and push it onto the sink.
+///
+/// Used both by the ICMP fallback path (code 13 — administratively prohibited)
+/// and by the TCP connect-probe failure classifier (codes 0 / 1 — net /
+/// host unreachable).
+pub fn send_dest_unreachable(sink: &PacketSink, original: &[u8], code: u8) {
     let view = match parse_5tuple(original) {
         Ok(v) => v,
         Err(_) => return,
@@ -252,7 +261,7 @@ fn send_admin_prohibited(sink: &PacketSink, original: &[u8]) {
     let embed_len = (ihl + 8).min(original.len());
     let mut icmp = Vec::with_capacity(8 + embed_len);
     icmp.push(ICMP_DEST_UNREACHABLE);
-    icmp.push(ICMP_CODE_ADMIN_PROHIBITED);
+    icmp.push(code);
     icmp.extend_from_slice(&[0, 0]); // checksum placeholder
     icmp.extend_from_slice(&[0, 0, 0, 0]); // unused
     icmp.extend_from_slice(&original[..embed_len]);
@@ -263,6 +272,11 @@ fn send_admin_prohibited(sink: &PacketSink, original: &[u8]) {
     // for it), dst = peer.
     let pkt = build_icmp_packet(view.dst_ip, view.src_ip, &icmp);
     let _ = sink.send(pkt);
+}
+
+/// Convenience wrapper: the ICMP fallback path's Type 3 / Code 13.
+fn send_admin_prohibited(sink: &PacketSink, original: &[u8]) {
+    send_dest_unreachable(sink, original, ICMP_CODE_ADMIN_PROHIBITED);
 }
 
 /// Build an IPv4 header around `icmp_payload` and return a complete packet.

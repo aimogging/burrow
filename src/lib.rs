@@ -1,6 +1,7 @@
 pub mod config;
 pub mod icmp;
 pub mod nat;
+pub mod probe;
 pub mod proxy;
 pub mod rewrite;
 pub mod runtime;

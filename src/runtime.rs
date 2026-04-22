@@ -26,6 +26,7 @@
 //! (open OS TcpStream, shuffle bytes both ways) lives in `crate::proxy`.
 
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -35,15 +36,22 @@ use anyhow::{anyhow, Result};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
+use smoltcp::wire::{IpAddress, IpListenEndpoint, Ipv4Cidr};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::config::Ipv4Cidr;
-use crate::nat::{ConnectionState, NatKey, NatTable, DEFAULT_TCP_GRACE};
+use crate::nat::{
+    ConnectionState, NatKey, NatTable, DEFAULT_TCP_GRACE, VIRTUAL_CIDR_PREFIX, VIRTUAL_IFACE_ADDR,
+};
 use crate::smoltcp_iface::{build_interface, ChannelDevice, PacketReceiver, PacketSender};
 
-/// Per-socket smoltcp buffer size. 64 KiB matches a typical Linux default
-/// and avoids stalling large transfers.
-const TCP_BUF_SIZE: usize = 65536;
+/// Per-socket smoltcp buffer size. Phase 11 Option A: pick a small fixed
+/// value so a large concurrent-listener pool (post-virtual_ip allocator the
+/// identifier space holds ~8.6 billion slots) stays memory-bounded. 4 KiB
+/// each direction keeps 1 M idle listeners at ~8 GiB of socket buffers —
+/// still generous vs Phase 11's expected workload. Established flows pay
+/// the same small window, trading single-stream throughput for concurrency
+/// headroom. See the Phase 11 plan for the Option A/B tradeoff.
+const TCP_BUF_SIZE: usize = 4096;
 
 /// Maximum bytes drained from a single socket per poll cycle. Keeps any one
 /// flow from monopolising the smoltcp thread under heavy load.
@@ -61,10 +69,14 @@ const IDLE_SLEEP: Duration = Duration::from_millis(2);
 pub struct ConnectionId(u64);
 
 pub enum SmoltcpCmd {
-    /// Idempotently create a TCP listener bound to `port` and tag it with
-    /// `key` so the runtime can route the eventual ESTABLISHED event to the
-    /// right NAT entry. Replies once with the issued `ConnectionId`.
+    /// Idempotently create a TCP listener bound to `(virtual_ip, port)` and
+    /// tag it with `key` so the runtime can route the eventual ESTABLISHED
+    /// event to the right NAT entry. Replies once with the issued
+    /// `ConnectionId`. Two listeners on the same `port` but different
+    /// `virtual_ip` coexist — smoltcp dispatches on the full
+    /// `IpListenEndpoint`.
     EnsureTcpListener {
+        virtual_ip: Ipv4Addr,
         port: u16,
         key: NatKey,
         ready: oneshot::Sender<ConnectionId>,
@@ -128,9 +140,15 @@ impl SmoltcpHandle {
         let _ = self.rx_tx.send(packet);
     }
 
-    pub fn ensure_listener(&self, port: u16, key: NatKey) -> oneshot::Receiver<ConnectionId> {
+    pub fn ensure_listener(
+        &self,
+        virtual_ip: Ipv4Addr,
+        port: u16,
+        key: NatKey,
+    ) -> oneshot::Receiver<ConnectionId> {
         let (tx, rx) = oneshot::channel();
         let _ = self.cmd_tx.send(SmoltcpCmd::EnsureTcpListener {
+            virtual_ip,
             port,
             key,
             ready: tx,
@@ -162,11 +180,11 @@ pub struct SmoltcpEvents {
 
 /// Spawn the smoltcp poll thread. Returns the cmd handle, an event stream,
 /// and the receiver end of the device's tx queue (drained by the egress
-/// task to encapsulate and send through the WG tunnel).
-pub fn spawn_smoltcp(
-    nat: Arc<NatTable>,
-    addr: Ipv4Cidr,
-) -> (SmoltcpHandle, SmoltcpEvents, PacketReceiver) {
+/// task to encapsulate and send through the WG tunnel). The smoltcp
+/// interface's IP configuration is fixed at the synthetic `198.18.0.0/15`
+/// range (see `nat::VIRTUAL_*`), and `set_any_ip(true)` makes smoltcp
+/// accept packets to any address in that prefix.
+pub fn spawn_smoltcp(nat: Arc<NatTable>) -> (SmoltcpHandle, SmoltcpEvents, PacketReceiver) {
     let (rx_tx, rx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (tx_tx, tx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -176,7 +194,7 @@ pub fn spawn_smoltcp(
 
     thread::Builder::new()
         .name("wgnat-smoltcp".into())
-        .spawn(move || run_smoltcp_thread(addr, rx_rx, tx_tx, cmd_rx, evt_tx, nat_thread))
+        .spawn(move || run_smoltcp_thread(rx_rx, tx_tx, cmd_rx, evt_tx, nat_thread))
         .expect("spawn smoltcp thread");
 
     (
@@ -194,15 +212,19 @@ struct ConnState {
 }
 
 fn run_smoltcp_thread(
-    addr: Ipv4Cidr,
     rx_queue: PacketReceiver,
     tx_queue: PacketSender,
     mut cmd_rx: mpsc::UnboundedReceiver<SmoltcpCmd>,
     evt_tx: mpsc::UnboundedSender<SmoltcpEvent>,
     nat: Arc<NatTable>,
 ) {
+    let addr = Ipv4Cidr::new(VIRTUAL_IFACE_ADDR, VIRTUAL_CIDR_PREFIX);
     let mut device = ChannelDevice::new(rx_queue, tx_queue);
     let mut iface = build_interface(&addr, &mut device);
+    // `any_ip=true` makes `has_ip_addr` return true unconditionally, so the
+    // interface accepts packets addressed to any virtual_ip in the pool
+    // without needing to enumerate 131K addresses on the interface vec.
+    iface.set_any_ip(true);
     let mut sockets: SocketSet<'static> = SocketSet::new(vec![]);
 
     let mut conns: HashMap<ConnectionId, ConnState> = HashMap::new();
@@ -374,7 +396,12 @@ fn handle_command(
     nat: &NatTable,
 ) {
     match cmd {
-        SmoltcpCmd::EnsureTcpListener { port, key, ready } => {
+        SmoltcpCmd::EnsureTcpListener {
+            virtual_ip,
+            port,
+            key,
+            ready,
+        } => {
             // If we already have a listener for this key, hand back the same
             // id. Idempotent: callers can fire this on every inbound packet
             // without growing the socket set.
@@ -388,8 +415,16 @@ fn handle_command(
             let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
             let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF_SIZE]);
             let mut sock = tcp::Socket::new(rx_buf, tx_buf);
-            if let Err(e) = sock.listen(port) {
-                tracing::warn!(port, ?e, "tcp listen failed");
+            // Bind the listener to the specific (virtual_ip, gateway_port).
+            // Smoltcp matches per-socket on the full `IpListenEndpoint`, so
+            // two listeners sharing a port but on different virtual_ips
+            // dispatch correctly.
+            let endpoint = IpListenEndpoint {
+                addr: Some(IpAddress::Ipv4(virtual_ip)),
+                port,
+            };
+            if let Err(e) = sock.listen(endpoint) {
+                tracing::warn!(?virtual_ip, port, ?e, "tcp listen failed");
                 // Drop `ready` so the caller's await wakes up with an error.
                 drop(ready);
                 return;
@@ -486,9 +521,8 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_emits_synack_for_listened_port() {
-        let nat = Arc::new(NatTable::new(Ipv4Addr::new(10, 0, 0, 2)));
-        let cidr = crate::config::parse_ipv4_cidr("10.0.0.2/24").unwrap();
-        let (handle, _events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), cidr);
+        let nat = Arc::new(NatTable::new());
+        let (handle, _events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat));
 
         let mut syn = build_tcp_syn(
             Ipv4Addr::new(10, 0, 0, 1),
@@ -496,12 +530,15 @@ mod tests {
             54321,
             8080,
         );
-        let (key, gateway_port) = nat.rewrite_inbound(&mut syn).unwrap();
+        let (key, virtual_ip, gateway_port) = nat.rewrite_inbound(&mut syn).unwrap();
 
         // Set up listener BEFORE enqueueing the packet so the SYN finds it.
-        // Listener binds the gateway_port (where smoltcp actually sees the
-        // SYN), not the original dst_port.
-        let id = handle.ensure_listener(gateway_port, key).await.unwrap();
+        // Listener binds the (virtual_ip, gateway_port) where smoltcp
+        // actually sees the rewritten SYN.
+        let id = handle
+            .ensure_listener(virtual_ip, gateway_port, key)
+            .await
+            .unwrap();
         assert_eq!(nat.get(key).unwrap().smoltcp_id, Some(id));
 
         handle.enqueue_inbound(syn);

@@ -17,7 +17,6 @@ use wgnat::rewrite::{parse_5tuple, PROTO_UDP};
 use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
 
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
-const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const PEER_PORT: u16 = 33333;
 
 /// Build a minimal IPv4+UDP datagram from PEER_IP:PEER_PORT to dst.
@@ -56,12 +55,12 @@ async fn udp_proxy_round_trips_via_loopback_echo() {
     };
     let dst_port = echo.port();
 
-    let nat = Arc::new(NatTable::new(GATEWAY_IP));
+    let nat = Arc::new(NatTable::new());
     let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // Inbound 1.
     let mut pkt = build_inbound_udp(dst_ip, dst_port, b"hello, udp");
-    let (key, _gateway_port) = nat.rewrite_inbound(&mut pkt).unwrap();
+    let (key, _virtual_ip, _gateway_port) = nat.rewrite_inbound(&mut pkt).unwrap();
     assert_eq!(key.proto, PROTO_UDP);
     assert_eq!(key.original_dst_ip, dst_ip);
     assert_eq!(key.original_dst_port, dst_port);
@@ -109,12 +108,12 @@ async fn udp_proxy_idle_sweep_replaces_entry() {
     };
     let dst_port = echo.port();
 
-    let nat = Arc::new(NatTable::new(GATEWAY_IP));
+    let nat = Arc::new(NatTable::new());
     let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // First datagram → spawn proxy A, get one echo.
     let mut pkt = build_inbound_udp(dst_ip, dst_port, b"a");
-    let (key, _) = nat.rewrite_inbound(&mut pkt).unwrap();
+    let (key, _, _) = nat.rewrite_inbound(&mut pkt).unwrap();
     let proxy_a = spawn_udp_proxy(key, sink_tx.clone());
     proxy_a.send(extract_udp_payload(&pkt).unwrap()).unwrap();
     let _ = timeout(Duration::from_secs(2), sink_rx.recv())
@@ -136,7 +135,7 @@ async fn udp_proxy_idle_sweep_replaces_entry() {
     // 5-tuple, not socket identity), spawn proxy B, ensure the round-trip
     // still works.
     let mut pkt2 = build_inbound_udp(dst_ip, dst_port, b"after-sweep");
-    let (key2, _) = nat.rewrite_inbound(&mut pkt2).unwrap();
+    let (key2, _, _) = nat.rewrite_inbound(&mut pkt2).unwrap();
     assert_eq!(key2, key); // same 5-tuple → same NatKey
     let proxy_b = spawn_udp_proxy(key2, sink_tx.clone());
     proxy_b

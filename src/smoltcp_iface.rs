@@ -184,22 +184,31 @@ mod tests {
         pkt
     }
 
-    /// Functional test for Phase 2: synthetic TCP SYN through the rewrite shim
-    /// + smoltcp produces a SYN-ACK at the device tx queue, which after the
-    ///   outbound rewrite has src restored to the original destination.
+    /// Functional test for Phase 2 / Phase 11: synthetic TCP SYN through the
+    /// rewrite shim + smoltcp produces a SYN-ACK at the device tx queue,
+    /// which after the outbound rewrite has src restored to the original
+    /// destination. Post-Phase-11 the rewrite picks a (virtual_ip,
+    /// gateway_port) from the 198.18.0.0/15 pool; smoltcp's interface uses
+    /// the lowest address of the pool plus `set_any_ip(true)` so any
+    /// virtual_ip in the /15 is accepted.
     #[test]
     fn syn_through_pipeline_yields_synack() {
-        let smoltcp_addr = Ipv4Addr::new(10, 0, 0, 2);
-        let cidr = crate::config::parse_ipv4_cidr("10.0.0.2/24").unwrap();
+        use smoltcp::wire::{IpAddress, IpListenEndpoint};
+
+        let cidr = Ipv4Cidr::new(
+            crate::nat::VIRTUAL_IFACE_ADDR,
+            crate::nat::VIRTUAL_CIDR_PREFIX,
+        );
 
         let (rx_tx, rx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (tx_tx, mut tx_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let mut device = ChannelDevice::new(rx_rx, tx_tx);
         let mut iface = build_interface(&cidr, &mut device);
+        iface.set_any_ip(true);
 
         let mut sockets = SocketSet::new(vec![]);
 
-        let table = NatTable::new(smoltcp_addr);
+        let table = NatTable::new();
 
         // Build a SYN from peer 10.0.0.1:54321 → 192.168.1.50:80 (original dst).
         let mut syn = build_tcp_syn(
@@ -209,16 +218,21 @@ mod tests {
             80,
             1000,
         );
-        let (key, gateway_port) = table.rewrite_inbound(&mut syn).unwrap();
+        let (key, virtual_ip, gateway_port) = table.rewrite_inbound(&mut syn).unwrap();
         assert_eq!(key.original_dst_ip, Ipv4Addr::new(192, 168, 1, 50));
         assert_eq!(key.original_dst_port, 80);
 
-        // Bind the listener on the per-flow gateway_port — that's where
+        // Bind the listener on (virtual_ip, gateway_port) — that's where
         // smoltcp will see the rewritten SYN arrive.
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; 4096]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; 4096]);
         let mut listener = tcp::Socket::new(rx_buf, tx_buf);
-        listener.listen(gateway_port).expect("listen ok");
+        listener
+            .listen(IpListenEndpoint {
+                addr: Some(IpAddress::Ipv4(virtual_ip)),
+                port: gateway_port,
+            })
+            .expect("listen ok");
         let _handle = sockets.add(listener);
 
         rx_tx.send(syn).unwrap();
@@ -237,7 +251,7 @@ mod tests {
         // Must be a SYN-ACK (flags = 0x12) before the rewrite pass.
         let view = rewrite::parse_5tuple(&out).unwrap();
         assert_eq!(view.proto, rewrite::PROTO_TCP);
-        assert_eq!(view.src_ip, smoltcp_addr);
+        assert_eq!(view.src_ip, virtual_ip);
         assert_eq!(view.src_port, gateway_port);
         assert_eq!(view.dst_ip, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(view.dst_port, 54321);
