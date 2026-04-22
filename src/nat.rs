@@ -483,59 +483,8 @@ fn evict(inner: &mut NatInner, key: NatKey) {
 mod tests {
     use super::*;
     use crate::rewrite::PROTO_TCP;
+    use crate::test_helpers::build_tcp_syn;
     use std::thread::sleep;
-
-    fn build_tcp_syn(
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
-        src_port: u16,
-        dst_port: u16,
-    ) -> Vec<u8> {
-        // Reuse the same construction as rewrite::tests by inlining. Keeps
-        // the modules independent.
-        let mut pkt = vec![0u8; 40];
-        pkt[0] = 0x45;
-        pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
-        pkt[8] = 64;
-        pkt[9] = PROTO_TCP;
-        pkt[12..16].copy_from_slice(&src.octets());
-        pkt[16..20].copy_from_slice(&dst.octets());
-        let mut sum: u32 = 0;
-        for i in (0..20).step_by(2) {
-            sum += u16::from_be_bytes([pkt[i], pkt[i + 1]]) as u32;
-        }
-        while (sum >> 16) != 0 {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-        let csum = !(sum as u16);
-        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
-        pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
-        pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
-        pkt[32] = 0x50;
-        pkt[33] = 0x02;
-        pkt[34..36].copy_from_slice(&65535u16.to_be_bytes());
-        // tcp checksum
-        let tcp_len = 20u16;
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&pkt[12..16]);
-        buf.extend_from_slice(&pkt[16..20]);
-        buf.push(0);
-        buf.push(PROTO_TCP);
-        buf.extend_from_slice(&tcp_len.to_be_bytes());
-        buf.extend_from_slice(&pkt[20..]);
-        let mut s: u32 = 0;
-        let mut i = 0;
-        while i + 1 < buf.len() {
-            s += u16::from_be_bytes([buf[i], buf[i + 1]]) as u32;
-            i += 2;
-        }
-        while (s >> 16) != 0 {
-            s = (s & 0xFFFF) + (s >> 16);
-        }
-        let tc = !(s as u16);
-        pkt[36..38].copy_from_slice(&tc.to_be_bytes());
-        pkt
-    }
 
     fn vip_in_pool(addr: Ipv4Addr) -> bool {
         let v: u32 = addr.into();

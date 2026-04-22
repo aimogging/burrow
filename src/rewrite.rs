@@ -304,42 +304,7 @@ pub fn build_udp_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn build_tcp_syn(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
-        let total_len = 40usize; // 20 IP + 20 TCP, no payload
-        let mut pkt = vec![0u8; total_len];
-        {
-            let mut ip = Ipv4Packet::new_unchecked(&mut pkt[..]);
-            ip.set_version(4);
-            ip.set_header_len(20);
-            ip.set_dscp(0);
-            ip.set_ecn(0);
-            ip.set_total_len(total_len as u16);
-            ip.set_ident(0);
-            ip.set_dont_frag(false);
-            ip.set_more_frags(false);
-            ip.set_frag_offset(0);
-            ip.set_hop_limit(64);
-            ip.set_next_header(IpProtocol::Tcp);
-            ip.set_src_addr(src);
-            ip.set_dst_addr(dst);
-            ip.fill_checksum();
-        }
-        {
-            let mut tcp = TcpPacket::new_unchecked(&mut pkt[20..]);
-            tcp.set_src_port(src_port);
-            tcp.set_dst_port(dst_port);
-            tcp.set_seq_number(TcpSeqNumber(1234));
-            tcp.set_ack_number(TcpSeqNumber(0));
-            tcp.set_header_len(20);
-            tcp.clear_flags();
-            tcp.set_syn(true);
-            tcp.set_window_len(65535);
-            tcp.set_urgent_at(0);
-            tcp.fill_checksum(&IpAddress::Ipv4(src), &IpAddress::Ipv4(dst));
-        }
-        pkt
-    }
+    use crate::test_helpers::build_tcp_syn;
 
     fn ip_checksum_ok(pkt: &[u8]) -> bool {
         Ipv4Packet::new_checked(pkt)

@@ -20,6 +20,7 @@ use std::time::Duration;
 use wgnat::nat::NatTable;
 use wgnat::rewrite::{parse_5tuple, PROTO_TCP};
 use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent};
+use wgnat::test_helpers::{build_tcp, ACK, SYN};
 
 const WG_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -36,51 +37,7 @@ fn build_synack(
     seq: u32,
     ack: u32,
 ) -> Vec<u8> {
-    let mut pkt = vec![0u8; 40];
-    pkt[0] = 0x45;
-    pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
-    pkt[8] = 64;
-    pkt[9] = PROTO_TCP;
-    pkt[12..16].copy_from_slice(&src.octets());
-    pkt[16..20].copy_from_slice(&dst.octets());
-    let mut sum: u32 = 0;
-    for i in (0..20).step_by(2) {
-        sum += u16::from_be_bytes([pkt[i], pkt[i + 1]]) as u32;
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let csum = !(sum as u16);
-    pkt[10..12].copy_from_slice(&csum.to_be_bytes());
-
-    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
-    pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
-    pkt[24..28].copy_from_slice(&seq.to_be_bytes());
-    pkt[28..32].copy_from_slice(&ack.to_be_bytes());
-    pkt[32] = 0x50;
-    pkt[33] = 0x12; // SYN + ACK
-    pkt[34..36].copy_from_slice(&65535u16.to_be_bytes());
-
-    let tcp_len = 20u16;
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&pkt[12..16]);
-    buf.extend_from_slice(&pkt[16..20]);
-    buf.push(0);
-    buf.push(PROTO_TCP);
-    buf.extend_from_slice(&tcp_len.to_be_bytes());
-    buf.extend_from_slice(&pkt[20..]);
-    let mut s: u32 = 0;
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        s += u16::from_be_bytes([buf[i], buf[i + 1]]) as u32;
-        i += 2;
-    }
-    while (s >> 16) != 0 {
-        s = (s & 0xFFFF) + (s >> 16);
-    }
-    let tc = !(s as u16);
-    pkt[36..38].copy_from_slice(&tc.to_be_bytes());
-    pkt
+    build_tcp(src, dst, src_port, dst_port, seq, ack, SYN | ACK, &[])
 }
 
 /// Extract the TCP seq number from a 20-byte-IP + 20-byte-TCP packet.
