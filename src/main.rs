@@ -13,16 +13,20 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use wgnat::config;
+use wgnat::control::{listener_key, spawn_control_handler};
 use wgnat::icmp::{
     send_dest_unreachable, IcmpForwarder, ICMP_CODE_HOST_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE,
 };
 use wgnat::nat::{NatKey, NatTable};
 use wgnat::probe::{classify_connect_error, ConnectClass};
 use wgnat::proxy::{spawn_tcp_proxy_with_stream, ProxyMsg};
+use wgnat::reverse_registry::ReverseRegistry;
 use wgnat::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
-use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent, SmoltcpHandle};
+use wgnat::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
 use wgnat::tunnel::WgTunnel;
 use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
+use wgnat::wire::Proto;
+
 
 /// Optional config baked in at build time via the `embedded-config` feature.
 /// The path is taken from `WGNAT_EMBEDDED_CONFIG` at build time; `build.rs`
@@ -224,17 +228,36 @@ async fn run(
     // back to the peer after the OS-side connect succeeds.
     let (arm_tx, mut arm_rx) = mpsc::unbounded_channel::<(NatKey, TcpStream)>();
 
+    // Reverse-tunnel registry: control handlers insert/remove entries,
+    // the event loop reads them on TcpConnected to dispatch registered
+    // ports to the bridge handler.
+    let reverse_registry = Arc::new(ReverseRegistry::new());
+    let control_port = cfg.interface.control_port;
+
+    // Bootstrap the first control-port listener. Subsequent listeners
+    // are rearmed in the event loop each time a peer connects.
+    let _initial_control_id = smoltcp
+        .ensure_listener(wg_ip, control_port, listener_key(wg_ip, control_port))
+        .await
+        .context("initial control listener")?;
+    info!(%wg_ip, control_port, "control listener active");
+
+    // Channel bridges use to register their outbound side's ConnectionId
+    // with the event loop's `proxies` map once `open_outbound_tcp`
+    // completes asynchronously.
+    let (bridge_register_tx, mut bridge_register_rx) =
+        mpsc::unbounded_channel::<wgnat::bridge::BridgeRegister>();
+
     // Spawn the smoltcp event consumer: turns runtime events into proxy
     // task lifecycle. The `proxies` and `armed` maps live entirely inside
     // this closure — only one task touches them, so plain HashMaps suffice.
     let event_loop = tokio::spawn({
         let smoltcp = smoltcp.clone();
         let nat = Arc::clone(&nat);
+        let reverse_registry = Arc::clone(&reverse_registry);
         async move {
-            let mut proxies: HashMap<
-                wgnat::runtime::ConnectionId,
-                mpsc::UnboundedSender<ProxyMsg>,
-            > = HashMap::new();
+            let mut proxies: HashMap<ConnectionId, mpsc::UnboundedSender<ProxyMsg>> =
+                HashMap::new();
             // Streams pre-dialed by connect_probe, awaiting their matching
             // TcpConnected event so we can hand them off to the proxy task.
             let mut armed: HashMap<NatKey, TcpStream> = HashMap::new();
@@ -245,22 +268,69 @@ async fn run(
                             warn!(?key, "armed stream replaced — duplicate probe");
                         }
                     }
+                    Some((outbound_id, outbound_tx)) = bridge_register_rx.recv() => {
+                        proxies.insert(outbound_id, outbound_tx);
+                    }
                     Some(evt) = events.evt_rx.recv() => match evt {
                         SmoltcpEvent::TcpConnected { key, id } => {
                             debug!(?key, ?id, "tcp connected");
-                            let Some(stream) = armed.remove(&key) else {
-                                error!(?key, ?id, "TcpConnected with no armed stream — Fix #1 invariant violated; aborting smoltcp side");
-                                smoltcp.abort_tcp(id);
-                                continue;
-                            };
-                            let tx = spawn_tcp_proxy_with_stream(
-                                key,
-                                id,
-                                smoltcp.clone(),
-                                Arc::clone(&nat),
-                                stream,
-                            );
-                            proxies.insert(id, tx);
+                            if key.original_dst_ip == wg_ip
+                                && key.original_dst_port == control_port
+                            {
+                                // Re-arm so the next peer hits a listener.
+                                let next_key = listener_key(wg_ip, control_port);
+                                let _ = smoltcp
+                                    .ensure_listener(wg_ip, control_port, next_key)
+                                    .await;
+                                let tx = spawn_control_handler(
+                                    id,
+                                    smoltcp.clone(),
+                                    wg_ip,
+                                    Arc::clone(&reverse_registry),
+                                );
+                                proxies.insert(id, tx);
+                            } else if key.original_dst_ip == wg_ip {
+                                // Reverse-tunnel port? Lookup in registry.
+                                let Some(entry) = reverse_registry
+                                    .lookup(Proto::Tcp, key.original_dst_port)
+                                else {
+                                    warn!(
+                                        ?key,
+                                        ?id,
+                                        "TCP to unregistered wg_ip port — aborting"
+                                    );
+                                    smoltcp.abort_tcp(id);
+                                    continue;
+                                };
+                                // Re-arm the reverse listener for next peer.
+                                let next_key = listener_key(wg_ip, key.original_dst_port);
+                                let _ = smoltcp
+                                    .ensure_listener(wg_ip, key.original_dst_port, next_key)
+                                    .await;
+                                let tx = wgnat::bridge::spawn_reverse_bridge(
+                                    id,
+                                    smoltcp.clone(),
+                                    wg_ip,
+                                    entry.forward_to,
+                                    bridge_register_tx.clone(),
+                                );
+                                proxies.insert(id, tx);
+                            } else {
+                                // NAT path (existing).
+                                let Some(stream) = armed.remove(&key) else {
+                                    error!(?key, ?id, "TcpConnected with no armed stream — Fix #1 invariant violated; aborting smoltcp side");
+                                    smoltcp.abort_tcp(id);
+                                    continue;
+                                };
+                                let tx = spawn_tcp_proxy_with_stream(
+                                    key,
+                                    id,
+                                    smoltcp.clone(),
+                                    Arc::clone(&nat),
+                                    stream,
+                                );
+                                proxies.insert(id, tx);
+                            }
                         }
                         SmoltcpEvent::TcpData { id, data, .. } => {
                             if let Some(tx) = proxies.get(&id) {
@@ -280,14 +350,13 @@ async fn run(
                             armed.remove(&key);
                         }
                         SmoltcpEvent::TcpAborted { key, id } => {
-                            // Phase 10: peer aborted before reaching ESTABLISHED
-                            // (typical of `nmap -sS`: SYN → SYN-ACK → RST without
-                            // an intervening ACK). The runtime has already torn
-                            // down its smoltcp socket and evicted the NAT entry;
-                            // we just need to drop the OS-side stream that
-                            // connect_probe parked. No proxy was spawned because
-                            // TcpConnected never fired.
-                            debug!(?key, ?id, "tcp aborted before establishment — dropping armed stream");
+                            debug!(?key, ?id, "tcp aborted before establishment");
+                            // If a bridge or control handler is listening on
+                            // this id, signal Closed so it tears down.
+                            if let Some(tx) = proxies.remove(&id) {
+                                let _ = tx.send(ProxyMsg::Closed);
+                            }
+                            // Drop any pre-dialed OS stream from the NAT path.
                             armed.remove(&key);
                         }
                     },

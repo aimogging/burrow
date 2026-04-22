@@ -11,14 +11,34 @@
 //! protocol. Phase 13 responds `Error{NotYetSupported}` for anything
 //! beyond the tunnel requests.
 
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
+use crate::nat::NatKey;
 use crate::proxy::ProxyMsg;
 use crate::reverse_registry::{RegisterError, ReverseRegistry, UnregisterError};
+use crate::rewrite::PROTO_TCP;
 use crate::runtime::{ConnectionId, SmoltcpHandle};
-use crate::wire::{ClientReq, ErrorKind, ServerResp, MAX_FRAME_LEN};
+use crate::wire::{ClientReq, ErrorKind, Proto, ServerResp, MAX_FRAME_LEN};
+
+/// Build a unique synthetic `NatKey` for a service listener on
+/// `(wg_ip, port)` — shared between `main.rs` and this handler so the
+/// runtime's `conns` map never sees duplicate keys across control and
+/// reverse-tunnel listeners.
+pub fn listener_key(wg_ip: Ipv4Addr, port: u16) -> NatKey {
+    static COUNTER: AtomicU16 = AtomicU16::new(1);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    NatKey {
+        proto: PROTO_TCP,
+        peer_ip: Ipv4Addr::UNSPECIFIED,
+        peer_port: seq,
+        original_dst_ip: wg_ip,
+        original_dst_port: port,
+    }
+}
 
 /// Spawn the per-flow handler. Returns the `ProxyMsg` sender that the
 /// event loop feeds with `TcpData` / `PeerFin` / `Closed`. Mirrors the
@@ -27,11 +47,12 @@ use crate::wire::{ClientReq, ErrorKind, ServerResp, MAX_FRAME_LEN};
 pub fn spawn_control_handler(
     id: ConnectionId,
     smoltcp: SmoltcpHandle,
+    wg_ip: Ipv4Addr,
     registry: Arc<ReverseRegistry>,
 ) -> mpsc::UnboundedSender<ProxyMsg> {
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        if let Err(e) = run_once(id, smoltcp, msg_rx, registry).await {
+        if let Err(e) = run_once(id, smoltcp, wg_ip, msg_rx, registry).await {
             tracing::debug!(?id, error = %e, "control handler exited");
         }
     });
@@ -41,6 +62,7 @@ pub fn spawn_control_handler(
 async fn run_once(
     id: ConnectionId,
     smoltcp: SmoltcpHandle,
+    wg_ip: Ipv4Addr,
     mut msg_rx: mpsc::UnboundedReceiver<ProxyMsg>,
     registry: Arc<ReverseRegistry>,
 ) -> anyhow::Result<()> {
@@ -76,34 +98,63 @@ async fn run_once(
         }
     };
 
-    let resp = handle_request(req, &registry);
+    let resp = handle_request(req, &registry, &smoltcp, wg_ip).await;
     write_resp(&smoltcp, id, &resp).await;
     smoltcp.close_tcp(id);
     Ok(())
 }
 
-fn handle_request(req: ClientReq, registry: &ReverseRegistry) -> ServerResp {
+async fn handle_request(
+    req: ClientReq,
+    registry: &ReverseRegistry,
+    smoltcp: &SmoltcpHandle,
+    wg_ip: Ipv4Addr,
+) -> ServerResp {
     match req {
         ClientReq::RegisterReverse {
             proto,
             listen_port,
             forward_to,
-        } => match registry.register(proto, listen_port, forward_to) {
-            Ok(tunnel_id) => {
-                tracing::info!(
-                    ?proto,
+        } => {
+            let tunnel_id = match registry.register(proto, listen_port, forward_to) {
+                Ok(id) => id,
+                Err(RegisterError::PortInUse) => {
+                    return ServerResp::Error {
+                        kind: ErrorKind::PortInUse,
+                        msg: format!("port {listen_port}/{proto:?} already registered"),
+                    }
+                }
+            };
+            // UDP reverse tunnels land in Phase 14 — accept the
+            // registration in the registry but don't create a listener.
+            if matches!(proto, Proto::Udp) {
+                tracing::warn!(
                     listen_port,
                     ?forward_to,
                     ?tunnel_id,
-                    "reverse tunnel registered"
+                    "UDP reverse tunnel registered but not yet wired (Phase 14)"
                 );
-                ServerResp::Ok { tunnel_id }
+                return ServerResp::Ok { tunnel_id };
             }
-            Err(RegisterError::PortInUse) => ServerResp::Error {
-                kind: ErrorKind::PortInUse,
-                msg: format!("port {listen_port}/{proto:?} already registered"),
-            },
-        },
+            // TCP: create the smoltcp listener on (wg_ip, listen_port) so
+            // incoming peer connections get accepted and dispatched.
+            let lk = listener_key(wg_ip, listen_port);
+            if smoltcp.ensure_listener(wg_ip, listen_port, lk).await.is_err() {
+                let _ = registry.unregister(tunnel_id);
+                return ServerResp::Error {
+                    kind: ErrorKind::Internal,
+                    msg: "failed to create listener".into(),
+                };
+            }
+            tracing::info!(
+                ?proto,
+                listen_port,
+                ?forward_to,
+                ?tunnel_id,
+                "reverse tunnel registered"
+            );
+            ServerResp::Ok { tunnel_id }
+        }
         ClientReq::UnregisterReverse { tunnel_id } => match registry.unregister(tunnel_id) {
             Ok(()) => {
                 tracing::info!(?tunnel_id, "reverse tunnel unregistered");
@@ -174,74 +225,16 @@ async fn write_resp(smoltcp: &SmoltcpHandle, id: ConnectionId, resp: &ServerResp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::Proto;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    // Registry-level logic is covered by `reverse_registry::tests`.
+    // End-to-end handler tests (including the smoltcp listener side effect)
+    // live in `tests/control_loopback.rs` (Phase 13 integration test), which
+    // drives real SYN/ACK packets through the runtime.
 
     #[test]
-    fn handle_register_ok() {
-        let reg = ReverseRegistry::new();
-        let resp = handle_request(
-            ClientReq::RegisterReverse {
-                proto: Proto::Tcp,
-                listen_port: 8080,
-                forward_to: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000),
-            },
-            &reg,
-        );
-        match resp {
-            ServerResp::Ok { .. } => (),
-            other => panic!("expected Ok, got {other:?}"),
-        }
-        assert_eq!(reg.len(), 1);
-    }
-
-    #[test]
-    fn handle_register_collision_gives_error() {
-        let reg = ReverseRegistry::new();
-        let _ = reg.register(
-            Proto::Tcp,
-            8080,
-            SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000),
-        );
-        let resp = handle_request(
-            ClientReq::RegisterReverse {
-                proto: Proto::Tcp,
-                listen_port: 8080,
-                forward_to: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 9000),
-            },
-            &reg,
-        );
-        match resp {
-            ServerResp::Error {
-                kind: ErrorKind::PortInUse,
-                ..
-            } => (),
-            other => panic!("expected PortInUse, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn handle_unregister_roundtrip() {
-        let reg = ReverseRegistry::new();
-        let id = reg
-            .register(
-                Proto::Tcp,
-                8080,
-                SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000),
-            )
-            .unwrap();
-        let resp = handle_request(ClientReq::UnregisterReverse { tunnel_id: id }, &reg);
-        assert!(matches!(resp, ServerResp::Unregistered));
-        assert!(reg.is_empty());
-    }
-
-    #[test]
-    fn handle_list_empty() {
-        let reg = ReverseRegistry::new();
-        let resp = handle_request(ClientReq::ListReverse, &reg);
-        match resp {
-            ServerResp::ReverseList(entries) => assert!(entries.is_empty()),
-            other => panic!("expected ReverseList, got {other:?}"),
-        }
+    fn listener_keys_are_unique() {
+        let a = listener_key(Ipv4Addr::new(10, 0, 0, 2), 57821);
+        let b = listener_key(Ipv4Addr::new(10, 0, 0, 2), 57821);
+        assert_ne!(a, b, "each listener_key call must produce a fresh key");
     }
 }
