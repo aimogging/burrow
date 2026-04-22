@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -374,6 +375,30 @@ async fn run(
                             }
                             // Drop any pre-dialed OS stream from the NAT path.
                             armed.remove(&key);
+                            // Well-known listeners (control port, reverse-
+                            // tunnel listen_port) are single-accept sockets:
+                            // the listener IS the connection once a SYN
+                            // lands. If the flow aborts before reaching
+                            // Established, the listener slot is gone and no
+                            // re-arm happened on TcpConnected. Re-arm here
+                            // so the service stays responsive to the next
+                            // peer. No-op for NAT flows (peer_ip != UNSPEC).
+                            if key.peer_ip == Ipv4Addr::UNSPECIFIED
+                                && key.original_dst_ip == wg_ip
+                            {
+                                let port = key.original_dst_port;
+                                let re_arm = port == control_port
+                                    || reverse_registry
+                                        .lookup(Proto::Tcp, port)
+                                        .is_some();
+                                if re_arm {
+                                    let next = listener_key(wg_ip, port);
+                                    let _ = smoltcp
+                                        .ensure_listener(wg_ip, port, next)
+                                        .await;
+                                    debug!(%wg_ip, port, "re-armed well-known listener after abort");
+                                }
+                            }
                         }
                     },
                     else => break,
@@ -488,6 +513,17 @@ async fn ingest_tunnel_packet(
     // responses). UDP is handled separately — it's intercepted here
     // for reverse-tunnel forwarding without going through smoltcp.
     if view.dst_ip == wg_ip && view.proto == PROTO_TCP {
+        smoltcp.enqueue_inbound(packet);
+        return;
+    }
+    // ICMP to wg_ip: let smoltcp answer. smoltcp's interface has
+    // built-in echo-request handling for packets addressed to any of
+    // its configured interface addresses (incl. the wg_ip/32 added in
+    // Phase 12), so peers can `ping wg_ip` for reachability checks
+    // without wgnat running its own ICMP state machine for itself.
+    // Other ICMP traffic (peers pinging LAN hosts) still goes through
+    // the raw-socket / fallback path in `IcmpForwarder`.
+    if view.dst_ip == wg_ip && view.proto == PROTO_ICMP {
         smoltcp.enqueue_inbound(packet);
         return;
     }

@@ -365,9 +365,24 @@ fn run_smoltcp_thread(
                 last_states.insert(id, new_state);
                 tracing::trace!(?id, ?key, ?prev, ?new_state, "tcp state change");
 
-                if matches!(new_state, tcp::State::Established)
-                    && !matches!(prev, Some(tcp::State::Established))
-                {
+                // Detect establishment via any post-SYN_RECEIVED state.
+                // smoltcp can transition Established → CloseWait (or
+                // further) inside a single `Interface::poll` call; our
+                // outer sampling then sees the later state without ever
+                // observing Established. Any of these states implies the
+                // 3-way handshake completed, so mark `ever_established`
+                // and fire `TcpConnected` if we haven't already.
+                let is_post_handshake = matches!(
+                    new_state,
+                    tcp::State::Established
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::CloseWait
+                        | tcp::State::Closing
+                        | tcp::State::LastAck
+                        | tcp::State::TimeWait
+                );
+                if is_post_handshake && !ever_established.contains(&id) {
                     ever_established.insert(id);
                     nat.set_state(key, ConnectionState::Established);
                     send_evt(SmoltcpEvent::TcpConnected { key, id });
