@@ -355,11 +355,13 @@ async fn ingest_tunnel_packet(
                     // No entry: only kick off a probe for a fresh SYN.
                     // Anything else is stale traffic with no listener and
                     // should be dropped silently.
-                    let ihl = ((packet[0] & 0x0F) as usize) * 4;
-                    let flags = if packet.len() >= ihl + 14 { packet[ihl + 13] } else { 0 };
-                    let is_syn_only = (flags & 0x12) == 0x02; // SYN set, ACK clear
+                    use smoltcp::wire::{Ipv4Packet, TcpPacket};
+                    let is_syn_only = Ipv4Packet::new_checked(&packet[..])
+                        .ok()
+                        .and_then(|ip| TcpPacket::new_checked(ip.payload()).ok().map(|tcp| tcp.syn() && !tcp.ack()))
+                        .unwrap_or(false);
                     if !is_syn_only {
-                        debug!(?key, flags, "tcp packet to unknown flow (not SYN) — dropping");
+                        debug!(?key, "tcp packet to unknown flow (not SYN) — dropping");
                         return;
                     }
                     let smoltcp = smoltcp.clone();
