@@ -25,6 +25,7 @@ use wgnat::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 use wgnat::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
 use wgnat::tunnel::WgTunnel;
 use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
+use wgnat::udp_reverse::UdpReverseState;
 use wgnat::wire::Proto;
 
 
@@ -232,6 +233,10 @@ async fn run(
     // the event loop reads them on TcpConnected to dispatch registered
     // ports to the bridge handler.
     let reverse_registry = Arc::new(ReverseRegistry::new());
+    // UDP reverse-tunnel per-flow state — populated by the ingest path
+    // (not the event loop) since UDP reverse tunnels don't go through
+    // smoltcp.
+    let udp_reverse = Arc::new(UdpReverseState::new());
     let control_port = cfg.interface.control_port;
 
     // Bootstrap the first control-port listener. Subsequent listeners
@@ -381,6 +386,7 @@ async fn run(
     let sweep = tokio::spawn({
         let nat = Arc::clone(&nat);
         let udp_proxies = Arc::clone(&udp_proxies);
+        let udp_reverse = Arc::clone(&udp_reverse);
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -397,6 +403,11 @@ async fn run(
                         map.remove(k);
                     }
                     debug!(count = removed_udp.len(), "NAT entries swept (udp idle)");
+                }
+                let removed_rev_udp =
+                    udp_reverse.sweep_idle(now, wgnat::nat::DEFAULT_UDP_IDLE);
+                if removed_rev_udp > 0 {
+                    debug!(count = removed_rev_udp, "UDP reverse flows swept (idle)");
                 }
             }
         }
@@ -429,6 +440,8 @@ async fn run(
                             &arm_tx,
                             &icmp,
                             wg_ip,
+                            &reverse_registry,
+                            &udp_reverse,
                         ).await;
                     }
                     Ok(None) => { /* control plane */ }
@@ -457,6 +470,8 @@ async fn ingest_tunnel_packet(
     arm_tx: &mpsc::UnboundedSender<(NatKey, TcpStream)>,
     icmp: &Arc<IcmpForwarder>,
     wg_ip: std::net::Ipv4Addr,
+    reverse_registry: &Arc<ReverseRegistry>,
+    udp_reverse: &Arc<UdpReverseState>,
 ) {
     let view = match rewrite::parse_5tuple(&packet) {
         Ok(v) => v,
@@ -465,15 +480,23 @@ async fn ingest_tunnel_packet(
             return;
         }
     };
-    // Packets addressed to wgnat's WG IP belong to smoltcp directly:
-    //   - TCP: responses to originated outbound flows (Phase 12), or
-    //     future connections to reverse-tunnel / control listeners
-    //     (Phase 13+).
-    //   - UDP: same shape, including the future DNS service (Phase 15).
-    // Skip NAT entirely — smoltcp is already the address owner with
-    // `set_any_ip(true)` + wg_ip/32 on the interface.
-    if view.dst_ip == wg_ip && matches!(view.proto, PROTO_TCP | PROTO_UDP) {
+    // Packets addressed to wgnat's WG IP: smoltcp owns the TCP stack
+    // (control listener, reverse-tunnel TCP, originated outbound
+    // responses). UDP is handled separately — it's intercepted here
+    // for reverse-tunnel forwarding without going through smoltcp.
+    if view.dst_ip == wg_ip && view.proto == PROTO_TCP {
         smoltcp.enqueue_inbound(packet);
+        return;
+    }
+    if view.dst_ip == wg_ip && view.proto == PROTO_UDP {
+        wgnat::udp_reverse::dispatch_udp_to_wg_ip(
+            &packet,
+            &view,
+            wg_ip,
+            reverse_registry,
+            udp_reverse,
+            egress_tx,
+        );
         return;
     }
     match view.proto {

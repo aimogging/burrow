@@ -125,26 +125,19 @@ async fn handle_request(
                     }
                 }
             };
-            // UDP reverse tunnels land in Phase 14 — accept the
-            // registration in the registry but don't create a listener.
-            if matches!(proto, Proto::Udp) {
-                tracing::warn!(
-                    listen_port,
-                    ?forward_to,
-                    ?tunnel_id,
-                    "UDP reverse tunnel registered but not yet wired (Phase 14)"
-                );
-                return ServerResp::Ok { tunnel_id };
-            }
-            // TCP: create the smoltcp listener on (wg_ip, listen_port) so
-            // incoming peer connections get accepted and dispatched.
-            let lk = listener_key(wg_ip, listen_port);
-            if smoltcp.ensure_listener(wg_ip, listen_port, lk).await.is_err() {
-                let _ = registry.unregister(tunnel_id);
-                return ServerResp::Error {
-                    kind: ErrorKind::Internal,
-                    msg: "failed to create listener".into(),
-                };
+            // UDP reverse tunnels don't need a smoltcp listener — the
+            // ingest path intercepts them directly and handles
+            // forwarding through `UdpReverseState`. Registry entry is
+            // sufficient.
+            if matches!(proto, Proto::Tcp) {
+                let lk = listener_key(wg_ip, listen_port);
+                if smoltcp.ensure_listener(wg_ip, listen_port, lk).await.is_err() {
+                    let _ = registry.unregister(tunnel_id);
+                    return ServerResp::Error {
+                        kind: ErrorKind::Internal,
+                        msg: "failed to create listener".into(),
+                    };
+                }
             }
             tracing::info!(
                 ?proto,

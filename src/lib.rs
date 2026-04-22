@@ -12,4 +12,5 @@ pub mod smoltcp_iface;
 pub mod test_helpers;
 pub mod tunnel;
 pub mod udp_proxy;
+pub mod udp_reverse;
 pub mod wire;
