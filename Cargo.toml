@@ -17,6 +17,8 @@ thiserror = "2"
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 smoltcp = { version = "0.13", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp"] }
 socket2 = { version = "0.6", features = ["all"] }
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
 
 [features]
 # Bake the wg-quick config at $WGNAT_EMBEDDED_CONFIG into the binary as a

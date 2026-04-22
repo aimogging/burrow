@@ -23,6 +23,7 @@ fn build_pair() -> (WgCore, WgCore) {
         interface: InterfaceConfig {
             private_key: client_secret,
             address: "10.0.0.1/24".parse().unwrap(),
+            control_port: wgnat::config::DEFAULT_CONTROL_PORT,
         },
         peer: PeerConfig {
             public_key: server_public,
@@ -36,6 +37,7 @@ fn build_pair() -> (WgCore, WgCore) {
         interface: InterfaceConfig {
             private_key: server_secret,
             address: "10.0.0.2/24".parse().unwrap(),
+            control_port: wgnat::config::DEFAULT_CONTROL_PORT,
         },
         peer: PeerConfig {
             public_key: client_public,

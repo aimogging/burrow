@@ -38,7 +38,16 @@ pub fn parse_ipv4_cidr(s: &str) -> Result<Ipv4Cidr> {
 pub struct InterfaceConfig {
     pub private_key: StaticSecret,
     pub address: Ipv4Cidr,
+    /// TCP port on the WG interface address where wgnat accepts control
+    /// requests (reverse-tunnel registrations, shell sessions in Phase
+    /// 16). Default if unset: `DEFAULT_CONTROL_PORT` (57821).
+    pub control_port: u16,
 }
+
+/// Default TCP port for the wgnat control channel on the WG interface
+/// address. Chosen to avoid common services and not collide with
+/// WireGuard's default 51820.
+pub const DEFAULT_CONTROL_PORT: u16 = 57821;
 
 impl fmt::Debug for InterfaceConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -80,6 +89,7 @@ pub struct Config {
 struct InterfaceBuilder {
     private_key: Option<StaticSecret>,
     address: Option<Ipv4Cidr>,
+    control_port: Option<u16>,
 }
 
 #[derive(Default)]
@@ -143,6 +153,7 @@ pub fn parse_str(input: &str) -> Result<Config> {
         address: iface
             .address
             .ok_or_else(|| anyhow!("[Interface] missing Address"))?,
+        control_port: iface.control_port.unwrap_or(DEFAULT_CONTROL_PORT),
     };
     let peer = PeerConfig {
         public_key: peer
@@ -206,6 +217,15 @@ fn apply_interface_kv(
             let cidr =
                 parse_ipv4_cidr(value).with_context(|| format!("line {lineno}: invalid Address"))?;
             builder.address = Some(cidr);
+        }
+        "controlport" => {
+            let port = value
+                .parse::<u16>()
+                .with_context(|| format!("line {lineno}: invalid ControlPort"))?;
+            if port == 0 {
+                bail!("line {lineno}: ControlPort must be non-zero");
+            }
+            builder.control_port = Some(port);
         }
         "listenport" | "dns" | "mtu" | "fwmark" | "table" | "preup" | "postup" | "predown"
         | "postdown" | "saveconfig" => {
