@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use crate::dns_service::{handle_query, DNS_PORT};
 use crate::rewrite::{build_udp_packet, PacketView};
 use crate::reverse_registry::ReverseRegistry;
 use crate::udp_proxy::extract_udp_payload;
@@ -188,17 +189,19 @@ impl Default for UdpReverseState {
     }
 }
 
-/// Dispatch a UDP datagram whose dst is `wg_ip`. Checks the per-flow
-/// ephemeral table first (response path), falls back to the reverse
-/// registry (forward path). Rewrites headers via `build_udp_packet` and
-/// emits on `egress_tx`. Drops silently on no match.
-pub fn dispatch_udp_to_wg_ip(
+/// Dispatch a UDP datagram whose dst is `wg_ip`. Order of precedence:
+/// 1. Ephemeral reverse-lookup (reply to an originated outbound).
+/// 2. Registered reverse tunnel (forward path).
+/// 3. DNS service (dst_port == 53), unless `dns_enabled` is false.
+/// Non-matching datagrams drop silently.
+pub async fn dispatch_udp_to_wg_ip(
     packet: &[u8],
     view: &PacketView,
     wg_ip: Ipv4Addr,
     reverse_registry: &Arc<ReverseRegistry>,
     udp_reverse: &Arc<UdpReverseState>,
     egress_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    dns_enabled: bool,
 ) {
     let Some(payload) = extract_udp_payload(packet) else {
         tracing::debug!(?view, "malformed UDP to wg_ip — dropping");
@@ -235,7 +238,22 @@ pub fn dispatch_udp_to_wg_ip(
         let _ = egress_tx.send(out);
         return;
     }
-    tracing::debug!(?view, "UDP to wg_ip matched no reverse tunnel — dropping");
+    // DNS service: peers querying wg_ip as a resolver. Registered
+    // tunnels on port 53 already took priority above.
+    if dns_enabled && view.dst_port == DNS_PORT {
+        if let Some(resp) = handle_query(&payload).await {
+            let out = build_udp_packet(
+                wg_ip,
+                view.src_ip,
+                DNS_PORT,
+                view.src_port,
+                &resp.payload,
+            );
+            let _ = egress_tx.send(out);
+            return;
+        }
+    }
+    tracing::debug!(?view, "UDP to wg_ip matched no handler — dropping");
 }
 
 fn clamp(p: u16) -> u16 {

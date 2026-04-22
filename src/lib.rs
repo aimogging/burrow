@@ -1,6 +1,7 @@
 pub mod bridge;
 pub mod config;
 pub mod control;
+pub mod dns_service;
 pub mod icmp;
 pub mod nat;
 pub mod probe;

@@ -183,6 +183,7 @@ async fn run(
     info!(local = %tunnel.local_addr()?, peer = %tunnel.endpoint(), "WG socket bound");
 
     let wg_ip = cfg.interface.address.address();
+    let dns_enabled = cfg.interface.dns_enabled;
     let (smoltcp, mut events, smoltcp_tx_rx) = spawn_smoltcp(Arc::clone(&nat), wg_ip);
     info!("smoltcp runtime spawned");
 
@@ -442,6 +443,7 @@ async fn run(
                             wg_ip,
                             &reverse_registry,
                             &udp_reverse,
+                            dns_enabled,
                         ).await;
                     }
                     Ok(None) => { /* control plane */ }
@@ -472,6 +474,7 @@ async fn ingest_tunnel_packet(
     wg_ip: std::net::Ipv4Addr,
     reverse_registry: &Arc<ReverseRegistry>,
     udp_reverse: &Arc<UdpReverseState>,
+    dns_enabled: bool,
 ) {
     let view = match rewrite::parse_5tuple(&packet) {
         Ok(v) => v,
@@ -496,7 +499,9 @@ async fn ingest_tunnel_packet(
             reverse_registry,
             udp_reverse,
             egress_tx,
-        );
+            dns_enabled,
+        )
+        .await;
         return;
     }
     match view.proto {

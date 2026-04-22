@@ -26,8 +26,8 @@ const LISTEN_PORT: u16 = 53;
 const FORWARD_PORT: u16 = 5353;
 const PEER_PORT: u16 = 44000;
 
-#[test]
-fn udp_reverse_forward_and_reply() {
+#[tokio::test]
+async fn udp_reverse_forward_and_reply() {
     let registry = Arc::new(ReverseRegistry::new());
     let state = Arc::new(UdpReverseState::new());
     registry
@@ -44,7 +44,7 @@ fn udp_reverse_forward_and_reply() {
     let query = b"DNS-LIKE-QUERY";
     let inbound = build_udp_packet(PEER_IP, WG_IP, PEER_PORT, LISTEN_PORT, query);
     let view = parse_5tuple(&inbound).unwrap();
-    dispatch_udp_to_wg_ip(&inbound, &view, WG_IP, &registry, &state, &tx);
+    dispatch_udp_to_wg_ip(&inbound, &view, WG_IP, &registry, &state, &tx, false).await;
 
     let forward_pkt = rx.try_recv().expect("forward datagram should be emitted");
     let fwd_view = parse_5tuple(&forward_pkt).unwrap();
@@ -66,7 +66,7 @@ fn udp_reverse_forward_and_reply() {
     let answer = b"DNS-LIKE-RESPONSE";
     let reply_in = build_udp_packet(FORWARD_IP, WG_IP, FORWARD_PORT, ephemeral, answer);
     let reply_view = parse_5tuple(&reply_in).unwrap();
-    dispatch_udp_to_wg_ip(&reply_in, &reply_view, WG_IP, &registry, &state, &tx);
+    dispatch_udp_to_wg_ip(&reply_in, &reply_view, WG_IP, &registry, &state, &tx, false).await;
 
     let reply_pkt = rx.try_recv().expect("reply datagram should be emitted");
     let reply_view = parse_5tuple(&reply_pkt).unwrap();
@@ -82,7 +82,7 @@ fn udp_reverse_forward_and_reply() {
     let q2 = b"Q2";
     let inbound2 = build_udp_packet(PEER_IP, WG_IP, PEER_PORT, LISTEN_PORT, q2);
     let view2 = parse_5tuple(&inbound2).unwrap();
-    dispatch_udp_to_wg_ip(&inbound2, &view2, WG_IP, &registry, &state, &tx);
+    dispatch_udp_to_wg_ip(&inbound2, &view2, WG_IP, &registry, &state, &tx, false).await;
     let fwd2 = rx.try_recv().expect("second forward should be emitted");
     let fwd2_view = parse_5tuple(&fwd2).unwrap();
     assert_eq!(
@@ -93,13 +93,13 @@ fn udp_reverse_forward_and_reply() {
     // Phase D: a datagram to an unregistered listen_port gets dropped.
     let bogus = build_udp_packet(PEER_IP, WG_IP, PEER_PORT, 9999, b"nope");
     let bogus_view = parse_5tuple(&bogus).unwrap();
-    dispatch_udp_to_wg_ip(&bogus, &bogus_view, WG_IP, &registry, &state, &tx);
+    dispatch_udp_to_wg_ip(&bogus, &bogus_view, WG_IP, &registry, &state, &tx, false).await;
     assert!(rx.try_recv().is_err(), "unregistered port must drop silently");
 
     // Phase E: a reply on an unrecognized ephemeral port also drops.
     let stale = build_udp_packet(FORWARD_IP, WG_IP, FORWARD_PORT, 58000, b"stale");
     let stale_view = parse_5tuple(&stale).unwrap();
-    dispatch_udp_to_wg_ip(&stale, &stale_view, WG_IP, &registry, &state, &tx);
+    dispatch_udp_to_wg_ip(&stale, &stale_view, WG_IP, &registry, &state, &tx, false).await;
     assert!(rx.try_recv().is_err(), "stale ephemeral must drop silently");
 }
 

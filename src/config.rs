@@ -42,6 +42,11 @@ pub struct InterfaceConfig {
     /// requests (reverse-tunnel registrations, shell sessions in Phase
     /// 16). Default if unset: `DEFAULT_CONTROL_PORT` (57821).
     pub control_port: u16,
+    /// Whether the built-in DNS resolver (`wg_ip:53/udp`) is active.
+    /// On by default; opt out with `DnsEnabled = false`. A UDP
+    /// reverse-tunnel registration on port 53 always takes precedence
+    /// over the DNS service regardless of this flag.
+    pub dns_enabled: bool,
 }
 
 /// Default TCP port for the wgnat control channel on the WG interface
@@ -90,6 +95,7 @@ struct InterfaceBuilder {
     private_key: Option<StaticSecret>,
     address: Option<Ipv4Cidr>,
     control_port: Option<u16>,
+    dns_enabled: Option<bool>,
 }
 
 #[derive(Default)]
@@ -154,6 +160,7 @@ pub fn parse_str(input: &str) -> Result<Config> {
             .address
             .ok_or_else(|| anyhow!("[Interface] missing Address"))?,
         control_port: iface.control_port.unwrap_or(DEFAULT_CONTROL_PORT),
+        dns_enabled: iface.dns_enabled.unwrap_or(true),
     };
     let peer = PeerConfig {
         public_key: peer
@@ -226,6 +233,16 @@ fn apply_interface_kv(
                 bail!("line {lineno}: ControlPort must be non-zero");
             }
             builder.control_port = Some(port);
+        }
+        "dnsenabled" => {
+            let enabled = match value.to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => true,
+                "false" | "no" | "off" | "0" => false,
+                other => bail!(
+                    "line {lineno}: DnsEnabled expects true/false/yes/no/on/off/1/0, got `{other}`"
+                ),
+            };
+            builder.dns_enabled = Some(enabled);
         }
         "listenport" | "dns" | "mtu" | "fwmark" | "table" | "preup" | "postup" | "predown"
         | "postdown" | "saveconfig" => {

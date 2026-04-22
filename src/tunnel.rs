@@ -305,6 +305,7 @@ mod tests {
                 private_key: private,
                 address: "10.0.0.2/24".parse().unwrap(),
                 control_port: crate::config::DEFAULT_CONTROL_PORT,
+                dns_enabled: true,
             },
             peer: PeerConfig {
                 public_key: peer_public,
