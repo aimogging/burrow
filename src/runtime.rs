@@ -26,9 +26,10 @@
 //! (open OS TcpStream, shuffle bytes both ways) lives in `crate::proxy`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use smoltcp::iface::{SocketHandle, SocketSet};
@@ -202,6 +203,19 @@ fn run_smoltcp_thread(
     let mut last_states: HashMap<ConnectionId, tcp::State> = HashMap::new();
     let mut next_id: u64 = 0;
 
+    // Fix #3 observability: emit a single ERROR the first time the event
+    // consumer disappears, then stay quiet. A flapping consumer doesn't
+    // produce log spam but also doesn't get silently swallowed forever.
+    let consumer_alive = AtomicBool::new(true);
+    let send_evt = |evt: SmoltcpEvent| {
+        if evt_tx.send(evt).is_err() && consumer_alive.swap(false, Ordering::Relaxed) {
+            tracing::error!("smoltcp event consumer task gone — TCP path is dead");
+        }
+    };
+
+    let mut last_cardinality_log = Instant::now();
+    const CARDINALITY_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
     tracing::info!(addr = ?addr, "smoltcp thread started");
 
     loop {
@@ -211,9 +225,9 @@ fn run_smoltcp_thread(
             handle_command(cmd, &mut sockets, &mut conns, &mut by_handle, &mut next_id, &nat);
         }
 
-        // 2. Drive the stack. This consumes packets from the rx channel,
-        //    runs state machines, emits packets onto the tx channel.
-        let _ = iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+        // 2. Drive the stack. `poll` returns whether anything changed —
+        //    purely advisory, ignore.
+        let _changed = iface.poll(SmolInstant::now(), &mut device, &mut sockets);
 
         // 3. Inspect each socket; emit events on transitions / data.
         let mut to_drop: Vec<ConnectionId> = Vec::new();
@@ -240,14 +254,14 @@ fn run_smoltcp_thread(
                     && !matches!(prev, Some(tcp::State::Established))
                 {
                     nat.set_state(key, ConnectionState::Established);
-                    let _ = evt_tx.send(SmoltcpEvent::TcpConnected { key, id });
+                    send_evt(SmoltcpEvent::TcpConnected { key, id });
                 }
 
                 // CLOSE_WAIT means peer has FIN'd us. Half-close signal.
                 if matches!(new_state, tcp::State::CloseWait)
                     && !matches!(prev, Some(tcp::State::CloseWait))
                 {
-                    let _ = evt_tx.send(SmoltcpEvent::TcpFinFromPeer { key, id });
+                    send_evt(SmoltcpEvent::TcpFinFromPeer { key, id });
                 }
             }
 
@@ -256,13 +270,13 @@ fn run_smoltcp_thread(
                 if let Ok(n) = tcp_sock.recv_slice(&mut buf) {
                     if n > 0 {
                         buf.truncate(n);
-                        let _ = evt_tx.send(SmoltcpEvent::TcpData { key, id, data: buf });
+                        send_evt(SmoltcpEvent::TcpData { key, id, data: buf });
                     }
                 }
             }
 
             if matches!(new_state, tcp::State::Closed) {
-                let _ = evt_tx.send(SmoltcpEvent::TcpClosed { key, id });
+                send_evt(SmoltcpEvent::TcpClosed { key, id });
                 nat.mark_closing(key, DEFAULT_TCP_GRACE);
                 to_drop.push(id);
             }
@@ -274,6 +288,19 @@ fn run_smoltcp_thread(
                 by_handle.remove(&state.handle);
             }
             last_states.remove(&id);
+        }
+
+        // 4. Periodic cardinality log — tracks live socket count vs
+        //    connection-id count. Steady-state should hover near zero
+        //    plus open flows; monotonic growth is a leak signal.
+        if last_cardinality_log.elapsed() >= CARDINALITY_LOG_INTERVAL {
+            last_cardinality_log = Instant::now();
+            tracing::debug!(
+                sockets = sockets.iter().count(),
+                conns = conns.len(),
+                by_handle = by_handle.len(),
+                "smoltcp cardinality"
+            );
         }
 
         thread::sleep(IDLE_SLEEP);

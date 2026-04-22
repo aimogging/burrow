@@ -6,19 +6,26 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use clap::{Parser, Subcommand};
+use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use wgnat::config;
 use wgnat::icmp::IcmpForwarder;
 use wgnat::nat::{NatKey, NatTable};
-use wgnat::proxy::{spawn_tcp_proxy, ProxyMsg};
-use wgnat::rewrite::{self, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
+use wgnat::proxy::{spawn_tcp_proxy_with_stream, ProxyMsg};
+use wgnat::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent, SmoltcpHandle};
 use wgnat::tunnel::WgTunnel;
 use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
+
+/// How long to wait on the OS-side TCP connect during the probe before
+/// giving up and synthesizing a RST back to the peer. Roughly matches the
+/// first SYN-ACK retransmit window so we don't keep peers waiting.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `udp_proxies` is touched on every UDP packet (ingress task) and on the
 /// 10s NAT sweep — real but minimal contention. `std::sync::Mutex` is the
@@ -85,6 +92,19 @@ async fn run(
         )
         .init();
 
+    // Make panics in any thread (including tokio worker tasks and the
+    // smoltcp poll thread) loud. Pre-Phase-9 a panic in the smoltcp thread
+    // killed only that thread and the rest of the process kept running with
+    // every TCP path silently broken; the panic itself never landed in
+    // logs. This hook ensures the next stress test fails loudly.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        error!(thread = thread.name().unwrap_or("<unnamed>"), %info, "PANIC");
+        eprintln!("PANIC in thread {:?}: {}", thread.name(), info);
+        default_hook(info);
+    }));
+
     let mut cfg = config::load(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
@@ -146,9 +166,15 @@ async fn run(
         Arc::clone(&nat),
     ));
 
+    // Channel that connect_probe uses to hand a successfully-connected OS
+    // TcpStream over to the event loop, where it's parked until the matching
+    // smoltcp `TcpConnected` event arrives. Fix #1: the SYN-ACK only goes
+    // back to the peer after the OS-side connect succeeds.
+    let (arm_tx, mut arm_rx) = mpsc::unbounded_channel::<(NatKey, TcpStream)>();
+
     // Spawn the smoltcp event consumer: turns runtime events into proxy
-    // task lifecycle. The `proxies` map lives entirely inside this closure
-    // — only one task touches it, so plain HashMap is correct.
+    // task lifecycle. The `proxies` and `armed` maps live entirely inside
+    // this closure — only one task touches them, so plain HashMaps suffice.
     let event_loop = tokio::spawn({
         let smoltcp = smoltcp.clone();
         let nat = Arc::clone(&nat);
@@ -157,28 +183,52 @@ async fn run(
                 wgnat::runtime::ConnectionId,
                 mpsc::UnboundedSender<ProxyMsg>,
             > = HashMap::new();
-            while let Some(evt) = events.evt_rx.recv().await {
-                match evt {
-                    SmoltcpEvent::TcpConnected { key, id } => {
-                        debug!(?key, ?id, "tcp connected");
-                        let tx = spawn_tcp_proxy(key, id, smoltcp.clone(), Arc::clone(&nat));
-                        proxies.insert(id, tx);
-                    }
-                    SmoltcpEvent::TcpData { id, data, .. } => {
-                        if let Some(tx) = proxies.get(&id) {
-                            let _ = tx.send(ProxyMsg::Data(data));
+            // Streams pre-dialed by connect_probe, awaiting their matching
+            // TcpConnected event so we can hand them off to the proxy task.
+            let mut armed: HashMap<NatKey, TcpStream> = HashMap::new();
+            loop {
+                tokio::select! {
+                    Some((key, stream)) = arm_rx.recv() => {
+                        if armed.insert(key, stream).is_some() {
+                            warn!(?key, "armed stream replaced — duplicate probe");
                         }
                     }
-                    SmoltcpEvent::TcpFinFromPeer { id, .. } => {
-                        if let Some(tx) = proxies.get(&id) {
-                            let _ = tx.send(ProxyMsg::PeerFin);
+                    Some(evt) = events.evt_rx.recv() => match evt {
+                        SmoltcpEvent::TcpConnected { key, id } => {
+                            debug!(?key, ?id, "tcp connected");
+                            let Some(stream) = armed.remove(&key) else {
+                                error!(?key, ?id, "TcpConnected with no armed stream — Fix #1 invariant violated; aborting smoltcp side");
+                                smoltcp.abort_tcp(id);
+                                continue;
+                            };
+                            let tx = spawn_tcp_proxy_with_stream(
+                                key,
+                                id,
+                                smoltcp.clone(),
+                                Arc::clone(&nat),
+                                stream,
+                            );
+                            proxies.insert(id, tx);
                         }
-                    }
-                    SmoltcpEvent::TcpClosed { id, .. } => {
-                        if let Some(tx) = proxies.remove(&id) {
-                            let _ = tx.send(ProxyMsg::Closed);
+                        SmoltcpEvent::TcpData { id, data, .. } => {
+                            if let Some(tx) = proxies.get(&id) {
+                                let _ = tx.send(ProxyMsg::Data(data));
+                            }
                         }
-                    }
+                        SmoltcpEvent::TcpFinFromPeer { id, .. } => {
+                            if let Some(tx) = proxies.get(&id) {
+                                let _ = tx.send(ProxyMsg::PeerFin);
+                            }
+                        }
+                        SmoltcpEvent::TcpClosed { key, id } => {
+                            if let Some(tx) = proxies.remove(&id) {
+                                let _ = tx.send(ProxyMsg::Closed);
+                            }
+                            // Defensive: clear any orphaned armed entry.
+                            armed.remove(&key);
+                        }
+                    },
+                    else => break,
                 }
             }
         }
@@ -234,6 +284,7 @@ async fn run(
                             &nat,
                             &udp_proxies,
                             &egress_tx,
+                            &arm_tx,
                             &icmp,
                         ).await;
                     }
@@ -252,14 +303,15 @@ async fn run(
 }
 
 /// Take a decrypted IPv4 packet from the WG tunnel, run NAT rewrite, and
-/// dispatch by protocol: TCP into smoltcp, UDP into the per-entry forwarder.
-/// ICMP lands in Phase 6.
+/// dispatch by protocol: TCP into smoltcp, UDP into the per-entry forwarder,
+/// ICMP into the dedicated forwarder.
 async fn ingest_tunnel_packet(
     mut packet: Vec<u8>,
     smoltcp: &SmoltcpHandle,
     nat: &Arc<NatTable>,
     udp_proxies: &UdpProxyMap,
     egress_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    arm_tx: &mpsc::UnboundedSender<(NatKey, TcpStream)>,
     icmp: &Arc<IcmpForwarder>,
 ) {
     let view = match rewrite::parse_5tuple(&packet) {
@@ -271,24 +323,54 @@ async fn ingest_tunnel_packet(
     };
     match view.proto {
         PROTO_TCP => {
-            let (key, gateway_port) = match nat.rewrite_inbound(&mut packet) {
-                Ok(k) => k,
-                Err(e) => {
-                    warn!(error = %e, "nat rewrite_inbound (tcp) failed");
-                    return;
-                }
+            // Compute the prospective NatKey from the packet's natural
+            // 5-tuple WITHOUT triggering rewrite/registration yet — the
+            // probe path needs to claim the slot before any rewrite, so
+            // retransmits during the probe see Pending and short-circuit.
+            let key = NatKey {
+                proto: PROTO_TCP,
+                peer_ip: view.src_ip,
+                peer_port: view.src_port,
+                original_dst_ip: view.dst_ip,
+                original_dst_port: view.dst_port,
             };
-            // Ensure listener exists *before* the SYN reaches the smoltcp poll.
-            // The listener binds on the per-flow gateway_port, NOT the
-            // original dst_port — that's how distinct flows from the same
-            // (peer_ip, peer_port) to the same dst_port stay separable.
-            if nat.get(key).and_then(|e| e.smoltcp_id).is_none()
-                && smoltcp.ensure_listener(gateway_port, key).await.is_err()
-            {
-                error!(?key, "smoltcp thread dropped ensure_listener reply");
-                return;
+            let entry = nat.get(key);
+            match entry {
+                Some(e) if e.smoltcp_id.is_some() => {
+                    // Fast path: listener exists, just rewrite and enqueue.
+                    if let Err(err) = nat.rewrite_inbound(&mut packet) {
+                        warn!(?key, error = %err, "nat rewrite_inbound (tcp fast path) failed");
+                        return;
+                    }
+                    smoltcp.enqueue_inbound(packet);
+                }
+                Some(_) => {
+                    // Probe in flight (Pending, no smoltcp_id yet). This is
+                    // a SYN retransmit — drop. The probe will resolve and
+                    // either enqueue the original SYN (success) or send
+                    // back a RST (failure).
+                    debug!(?key, "tcp packet during connect probe — dropping");
+                }
+                None => {
+                    // No entry: only kick off a probe for a fresh SYN.
+                    // Anything else is stale traffic with no listener and
+                    // should be dropped silently.
+                    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+                    let flags = if packet.len() >= ihl + 14 { packet[ihl + 13] } else { 0 };
+                    let is_syn_only = (flags & 0x12) == 0x02; // SYN set, ACK clear
+                    if !is_syn_only {
+                        debug!(?key, flags, "tcp packet to unknown flow (not SYN) — dropping");
+                        return;
+                    }
+                    let smoltcp = smoltcp.clone();
+                    let nat = Arc::clone(nat);
+                    let arm_tx = arm_tx.clone();
+                    let egress_tx = egress_tx.clone();
+                    tokio::spawn(async move {
+                        connect_probe(packet, key, smoltcp, nat, arm_tx, egress_tx).await;
+                    });
+                }
             }
-            smoltcp.enqueue_inbound(packet);
         }
         PROTO_UDP => {
             let (key, _gateway_port) = match nat.rewrite_inbound(&mut packet) {
@@ -340,4 +422,110 @@ async fn egress_loop(
             warn!(error = %e, "wg send");
         }
     }
+}
+
+/// Phase 9 fix #1: try to dial the OS-side destination *before* letting
+/// smoltcp answer the peer's SYN. Outcomes:
+///   * Connect succeeds → arm the stream for the event loop, register the
+///     smoltcp listener, enqueue the original SYN. Smoltcp emits SYN-ACK
+///     and the proxy task takes over once `TcpConnected` fires.
+///   * Connect fails or times out → synthesize a TCP RST in userspace and
+///     send it straight back through the tunnel. The peer correctly sees
+///     the destination port as closed, instead of a SYN-ACK + delayed RST
+///     (which gets reported as `open` by tools like nmap).
+///
+/// `try_reserve_pending` claims the NAT slot up-front, so SYN retransmits
+/// arriving while this probe is in flight see a Pending entry and are
+/// dropped by the dispatch in `ingest_tunnel_packet` rather than starting
+/// a second probe.
+async fn connect_probe(
+    mut packet: Vec<u8>,
+    key: NatKey,
+    smoltcp: SmoltcpHandle,
+    nat: Arc<NatTable>,
+    arm_tx: mpsc::UnboundedSender<(NatKey, TcpStream)>,
+    egress_tx: mpsc::UnboundedSender<Vec<u8>>,
+) {
+    // Capture peer's SYN sequence number BEFORE any rewrite mutates the
+    // packet — needed if we have to synthesize a RST.
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if packet.len() < ihl + 8 {
+        debug!(?key, "probe: malformed SYN, dropping");
+        return;
+    }
+    let peer_seq = u32::from_be_bytes([
+        packet[ihl + 4],
+        packet[ihl + 5],
+        packet[ihl + 6],
+        packet[ihl + 7],
+    ]);
+
+    // Claim the NAT slot first so concurrent retransmits short-circuit.
+    match nat.try_reserve_pending(key) {
+        Ok(Some(_gw)) => { /* fresh — proceed */ }
+        Ok(None) => {
+            // Lost a race — another task is already probing for this exact
+            // 5-tuple. Drop this duplicate.
+            debug!(?key, "probe: another probe already in flight; dropping");
+            return;
+        }
+        Err(e) => {
+            warn!(?key, error = %e, "probe: cannot reserve NAT slot");
+            return;
+        }
+    };
+
+    let dst = (key.original_dst_ip, key.original_dst_port);
+    let stream = match timeout(PROBE_TIMEOUT, TcpStream::connect(dst)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            debug!(?key, error = %e, "probe: OS connect refused/failed → RST to peer");
+            send_rst(&egress_tx, key, peer_seq);
+            nat.evict_key(key);
+            return;
+        }
+        Err(_) => {
+            debug!(?key, ?PROBE_TIMEOUT, "probe: OS connect timed out → RST to peer");
+            send_rst(&egress_tx, key, peer_seq);
+            nat.evict_key(key);
+            return;
+        }
+    };
+
+    // Hand the stream off BEFORE enqueueing the SYN — guarantees that the
+    // event loop has the stream parked by the time the matching
+    // TcpConnected event arrives.
+    if arm_tx.send((key, stream)).is_err() {
+        warn!(?key, "probe: event loop receiver gone; aborting");
+        nat.evict_key(key);
+        return;
+    }
+
+    // Now actually rewrite the SYN and register the listener. Idempotent
+    // against the slot try_reserve_pending already created.
+    let gateway_port = match nat.rewrite_inbound(&mut packet) {
+        Ok((_, gw)) => gw,
+        Err(e) => {
+            warn!(?key, error = %e, "probe: rewrite_inbound failed post-connect");
+            nat.evict_key(key);
+            return;
+        }
+    };
+    if smoltcp.ensure_listener(gateway_port, key).await.is_err() {
+        error!(?key, "probe: smoltcp dropped ensure_listener reply");
+        nat.evict_key(key);
+        return;
+    }
+    smoltcp.enqueue_inbound(packet);
+}
+
+fn send_rst(egress_tx: &mpsc::UnboundedSender<Vec<u8>>, key: NatKey, peer_seq: u32) {
+    let rst = build_tcp_rst(
+        key.original_dst_ip,
+        key.peer_ip,
+        key.original_dst_port,
+        key.peer_port,
+        peer_seq.wrapping_add(1),
+    );
+    let _ = egress_tx.send(rst);
 }

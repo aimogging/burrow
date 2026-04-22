@@ -21,9 +21,10 @@ use tokio::sync::mpsc;
 use crate::nat::{ConnectionState, NatKey, NatTable};
 use crate::runtime::{ConnectionId, SmoltcpHandle};
 
-/// Spawn a task that connects to the original destination and proxies data
-/// in both directions. Returns immediately with the inbound data sender —
-/// the caller (event loop) hands smoltcp `TcpData` chunks to it.
+/// Legacy entry point: spawn a task that dials the original destination
+/// itself and then proxies data in both directions. Used by tests that drive
+/// the runtime directly without going through main.rs's connect-probe path.
+/// In production main.rs always pre-dials and uses `spawn_tcp_proxy_with_stream`.
 pub fn spawn_tcp_proxy(
     key: NatKey,
     id: ConnectionId,
@@ -32,7 +33,36 @@ pub fn spawn_tcp_proxy(
 ) -> mpsc::UnboundedSender<ProxyMsg> {
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        if let Err(e) = run_tcp_proxy(key, id, smoltcp, nat, msg_rx).await {
+        let dst = (key.original_dst_ip, key.original_dst_port);
+        let stream = match TcpStream::connect(dst).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(?key, error = %e, "proxy: OS connect failed; aborting smoltcp side");
+                smoltcp.abort_tcp(id);
+                nat.set_state(key, ConnectionState::Closed);
+                return;
+            }
+        };
+        if let Err(e) = run_tcp_proxy_inner(stream, key, id, smoltcp, nat, msg_rx).await {
+            tracing::warn!(?key, error = %e, "tcp proxy task failed");
+        }
+    });
+    msg_tx
+}
+
+/// Production entry point: caller pre-dials the OS stream (so the SYN-ACK
+/// to the peer reflects the real reachability of the destination — fix #1)
+/// and hands it off here once smoltcp emits `TcpConnected`.
+pub fn spawn_tcp_proxy_with_stream(
+    key: NatKey,
+    id: ConnectionId,
+    smoltcp: SmoltcpHandle,
+    nat: Arc<NatTable>,
+    stream: TcpStream,
+) -> mpsc::UnboundedSender<ProxyMsg> {
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        if let Err(e) = run_tcp_proxy_inner(stream, key, id, smoltcp, nat, msg_rx).await {
             tracing::warn!(?key, error = %e, "tcp proxy task failed");
         }
     });
@@ -49,25 +79,14 @@ pub enum ProxyMsg {
     Closed,
 }
 
-async fn run_tcp_proxy(
+async fn run_tcp_proxy_inner(
+    stream: TcpStream,
     key: NatKey,
     id: ConnectionId,
     smoltcp: SmoltcpHandle,
     nat: Arc<NatTable>,
     mut msg_rx: mpsc::UnboundedReceiver<ProxyMsg>,
 ) -> Result<()> {
-    let dst = (key.original_dst_ip, key.original_dst_port);
-    tracing::debug!(?key, "proxy: connecting OS stream → {}:{}", dst.0, dst.1);
-
-    let stream = match TcpStream::connect(dst).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(?key, error = %e, "proxy: OS connect failed; aborting smoltcp side");
-            smoltcp.abort_tcp(id);
-            nat.set_state(key, ConnectionState::Closed);
-            return Ok(());
-        }
-    };
     let _ = stream.set_nodelay(true);
     let (mut os_read, mut os_write) = stream.into_split();
 
@@ -134,8 +153,12 @@ async fn run_tcp_proxy(
         let _ = os_write.shutdown().await;
     }
 
-    // Wait for the OS pump to wind down so we don't leak the read half.
-    let _ = os_pump.await;
+    // Wait for the OS pump to wind down so we don't leak the read half. A
+    // join error here means the pump panicked — surface it (fix #3 — pre
+    // Phase-9 this was silently `let _ = ...`).
+    if let Err(e) = os_pump.await {
+        tracing::warn!(?key, error = %e, "tcp os_pump joined with error");
+    }
 
     nat.set_state(key, ConnectionState::Closed);
     tracing::debug!(?key, "proxy task exiting");
