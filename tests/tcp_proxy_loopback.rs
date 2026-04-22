@@ -256,6 +256,9 @@ async fn tcp_proxy_round_trips_via_loopback_echo() {
                             let _ = tx.send(ProxyMsg::Closed);
                         }
                     }
+                    SmoltcpEvent::TcpAborted { id, .. } => {
+                        proxies.remove(&id);
+                    }
                 }
             }
         }

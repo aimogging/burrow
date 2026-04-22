@@ -275,6 +275,17 @@ async fn run(
                             // Defensive: clear any orphaned armed entry.
                             armed.remove(&key);
                         }
+                        SmoltcpEvent::TcpAborted { key, id } => {
+                            // Phase 10: peer aborted before reaching ESTABLISHED
+                            // (typical of `nmap -sS`: SYN → SYN-ACK → RST without
+                            // an intervening ACK). The runtime has already torn
+                            // down its smoltcp socket and evicted the NAT entry;
+                            // we just need to drop the OS-side stream that
+                            // connect_probe parked. No proxy was spawned because
+                            // TcpConnected never fired.
+                            debug!(?key, ?id, "tcp aborted before establishment — dropping armed stream");
+                            armed.remove(&key);
+                        }
                     },
                     else => break,
                 }

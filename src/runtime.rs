@@ -25,7 +25,7 @@
 //! This module is the *plumbing* for the smoltcp side. The actual proxying
 //! (open OS TcpStream, shuffle bytes both ways) lives in `crate::proxy`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -102,6 +102,13 @@ pub enum SmoltcpEvent {
     /// Socket reached terminal CLOSED state. The `ConnectionId` is no longer
     /// valid after this event; subsequent commands referencing it no-op.
     TcpClosed { key: NatKey, id: ConnectionId },
+    /// Phase 10: connection attempt was aborted before reaching ESTABLISHED
+    /// (peer sent RST after SYN-ACK, or the listener went directly to
+    /// CLOSED without ever transitioning through ESTABLISHED). The smoltcp
+    /// socket and ConnectionId are torn down by the time this event fires;
+    /// callers should drop any armed OS-side stream and forget the entry.
+    /// `ConnectionId` is invalid after this event.
+    TcpAborted { key: NatKey, id: ConnectionId },
 }
 
 /// Cheap-to-clone handle for issuing commands and feeding inbound packets to
@@ -201,6 +208,11 @@ fn run_smoltcp_thread(
     let mut conns: HashMap<ConnectionId, ConnState> = HashMap::new();
     let mut by_handle: HashMap<SocketHandle, ConnectionId> = HashMap::new();
     let mut last_states: HashMap<ConnectionId, tcp::State> = HashMap::new();
+    // Phase 10: track which conns ever reached ESTABLISHED so we can
+    // distinguish "aborted before establishment" (drop everything, no proxy
+    // exists) from "closed after establishment" (signal proxy to wind down,
+    // mark NAT entry for grace-period sweep).
+    let mut ever_established: HashSet<ConnectionId> = HashSet::new();
     let mut next_id: u64 = 0;
 
     // Fix #3 observability: emit a single ERROR the first time the event
@@ -231,6 +243,10 @@ fn run_smoltcp_thread(
 
         // 3. Inspect each socket; emit events on transitions / data.
         let mut to_drop: Vec<ConnectionId> = Vec::new();
+        // Phase 10: aborted connections — never reached ESTABLISHED. Tear
+        // down the smoltcp socket AND evict the NAT entry (no grace
+        // period — there's no proxy/peer state to wind down).
+        let mut to_abort: Vec<(ConnectionId, NatKey)> = Vec::new();
         for (handle, socket) in sockets.iter_mut() {
             let smoltcp::socket::Socket::Tcp(tcp_sock) = socket else {
                 continue;
@@ -246,6 +262,15 @@ fn run_smoltcp_thread(
             let new_state = tcp_sock.state();
             let prev = last_states.get(&id).copied();
 
+            // Phase 10: detect "aborted before establishment". smoltcp
+            // explicitly sends a SYN-RECEIVED listener back to LISTEN on
+            // RST (smoltcp 0.13 socket/tcp.rs:1818-1826), so SYN-scan
+            // workloads (`nmap -sS`) leave listeners stuck in LISTEN
+            // forever — never reaching CLOSED, never firing TcpClosed.
+            // Treat any backwards transition (toward LISTEN, or directly
+            // to CLOSED) without a prior ESTABLISHED as an abort.
+            let mut is_aborting = false;
+
             if prev != Some(new_state) {
                 last_states.insert(id, new_state);
                 tracing::trace!(?id, ?key, ?prev, ?new_state, "tcp state change");
@@ -253,6 +278,7 @@ fn run_smoltcp_thread(
                 if matches!(new_state, tcp::State::Established)
                     && !matches!(prev, Some(tcp::State::Established))
                 {
+                    ever_established.insert(id);
                     nat.set_state(key, ConnectionState::Established);
                     send_evt(SmoltcpEvent::TcpConnected { key, id });
                 }
@@ -263,9 +289,27 @@ fn run_smoltcp_thread(
                 {
                     send_evt(SmoltcpEvent::TcpFinFromPeer { key, id });
                 }
+
+                let went_back_to_listen = matches!(
+                    prev,
+                    Some(tcp::State::SynReceived | tcp::State::SynSent)
+                ) && matches!(new_state, tcp::State::Listen);
+                let closed_now = matches!(new_state, tcp::State::Closed);
+                if (went_back_to_listen || closed_now) && !ever_established.contains(&id) {
+                    tracing::debug!(
+                        ?id,
+                        ?key,
+                        ?prev,
+                        ?new_state,
+                        "tcp aborted before establishment"
+                    );
+                    send_evt(SmoltcpEvent::TcpAborted { key, id });
+                    to_abort.push((id, key));
+                    is_aborting = true;
+                }
             }
 
-            if tcp_sock.can_recv() {
+            if !is_aborting && tcp_sock.can_recv() {
                 let mut buf = vec![0u8; RECV_CHUNK];
                 if let Ok(n) = tcp_sock.recv_slice(&mut buf) {
                     if n > 0 {
@@ -275,11 +319,24 @@ fn run_smoltcp_thread(
                 }
             }
 
-            if matches!(new_state, tcp::State::Closed) {
+            if matches!(new_state, tcp::State::Closed) && !is_aborting {
                 send_evt(SmoltcpEvent::TcpClosed { key, id });
                 nat.mark_closing(key, DEFAULT_TCP_GRACE);
                 to_drop.push(id);
             }
+        }
+
+        for (id, key) in to_abort {
+            if let Some(state) = conns.remove(&id) {
+                sockets.remove(state.handle);
+                by_handle.remove(&state.handle);
+            }
+            last_states.remove(&id);
+            ever_established.remove(&id);
+            // Aborted entries skip the TCP grace window — there's no
+            // half-open state to keep alive and the gateway_port should
+            // return to the pool immediately.
+            nat.evict_key(key);
         }
 
         for id in to_drop {
@@ -288,6 +345,7 @@ fn run_smoltcp_thread(
                 by_handle.remove(&state.handle);
             }
             last_states.remove(&id);
+            ever_established.remove(&id);
         }
 
         // 4. Periodic cardinality log — tracks live socket count vs
