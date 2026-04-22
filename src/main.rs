@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use tokio::net::TcpStream;
@@ -27,6 +27,27 @@ use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
 /// first SYN-ACK retransmit window so we don't keep peers waiting.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Optional config baked in at build time via the `embedded-config` feature.
+/// The path is taken from `WGNAT_EMBEDDED_CONFIG` at build time; `build.rs`
+/// reads the file and emits `$OUT_DIR/embedded_config.rs` containing
+/// `pub const EMBEDDED_CONFIG: &str = "..."`. Cargo's `rerun-if-changed`
+/// directive on that path means editing the .conf invalidates the build.
+#[cfg(feature = "embedded-config")]
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/embedded_config.rs"));
+}
+
+const EMBEDDED_CONFIG: Option<&str> = {
+    #[cfg(feature = "embedded-config")]
+    {
+        Some(embedded::EMBEDDED_CONFIG)
+    }
+    #[cfg(not(feature = "embedded-config"))]
+    {
+        None
+    }
+};
+
 /// `udp_proxies` is touched on every UDP packet (ingress task) and on the
 /// 10s NAT sweep — real but minimal contention. `std::sync::Mutex` is the
 /// right tool: critical sections are bounded HashMap ops with no `.await`
@@ -44,9 +65,12 @@ struct Cli {
 enum Cmd {
     /// Run the NAT gateway against a wg-quick style config.
     Run {
-        /// Path to a wg-quick style configuration file.
+        /// Path to a wg-quick style configuration file. Optional when the
+        /// binary was built with the `embedded-config` feature; required
+        /// otherwise. An explicit `--config` always overrides the embedded
+        /// one (useful for testing the same binary against a throwaway).
         #[arg(short, long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
 
         /// Override the peer endpoint from the config file (host:port).
         #[arg(long)]
@@ -79,7 +103,7 @@ fn keygen() -> Result<()> {
 }
 
 async fn run(
-    config_path: PathBuf,
+    config_path: Option<PathBuf>,
     endpoint: Option<String>,
     keepalive: Option<u16>,
 ) -> Result<()> {
@@ -95,16 +119,42 @@ async fn run(
     // killed only that thread and the rest of the process kept running with
     // every TCP path silently broken; the panic itself never landed in
     // logs. This hook ensures the next stress test fails loudly.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let thread = std::thread::current();
-        error!(thread = thread.name().unwrap_or("<unnamed>"), %info, "PANIC");
-        eprintln!("PANIC in thread {:?}: {}", thread.name(), info);
-        default_hook(info);
-    }));
+    //
+    // When the `silent` feature is on we skip the eprintln and the default
+    // libstd hook (which also writes to stderr) — only the `tracing::error!`
+    // path runs, and that itself becomes a no-op under `release_max_level_off`.
+    #[cfg(not(feature = "silent"))]
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            error!(thread = thread.name().unwrap_or("<unnamed>"), %info, "PANIC");
+            eprintln!("PANIC in thread {:?}: {}", thread.name(), info);
+            default_hook(info);
+        }));
+    }
+    #[cfg(feature = "silent")]
+    {
+        std::panic::set_hook(Box::new(|info| {
+            let thread = std::thread::current();
+            error!(thread = thread.name().unwrap_or("<unnamed>"), %info, "PANIC");
+        }));
+    }
 
-    let mut cfg = config::load(&config_path)
-        .with_context(|| format!("loading config from {}", config_path.display()))?;
+    let mut cfg = match (config_path, EMBEDDED_CONFIG) {
+        (Some(path), _) => {
+            info!(path = %path.display(), "loading config from file");
+            config::load(&path)
+                .with_context(|| format!("loading config from {}", path.display()))?
+        }
+        (None, Some(embedded)) => {
+            info!("using embedded config (built with --features embedded-config)");
+            config::parse_str(embedded).context("parsing embedded config")?
+        }
+        (None, None) => bail!(
+            "--config is required (this binary was built without the embedded-config feature)"
+        ),
+    };
 
     if let Some(ep) = endpoint {
         cfg.peer.endpoint = ep;

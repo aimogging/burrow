@@ -18,6 +18,25 @@ x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 smoltcp = { version = "0.13", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp"] }
 socket2 = { version = "0.6", features = ["all"] }
 
+[features]
+# Bake the wg-quick config at $WGNAT_EMBEDDED_CONFIG into the binary as a
+# `&'static str`, so `wgnat run` works without `--config`. Intended for
+# "build once, deploy one self-contained binary" workflows. The PrivateKey
+# ends up in the binary's read-only data segment — anyone with read access
+# to the binary can extract it via `strings`, so don't ship the resulting
+# binary to anyone you wouldn't trust with the .conf itself.
+#
+# Build with: `WGNAT_EMBEDDED_CONFIG=./deploy.conf cargo build --release \
+#                  --features embedded-config`
+embedded-config = []
+
+# Compile out all `tracing` events at any level in release builds (via
+# tracing's `release_max_level_off` feature) and gate out the panic-hook's
+# stderr printing. Pairs naturally with `embedded-config` for a deploy
+# binary that emits nothing on stdout/stderr. Debug builds still log
+# normally so `cargo test` output stays useful.
+silent = ["tracing/release_max_level_off"]
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock"] }
 
