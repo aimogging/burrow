@@ -274,6 +274,16 @@ async fn run(
                     Some(evt) = events.evt_rx.recv() => match evt {
                         SmoltcpEvent::TcpConnected { key, id } => {
                             debug!(?key, ?id, "tcp connected");
+                            // Originated flows (reverse-tunnel bridge outbounds,
+                            // future DNS/shell originations) carry peer_ip =
+                            // real remote in the synthetic key. The bridge task
+                            // already owns this connection — nothing to dispatch.
+                            if key.original_dst_ip == wg_ip
+                                && key.peer_ip != std::net::Ipv4Addr::UNSPECIFIED
+                            {
+                                debug!(?id, "originated TcpConnected — handler already registered");
+                                continue;
+                            }
                             if key.original_dst_ip == wg_ip
                                 && key.original_dst_port == control_port
                             {
