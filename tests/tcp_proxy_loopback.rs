@@ -275,8 +275,8 @@ async fn tcp_proxy_round_trips_via_loopback_echo() {
 
     // 1. Send SYN.
     let mut syn = peer.syn();
-    let key = nat.rewrite_inbound(&mut syn).unwrap();
-    let _ = runtime.ensure_listener(dst_port, key).await.unwrap();
+    let (key, gateway_port) = nat.rewrite_inbound(&mut syn).unwrap();
+    let _ = runtime.ensure_listener(gateway_port, key).await.unwrap();
     runtime.enqueue_inbound(syn);
     peer.seq = peer.seq.wrapping_add(1); // SYN consumes seq
 

@@ -61,10 +61,10 @@ async fn udp_proxy_round_trips_via_loopback_echo() {
 
     // Inbound 1.
     let mut pkt = build_inbound_udp(dst_ip, dst_port, b"hello, udp");
-    let key = nat.rewrite_inbound(&mut pkt).unwrap();
+    let (key, _gateway_port) = nat.rewrite_inbound(&mut pkt).unwrap();
     assert_eq!(key.proto, PROTO_UDP);
     assert_eq!(key.original_dst_ip, dst_ip);
-    assert_eq!(key.local_port, dst_port);
+    assert_eq!(key.original_dst_port, dst_port);
 
     let payload = extract_udp_payload(&pkt).unwrap();
     let proxy_tx = spawn_udp_proxy(key, sink_tx.clone());
@@ -114,7 +114,7 @@ async fn udp_proxy_idle_sweep_replaces_entry() {
 
     // First datagram → spawn proxy A, get one echo.
     let mut pkt = build_inbound_udp(dst_ip, dst_port, b"a");
-    let key = nat.rewrite_inbound(&mut pkt).unwrap();
+    let (key, _) = nat.rewrite_inbound(&mut pkt).unwrap();
     let proxy_a = spawn_udp_proxy(key, sink_tx.clone());
     proxy_a.send(extract_udp_payload(&pkt).unwrap()).unwrap();
     let _ = timeout(Duration::from_secs(2), sink_rx.recv())
@@ -136,7 +136,7 @@ async fn udp_proxy_idle_sweep_replaces_entry() {
     // 5-tuple, not socket identity), spawn proxy B, ensure the round-trip
     // still works.
     let mut pkt2 = build_inbound_udp(dst_ip, dst_port, b"after-sweep");
-    let key2 = nat.rewrite_inbound(&mut pkt2).unwrap();
+    let (key2, _) = nat.rewrite_inbound(&mut pkt2).unwrap();
     assert_eq!(key2, key); // same 5-tuple → same NatKey
     let proxy_b = spawn_udp_proxy(key2, sink_tx.clone());
     proxy_b
@@ -153,6 +153,6 @@ async fn udp_proxy_idle_sweep_replaces_entry() {
         peer_ip: PEER_IP,
         peer_port: PEER_PORT,
         original_dst_ip: dst_ip,
-        local_port: dst_port,
+        original_dst_port: dst_port,
     };
 }

@@ -88,6 +88,93 @@ pub fn rewrite_src_ip(packet: &mut [u8], new_src: Ipv4Addr) -> Result<Ipv4Addr> 
     Ok(old_src)
 }
 
+/// Rewrite the TCP/UDP destination port and patch the transport checksum.
+/// Returns the previous destination port.
+pub fn rewrite_dst_port(packet: &mut [u8], new_port: u16) -> Result<u16> {
+    let view = parse_5tuple(packet)?;
+    if view.proto != PROTO_TCP && view.proto != PROTO_UDP {
+        bail!("rewrite_dst_port: unsupported proto {}", view.proto);
+    }
+    let old_port = view.dst_port;
+    if old_port == new_port {
+        return Ok(old_port);
+    }
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if packet.len() < ihl + 4 {
+        bail!("transport header truncated");
+    }
+    packet[ihl + 2..ihl + 4].copy_from_slice(&new_port.to_be_bytes());
+    update_transport_checksum_for_word_change(packet, ihl, view.proto, old_port, new_port)?;
+    Ok(old_port)
+}
+
+/// Rewrite the TCP/UDP source port and patch the transport checksum.
+/// Returns the previous source port.
+pub fn rewrite_src_port(packet: &mut [u8], new_port: u16) -> Result<u16> {
+    let view = parse_5tuple(packet)?;
+    if view.proto != PROTO_TCP && view.proto != PROTO_UDP {
+        bail!("rewrite_src_port: unsupported proto {}", view.proto);
+    }
+    let old_port = view.src_port;
+    if old_port == new_port {
+        return Ok(old_port);
+    }
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if packet.len() < ihl + 2 {
+        bail!("transport header truncated");
+    }
+    packet[ihl..ihl + 2].copy_from_slice(&new_port.to_be_bytes());
+    update_transport_checksum_for_word_change(packet, ihl, view.proto, old_port, new_port)?;
+    Ok(old_port)
+}
+
+/// Build an IPv4+TCP RST|ACK packet from scratch. Used to synthesize a
+/// connection refusal when the OS-side connect probe (`Phase 9 fix #1`)
+/// fails — the peer must see the same thing it would see if the closed port
+/// answered directly.
+pub fn build_tcp_rst(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    ack_seq: u32,
+) -> Vec<u8> {
+    let total_len = 40usize; // 20 IP + 20 TCP, no payload, no options
+    let mut pkt = vec![0u8; total_len];
+    // IP header
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    pkt[8] = 64; // TTL
+    pkt[9] = PROTO_TCP;
+    pkt[12..16].copy_from_slice(&src_ip.octets());
+    pkt[16..20].copy_from_slice(&dst_ip.octets());
+    rewrite_ip_checksum(&mut pkt, 20);
+    // TCP header
+    pkt[20..22].copy_from_slice(&src_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dst_port.to_be_bytes());
+    pkt[24..28].copy_from_slice(&0u32.to_be_bytes()); // seq
+    pkt[28..32].copy_from_slice(&ack_seq.to_be_bytes()); // ack
+    pkt[32] = 0x50; // data offset = 5 words
+    pkt[33] = 0x14; // flags = RST|ACK
+    pkt[34..36].copy_from_slice(&0u16.to_be_bytes()); // window
+    // checksum at [36..38] left zero, urg ptr at [38..40] left zero.
+    let csum = compute_tcp_checksum_full(&pkt);
+    pkt[36..38].copy_from_slice(&csum.to_be_bytes());
+    pkt
+}
+
+fn compute_tcp_checksum_full(pkt: &[u8]) -> u16 {
+    let tcp_len = (pkt.len() - 20) as u16;
+    let mut buf = Vec::with_capacity(12 + pkt.len() - 20);
+    buf.extend_from_slice(&pkt[12..16]);
+    buf.extend_from_slice(&pkt[16..20]);
+    buf.push(0);
+    buf.push(PROTO_TCP);
+    buf.extend_from_slice(&tcp_len.to_be_bytes());
+    buf.extend_from_slice(&pkt[20..]);
+    ones_complement_checksum(&buf)
+}
+
 fn rewrite_ip_checksum(packet: &mut [u8], ihl: usize) {
     packet[10] = 0;
     packet[11] = 0;
@@ -168,6 +255,44 @@ fn update_transport_checksum_for_addr_change(
     }
     let old_csum = u16::from_be_bytes([packet[off], packet[off + 1]]);
     let new_csum = incremental_addr_update(old_csum, old_addr, new_addr);
+    packet[off..off + 2].copy_from_slice(&new_csum.to_be_bytes());
+    Ok(())
+}
+
+/// RFC 1624 incremental checksum update for changing a single 16-bit field
+/// inside the TCP/UDP segment (e.g., a port number). Unlike the address
+/// variant, this isn't part of the pseudo-header — but the field IS covered
+/// by the segment checksum, so the math is identical with one word delta.
+fn update_transport_checksum_for_word_change(
+    packet: &mut [u8],
+    ihl: usize,
+    proto: u8,
+    old_word: u16,
+    new_word: u16,
+) -> Result<()> {
+    let csum_offset = match proto {
+        PROTO_TCP => Some(ihl + 16),
+        PROTO_UDP => Some(ihl + 6),
+        _ => None,
+    };
+    let Some(off) = csum_offset else {
+        return Ok(());
+    };
+    if packet.len() < off + 2 {
+        bail!("transport header too short for checksum update");
+    }
+    if proto == PROTO_UDP && packet[off] == 0 && packet[off + 1] == 0 {
+        return Ok(());
+    }
+    let old_csum = u16::from_be_bytes([packet[off], packet[off + 1]]);
+    // ~HC' = ~HC + ~m + m'
+    let mut sum: u32 = (!old_csum) as u32;
+    sum += (!old_word) as u32;
+    sum += new_word as u32;
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let new_csum = !(sum as u16);
     packet[off..off + 2].copy_from_slice(&new_csum.to_be_bytes());
     Ok(())
 }
@@ -387,6 +512,99 @@ mod tests {
         buf.extend_from_slice(&udp_len.to_be_bytes());
         buf.extend_from_slice(&pkt[20..]);
         assert_eq!(ones_complement_checksum(&buf), 0);
+    }
+
+    #[test]
+    fn dst_port_rewrite_updates_tcp_checksum() {
+        let mut pkt = build_tcp_syn(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 50),
+            54321,
+            80,
+        );
+        assert!(verify_ip_checksum_zero(&pkt));
+        assert!(verify_tcp_checksum_zero(&pkt));
+
+        let old = rewrite_dst_port(&mut pkt, 8080).unwrap();
+        assert_eq!(old, 80);
+
+        // IP checksum unchanged (port lives in TCP, not IP).
+        assert!(verify_ip_checksum_zero(&pkt));
+        assert!(verify_tcp_checksum_zero(&pkt));
+        let view = parse_5tuple(&pkt).unwrap();
+        assert_eq!(view.dst_port, 8080);
+        assert_eq!(view.src_port, 54321);
+    }
+
+    #[test]
+    fn src_port_rewrite_updates_tcp_checksum() {
+        let mut pkt = build_tcp_syn(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(10, 0, 0, 1),
+            45678,
+            54321,
+        );
+        assert!(verify_tcp_checksum_zero(&pkt));
+
+        rewrite_src_port(&mut pkt, 80).unwrap();
+
+        assert!(verify_ip_checksum_zero(&pkt));
+        assert!(verify_tcp_checksum_zero(&pkt));
+        let view = parse_5tuple(&pkt).unwrap();
+        assert_eq!(view.src_port, 80);
+        assert_eq!(view.dst_port, 54321);
+    }
+
+    #[test]
+    fn dst_port_rewrite_combined_with_dst_ip() {
+        // The realistic path: NAT inbound rewrite changes BOTH dst_ip
+        // (peer-visible → smoltcp's interface IP) AND dst_port (original
+        // → per-flow gateway port). Both checksum patches must compose.
+        let mut pkt = build_tcp_syn(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 50),
+            54321,
+            80,
+        );
+        assert!(verify_ip_checksum_zero(&pkt));
+        assert!(verify_tcp_checksum_zero(&pkt));
+
+        rewrite_dst_ip(&mut pkt, Ipv4Addr::new(10, 0, 0, 2)).unwrap();
+        rewrite_dst_port(&mut pkt, 32801).unwrap();
+
+        assert!(verify_ip_checksum_zero(&pkt));
+        assert!(verify_tcp_checksum_zero(&pkt));
+        let view = parse_5tuple(&pkt).unwrap();
+        assert_eq!(view.dst_ip, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(view.dst_port, 32801);
+    }
+
+    #[test]
+    fn build_tcp_rst_is_well_formed() {
+        let pkt = build_tcp_rst(
+            Ipv4Addr::new(192, 168, 1, 50),
+            Ipv4Addr::new(10, 0, 0, 1),
+            80,
+            54321,
+            1001,
+        );
+        assert_eq!(pkt.len(), 40);
+        assert!(verify_ip_checksum_zero(&pkt));
+        assert!(verify_tcp_checksum_zero(&pkt));
+        let view = parse_5tuple(&pkt).unwrap();
+        assert_eq!(view.proto, PROTO_TCP);
+        assert_eq!(view.src_ip, Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(view.dst_ip, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(view.src_port, 80);
+        assert_eq!(view.dst_port, 54321);
+        // flags = RST|ACK
+        assert_eq!(pkt[33], 0x14);
+        // ack = 1001
+        let ack = u32::from_be_bytes([pkt[28], pkt[29], pkt[30], pkt[31]]);
+        assert_eq!(ack, 1001);
+        // seq = 0
+        let seq = u32::from_be_bytes([pkt[24], pkt[25], pkt[26], pkt[27]]);
+        assert_eq!(seq, 0);
     }
 
     #[test]

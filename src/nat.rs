@@ -1,25 +1,43 @@
 //! Connection tracking + destination/source IP rewrite. The NAT table is the
-//! single source of truth for an in-flight connection: it owns the 4-tuple →
-//! original-dst mapping (so the egress rewrite can restore the peer-visible
-//! src), the smoltcp socket handle, and the lifecycle state.
+//! single source of truth for an in-flight connection: it owns the 5-tuple →
+//! gateway-side port mapping (so the egress rewrite can restore the
+//! peer-visible src), the smoltcp ConnectionId, and the lifecycle state.
 //!
-//! Two indices, per the design in CLAUDE.md:
-//!   * `entries`: full 5-tuple (`NatKey`) → `NatEntry`
-//!   * `by_4tuple`: post-rewrite 4-tuple → 5-tuple, used on egress when the
-//!     original `dst_ip` has been replaced with the smoltcp interface address.
+//! ## Two-index design
 //!
-//! 4-tuple collisions (same peer + dst_port hitting two different original
-//! dst_ips concurrently) overwrite the older entry — they are negligibly
-//! rare in practice and we don't multiplex.
+//! * `entries`: full 5-tuple (`NatKey`) → `NatEntry`. `NatEntry` carries the
+//!   per-flow `gateway_port`.
+//! * `by_gateway`: post-rewrite 4-tuple `(proto, peer_ip, peer_port,
+//!   gateway_port)` → 5-tuple `NatKey`, used on egress when both the original
+//!   `dst_ip` AND `dst_port` have been replaced with smoltcp-side values.
+//!
+//! ## Why per-flow gateway ports
+//!
+//! Pre-Phase-9 the second index was keyed on `(peer_ip, peer_port,
+//! original_dst_port)` — the original dst_port was preserved on rewrite and
+//! used as the egress disambiguator. That broke under any port-scan workload
+//! (`nmap -sS` reuses ONE source port across hundreds of destinations on the
+//! SAME dst port), because every new SYN from `(peer, peer_port)` to a
+//! different `original_dst_ip` on the same `dst_port` collided on the index
+//! and silently evicted the prior in-flight flow.
+//!
+//! Fix: on inbound, allocate a per-flow `gateway_port` from a global pool
+//! (32768..=65535) and rewrite the packet's `dst_port` to it. Each flow now
+//! has its own (smoltcp listener, gateway_port) pair, so the egress lookup
+//! `(proto, peer_ip, peer_port, gateway_port)` is unique by construction and
+//! no flow can stomp another.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::rewrite::{parse_5tuple, rewrite_dst_ip, rewrite_src_ip, PROTO_TCP, PROTO_UDP};
+use crate::rewrite::{
+    parse_5tuple, rewrite_dst_ip, rewrite_dst_port, rewrite_src_ip, rewrite_src_port,
+    PROTO_TCP, PROTO_UDP,
+};
 use crate::runtime::ConnectionId;
 
 /// Grace period after a TCP connection's smoltcp socket reports closed
@@ -28,21 +46,35 @@ pub const DEFAULT_TCP_GRACE: Duration = Duration::from_secs(60);
 /// Idle timeout for UDP entries (no smoltcp state to observe).
 pub const DEFAULT_UDP_IDLE: Duration = Duration::from_secs(30);
 
+/// Lower bound of the per-flow gateway-port pool. Conventional ephemeral
+/// range; well below the registered-port boundary so we don't shadow anything.
+const GW_PORT_MIN: u16 = 32768;
+/// Upper bound (inclusive) of the gateway-port pool.
+const GW_PORT_MAX: u16 = 65535;
+
+/// Natural 5-tuple identifying a peer-initiated flow. Derivable purely from
+/// the inbound packet — NO gateway-side state in here. The gateway_port that
+/// disambiguates the egress side lives on `NatEntry`.
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub struct NatKey {
     pub proto: u8,
     pub peer_ip: Ipv4Addr,
     pub peer_port: u16,
     pub original_dst_ip: Ipv4Addr,
-    pub local_port: u16,
+    pub original_dst_port: u16,
 }
 
+/// Egress-side index key. The peer's view of the smoltcp endpoint is
+/// `(smoltcp_addr, gateway_port)`, so when an outbound packet from smoltcp
+/// arrives carrying `(src=smoltcp_addr, src_port=gateway_port,
+/// dst=peer_ip, dst_port=peer_port)`, we recover the full 5-tuple via this
+/// index.
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
-struct Key4 {
+struct KeyGw {
     proto: u8,
     peer_ip: Ipv4Addr,
     peer_port: u16,
-    local_port: u16,
+    gateway_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,10 +87,13 @@ pub enum ConnectionState {
 
 #[derive(Debug, Clone, Copy)]
 pub struct NatEntry {
-    pub original_dst_ip: Ipv4Addr,
+    /// Per-flow port allocated on the smoltcp side. Inbound rewrite changes
+    /// `dst_port` to this value; egress rewrite uses it to recover the
+    /// `NatKey`.
+    pub gateway_port: u16,
     /// Set once the smoltcp thread has issued a `ConnectionId` for this NAT
-    /// entry. `None` until the first `EnsureTcpListener` reply lands. Used by
-    /// the ingress dispatcher to skip redundant listener-creation requests.
+    /// entry. `None` until the first `EnsureTcpListener` reply lands (or for
+    /// UDP entries, where smoltcp isn't involved).
     pub smoltcp_id: Option<ConnectionId>,
     pub state: ConnectionState,
     pub created: Instant,
@@ -71,10 +106,22 @@ pub struct NatTable {
     inner: Mutex<NatInner>,
 }
 
-#[derive(Default)]
 struct NatInner {
     entries: HashMap<NatKey, NatEntry>,
-    by_4tuple: HashMap<Key4, NatKey>,
+    by_gateway: HashMap<KeyGw, NatKey>,
+    allocated_ports: HashSet<u16>,
+    next_port: u16,
+}
+
+impl Default for NatInner {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            by_gateway: HashMap::new(),
+            allocated_ports: HashSet::new(),
+            next_port: GW_PORT_MIN,
+        }
+    }
 }
 
 impl NatTable {
@@ -97,9 +144,12 @@ impl NatTable {
         self.inner.lock().unwrap().entries.is_empty()
     }
 
-    /// Inbound rewrite (peer → smoltcp). Registers or refreshes the entry and
-    /// swaps `dst_ip` → smoltcp address. Returns the connection's `NatKey`.
-    pub fn rewrite_inbound(&self, packet: &mut [u8]) -> Result<NatKey> {
+    /// Inbound rewrite (peer → smoltcp). Registers or refreshes the entry,
+    /// allocates a per-flow `gateway_port` on first sight, and rewrites BOTH
+    /// `dst_ip` → smoltcp address AND `dst_port` → `gateway_port`. Returns
+    /// the (5-tuple, gateway_port) so the caller can immediately register the
+    /// matching smoltcp listener without a follow-up lookup.
+    pub fn rewrite_inbound(&self, packet: &mut [u8]) -> Result<(NatKey, u16)> {
         let view = parse_5tuple(packet)?;
         if view.proto != PROTO_TCP && view.proto != PROTO_UDP {
             bail!("rewrite_inbound: unsupported proto {}", view.proto);
@@ -109,62 +159,120 @@ impl NatTable {
             peer_ip: view.src_ip,
             peer_port: view.src_port,
             original_dst_ip: view.dst_ip,
-            local_port: view.dst_port,
+            original_dst_port: view.dst_port,
         };
-        let key4 = key4_of(&key);
         let now = Instant::now();
-        {
+        let gateway_port = {
             let mut inner = self.inner.lock().unwrap();
-            // 4-tuple collision: same peer + dst_port hitting a different
-            // original dst. Evict the prior entry — we cannot multiplex.
-            if let Some(prev_key) = inner.by_4tuple.get(&key4).copied() {
-                if prev_key != key {
-                    inner.entries.remove(&prev_key);
-                    tracing::debug!(?prev_key, new = ?key, "evicted 4-tuple collision");
-                }
+            // Hit on the existing 5-tuple → reuse its gateway_port.
+            if let Some(entry) = inner.entries.get_mut(&key) {
+                entry.last_activity = now;
+                entry.gateway_port
+            } else {
+                // New flow → allocate a fresh gateway_port (collision-free
+                // by construction with any other live entry).
+                let gw = allocate_gateway_port(&mut inner)?;
+                inner.entries.insert(
+                    key,
+                    NatEntry {
+                        gateway_port: gw,
+                        smoltcp_id: None,
+                        state: ConnectionState::Pending,
+                        created: now,
+                        last_activity: now,
+                        expiry: None,
+                    },
+                );
+                inner.by_gateway.insert(
+                    KeyGw {
+                        proto: key.proto,
+                        peer_ip: key.peer_ip,
+                        peer_port: key.peer_port,
+                        gateway_port: gw,
+                    },
+                    key,
+                );
+                gw
             }
-            let entry = inner.entries.entry(key).or_insert(NatEntry {
-                original_dst_ip: view.dst_ip,
-                smoltcp_id: None,
-                state: ConnectionState::Pending,
-                created: now,
-                last_activity: now,
-                expiry: None,
-            });
-            entry.last_activity = now;
-            inner.by_4tuple.insert(key4, key);
-        }
+        };
         rewrite_dst_ip(packet, self.smoltcp_addr)?;
-        Ok(key)
+        rewrite_dst_port(packet, gateway_port)?;
+        Ok((key, gateway_port))
     }
 
-    /// Outbound rewrite (smoltcp → peer). Looks up the entry by 4-tuple
-    /// (because `dst_ip` is now the smoltcp address) and restores `src_ip`
-    /// to the original destination so the peer sees a coherent return path.
+    /// Outbound rewrite (smoltcp → peer). Looks up the entry by the
+    /// gateway-side 4-tuple (because `dst_ip` is now the smoltcp address and
+    /// `src_port` is the per-flow gateway_port) and restores BOTH `src_ip` →
+    /// original_dst_ip AND `src_port` → original_dst_port so the peer sees a
+    /// coherent return path.
     pub fn rewrite_outbound(&self, packet: &mut [u8]) -> Result<NatKey> {
         let view = parse_5tuple(packet)?;
-        let key4 = Key4 {
+        let key_gw = KeyGw {
             proto: view.proto,
             peer_ip: view.dst_ip,
             peer_port: view.dst_port,
-            local_port: view.src_port,
+            gateway_port: view.src_port,
         };
-        let (key, original_dst_ip) = {
+        let (key, original_dst_ip, original_dst_port) = {
             let mut inner = self.inner.lock().unwrap();
             let key = inner
-                .by_4tuple
-                .get(&key4)
+                .by_gateway
+                .get(&key_gw)
                 .copied()
-                .ok_or_else(|| anyhow!("rewrite_outbound: no NAT entry for {:?}", key4))?;
+                .ok_or_else(|| anyhow!("rewrite_outbound: no NAT entry for {:?}", key_gw))?;
             let entry = inner
                 .entries
                 .get_mut(&key)
                 .ok_or_else(|| anyhow!("rewrite_outbound: entry vanished for {:?}", key))?;
             entry.last_activity = Instant::now();
-            (key, entry.original_dst_ip)
+            (key, key.original_dst_ip, key.original_dst_port)
         };
         rewrite_src_ip(packet, original_dst_ip)?;
+        rewrite_src_port(packet, original_dst_port)?;
         Ok(key)
+    }
+
+    /// Insert a `Pending` entry directly without touching the packet. Used by
+    /// the connect-probe path (Phase 9 fix #1) to claim the NAT slot BEFORE
+    /// any rewrite happens, so SYN retransmits arriving while the OS-side
+    /// connect is in flight see an existing entry and short-circuit. Returns
+    /// `None` if an entry already exists for this 5-tuple, leaving it in
+    /// place. Returns `Some(gateway_port)` on a fresh insertion.
+    pub fn try_reserve_pending(&self, key: NatKey) -> Result<Option<u16>> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.entries.contains_key(&key) {
+            return Ok(None);
+        }
+        let gw = allocate_gateway_port(&mut inner)?;
+        inner.entries.insert(
+            key,
+            NatEntry {
+                gateway_port: gw,
+                smoltcp_id: None,
+                state: ConnectionState::Pending,
+                created: now,
+                last_activity: now,
+                expiry: None,
+            },
+        );
+        inner.by_gateway.insert(
+            KeyGw {
+                proto: key.proto,
+                peer_ip: key.peer_ip,
+                peer_port: key.peer_port,
+                gateway_port: gw,
+            },
+            key,
+        );
+        Ok(Some(gw))
+    }
+
+    /// Remove an entry — used by the probe-failure path to roll back a
+    /// `try_reserve_pending` that didn't lead to a real connection.
+    pub fn evict_key(&self, key: NatKey) {
+        let mut inner = self.inner.lock().unwrap();
+        evict(&mut inner, key);
     }
 
     pub fn set_id(&self, key: NatKey, id: ConnectionId) {
@@ -259,20 +367,37 @@ impl NatTable {
     }
 }
 
-fn key4_of(key: &NatKey) -> Key4 {
-    Key4 {
-        proto: key.proto,
-        peer_ip: key.peer_ip,
-        peer_port: key.peer_port,
-        local_port: key.local_port,
+/// Walk `[next_port, GW_PORT_MAX] ∪ [GW_PORT_MIN, next_port)` looking for a
+/// free slot in the pool. Errors only on full exhaustion (all 32768 ports
+/// in use simultaneously — orders of magnitude beyond realistic load).
+fn allocate_gateway_port(inner: &mut NatInner) -> Result<u16> {
+    let start = inner.next_port.max(GW_PORT_MIN);
+    let mut p = start;
+    loop {
+        if !inner.allocated_ports.contains(&p) {
+            inner.allocated_ports.insert(p);
+            inner.next_port = if p == GW_PORT_MAX { GW_PORT_MIN } else { p + 1 };
+            return Ok(p);
+        }
+        p = if p == GW_PORT_MAX { GW_PORT_MIN } else { p + 1 };
+        if p == start {
+            bail!("gateway-port pool exhausted");
+        }
     }
 }
 
 fn evict(inner: &mut NatInner, key: NatKey) {
-    inner.entries.remove(&key);
-    let k4 = key4_of(&key);
-    if inner.by_4tuple.get(&k4) == Some(&key) {
-        inner.by_4tuple.remove(&k4);
+    if let Some(entry) = inner.entries.remove(&key) {
+        let kgw = KeyGw {
+            proto: key.proto,
+            peer_ip: key.peer_ip,
+            peer_port: key.peer_port,
+            gateway_port: entry.gateway_port,
+        };
+        if inner.by_gateway.get(&kgw) == Some(&key) {
+            inner.by_gateway.remove(&kgw);
+        }
+        inner.allocated_ports.remove(&entry.gateway_port);
     }
 }
 
@@ -343,14 +468,22 @@ mod tests {
             54321,
             80,
         );
-        let key = table.rewrite_inbound(&mut pkt).unwrap();
+        let (key, gw) = table.rewrite_inbound(&mut pkt).unwrap();
         assert_eq!(key.peer_ip, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(key.original_dst_ip, Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(key.original_dst_port, 80);
+        assert!((GW_PORT_MIN..=GW_PORT_MAX).contains(&gw));
         assert_eq!(table.len(), 1);
+
+        // packet's dst should now be (smoltcp_addr, gateway_port).
+        let view = crate::rewrite::parse_5tuple(&pkt).unwrap();
+        assert_eq!(view.dst_ip, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(view.dst_port, gw);
 
         let entry = table.get(key).unwrap();
         assert_eq!(entry.state, ConnectionState::Pending);
         assert!(entry.smoltcp_id.is_none());
+        assert_eq!(entry.gateway_port, gw);
     }
 
     #[test]
@@ -362,27 +495,31 @@ mod tests {
             54321,
             80,
         );
-        let _ = table.rewrite_inbound(&mut ing).unwrap();
+        let (_, gw) = table.rewrite_inbound(&mut ing).unwrap();
 
-        // smoltcp would emit (src=10.0.0.2:80, dst=10.0.0.1:54321)
+        // smoltcp would emit (src=10.0.0.2:gw, dst=10.0.0.1:54321)
         let mut eg = build_tcp_syn(
             Ipv4Addr::new(10, 0, 0, 2),
             Ipv4Addr::new(10, 0, 0, 1),
-            80,
+            gw,
             54321,
         );
         let key = table.rewrite_outbound(&mut eg).unwrap();
         assert_eq!(key.original_dst_ip, Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(key.original_dst_port, 80);
 
         let view = crate::rewrite::parse_5tuple(&eg).unwrap();
         assert_eq!(view.src_ip, Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(view.src_port, 80);
     }
 
     #[test]
-    fn collision_evicts_older_entry() {
+    fn same_4tuple_different_dst_ip_coexist() {
+        // The whole reason for per-flow gateway-port allocation: nmap-style
+        // workloads where one (peer_ip, peer_port) reaches many distinct
+        // (dst_ip) on the same dst_port. Both flows must coexist with
+        // distinct gateway_ports so neither stomps the other.
         let table = NatTable::new(Ipv4Addr::new(10, 0, 0, 2));
-
-        // Same peer+local_port, two different dst IPs. Second wins.
         let mut a = build_tcp_syn(
             Ipv4Addr::new(10, 0, 0, 1),
             Ipv4Addr::new(192, 168, 1, 50),
@@ -395,11 +532,12 @@ mod tests {
             54321,
             80,
         );
-        let ka = table.rewrite_inbound(&mut a).unwrap();
-        let kb = table.rewrite_inbound(&mut b).unwrap();
+        let (ka, gwa) = table.rewrite_inbound(&mut a).unwrap();
+        let (kb, gwb) = table.rewrite_inbound(&mut b).unwrap();
         assert_ne!(ka, kb);
-        assert_eq!(table.len(), 1, "older entry must be evicted");
-        assert!(table.get(ka).is_none());
+        assert_ne!(gwa, gwb, "distinct flows must get distinct gateway_ports");
+        assert_eq!(table.len(), 2, "both entries must coexist");
+        assert!(table.get(ka).is_some());
         assert!(table.get(kb).is_some());
     }
 
@@ -412,7 +550,7 @@ mod tests {
             54321,
             80,
         );
-        let key = table.rewrite_inbound(&mut pkt).unwrap();
+        let (key, _) = table.rewrite_inbound(&mut pkt).unwrap();
 
         table.set_state(key, ConnectionState::Established);
         assert_eq!(table.get(key).unwrap().state, ConnectionState::Established);
@@ -431,6 +569,42 @@ mod tests {
         let removed = table.sweep_expired(Instant::now());
         assert_eq!(removed, vec![key]);
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn evict_releases_gateway_port() {
+        // After eviction, the gateway_port returns to the pool.
+        let table = NatTable::new(Ipv4Addr::new(10, 0, 0, 2));
+        let mut pkt = build_tcp_syn(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 50),
+            54321,
+            80,
+        );
+        let (key, gw) = table.rewrite_inbound(&mut pkt).unwrap();
+        table.evict_key(key);
+        assert!(table.get(key).is_none());
+        assert!(
+            !table.inner.lock().unwrap().allocated_ports.contains(&gw),
+            "evicted gateway_port must be released"
+        );
+    }
+
+    #[test]
+    fn try_reserve_pending_idempotent() {
+        let table = NatTable::new(Ipv4Addr::new(10, 0, 0, 2));
+        let key = NatKey {
+            proto: PROTO_TCP,
+            peer_ip: Ipv4Addr::new(10, 0, 0, 1),
+            peer_port: 54321,
+            original_dst_ip: Ipv4Addr::new(192, 168, 1, 50),
+            original_dst_port: 80,
+        };
+        let gw = table.try_reserve_pending(key).unwrap().expect("first reserve");
+        assert!((GW_PORT_MIN..=GW_PORT_MAX).contains(&gw));
+        let second = table.try_reserve_pending(key).unwrap();
+        assert!(second.is_none(), "second reserve on same key must be a no-op");
+        assert_eq!(table.len(), 1);
     }
 
     #[test]
@@ -457,7 +631,7 @@ mod tests {
         pkt[22..24].copy_from_slice(&53u16.to_be_bytes());
         pkt[24..26].copy_from_slice(&8u16.to_be_bytes());
 
-        let key = table.rewrite_inbound(&mut pkt).unwrap();
+        let (key, _) = table.rewrite_inbound(&mut pkt).unwrap();
         assert_eq!(key.proto, PROTO_UDP);
 
         // Idle of 0 from "now in the future" sweeps everything immediately.

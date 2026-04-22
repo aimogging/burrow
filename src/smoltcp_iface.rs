@@ -203,13 +203,6 @@ mod tests {
 
         let mut sockets = SocketSet::new(vec![]);
 
-        // Listen on port 80 to accept the synthetic SYN.
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 4096]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 4096]);
-        let mut listener = tcp::Socket::new(rx_buf, tx_buf);
-        listener.listen(80).expect("listen ok");
-        let _handle = sockets.add(listener);
-
         let table = NatTable::new(smoltcp_addr);
 
         // Build a SYN from peer 10.0.0.1:54321 → 192.168.1.50:80 (original dst).
@@ -220,8 +213,17 @@ mod tests {
             80,
             1000,
         );
-        let key = table.rewrite_inbound(&mut syn).unwrap();
+        let (key, gateway_port) = table.rewrite_inbound(&mut syn).unwrap();
         assert_eq!(key.original_dst_ip, Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(key.original_dst_port, 80);
+
+        // Bind the listener on the per-flow gateway_port — that's where
+        // smoltcp will see the rewritten SYN arrive.
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 4096]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 4096]);
+        let mut listener = tcp::Socket::new(rx_buf, tx_buf);
+        listener.listen(gateway_port).expect("listen ok");
+        let _handle = sockets.add(listener);
 
         rx_tx.send(syn).unwrap();
 
@@ -240,7 +242,7 @@ mod tests {
         let view = rewrite::parse_5tuple(&out).unwrap();
         assert_eq!(view.proto, rewrite::PROTO_TCP);
         assert_eq!(view.src_ip, smoltcp_addr);
-        assert_eq!(view.src_port, 80);
+        assert_eq!(view.src_port, gateway_port);
         assert_eq!(view.dst_ip, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(view.dst_port, 54321);
         let ihl = ((out[0] & 0x0F) as usize) * 4;
@@ -252,5 +254,6 @@ mod tests {
         assert_eq!(restored.original_dst_ip, Ipv4Addr::new(192, 168, 1, 50));
         let view_after = rewrite::parse_5tuple(&out).unwrap();
         assert_eq!(view_after.src_ip, Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(view_after.src_port, 80);
     }
 }

@@ -39,10 +39,12 @@ async fn stale_write_after_close_does_not_panic() {
             peer_ip: Ipv4Addr::new(10, 0, 0, 1),
             peer_port: 40000 + (i as u16 & 0x7FFF),
             original_dst_ip: Ipv4Addr::new(192, 168, 1, 50),
-            local_port: 80,
+            original_dst_port: 80,
         };
         // Register (issues a fresh ConnectionId) and tear down immediately.
-        let id = handle.ensure_listener(key.local_port, key).await.unwrap();
+        // Listener port can be anything stable for this test — it's never
+        // actually receiving real packets.
+        let id = handle.ensure_listener(50000 + (i as u16 & 0x3FFF), key).await.unwrap();
         handle.abort_tcp(id);
 
         // Race: fire writes against the id without waiting for TcpClosed.
@@ -60,11 +62,11 @@ async fn stale_write_after_close_does_not_panic() {
         peer_ip: Ipv4Addr::new(10, 0, 0, 1),
         peer_port: 12345,
         original_dst_ip: Ipv4Addr::new(192, 168, 1, 99),
-        local_port: 8080,
+        original_dst_port: 8080,
     };
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        handle.ensure_listener(key.local_port, key),
+        handle.ensure_listener(8080, key),
     )
     .await
     .expect("smoltcp thread must still respond to commands")

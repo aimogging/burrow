@@ -117,8 +117,8 @@ async fn run(
     info!("handshake initiation sent");
 
     // Per-NAT-entry UDP forwarders. Sender accepts raw payloads; the proxy
-    // task sends them to (original_dst_ip, local_port) and pushes responses
-    // (as fully formed IPv4+UDP packets) onto `egress_tx`.
+    // task sends them to (original_dst_ip, original_dst_port) and pushes
+    // responses (as fully formed IPv4+UDP packets) onto `egress_tx`.
     let udp_proxies: UdpProxyMap = Arc::new(Mutex::new(HashMap::new()));
     // Single shared egress channel for both UDP and ICMP — they both want to
     // emit fully formed IPv4 packets back through the tunnel.
@@ -271,7 +271,7 @@ async fn ingest_tunnel_packet(
     };
     match view.proto {
         PROTO_TCP => {
-            let key = match nat.rewrite_inbound(&mut packet) {
+            let (key, gateway_port) = match nat.rewrite_inbound(&mut packet) {
                 Ok(k) => k,
                 Err(e) => {
                     warn!(error = %e, "nat rewrite_inbound (tcp) failed");
@@ -279,8 +279,11 @@ async fn ingest_tunnel_packet(
                 }
             };
             // Ensure listener exists *before* the SYN reaches the smoltcp poll.
+            // The listener binds on the per-flow gateway_port, NOT the
+            // original dst_port — that's how distinct flows from the same
+            // (peer_ip, peer_port) to the same dst_port stay separable.
             if nat.get(key).and_then(|e| e.smoltcp_id).is_none()
-                && smoltcp.ensure_listener(key.local_port, key).await.is_err()
+                && smoltcp.ensure_listener(gateway_port, key).await.is_err()
             {
                 error!(?key, "smoltcp thread dropped ensure_listener reply");
                 return;
@@ -288,7 +291,7 @@ async fn ingest_tunnel_packet(
             smoltcp.enqueue_inbound(packet);
         }
         PROTO_UDP => {
-            let key = match nat.rewrite_inbound(&mut packet) {
+            let (key, _gateway_port) = match nat.rewrite_inbound(&mut packet) {
                 Ok(k) => k,
                 Err(e) => {
                     warn!(error = %e, "nat rewrite_inbound (udp) failed");

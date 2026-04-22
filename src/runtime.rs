@@ -411,10 +411,12 @@ mod tests {
             54321,
             8080,
         );
-        let key = nat.rewrite_inbound(&mut syn).unwrap();
+        let (key, gateway_port) = nat.rewrite_inbound(&mut syn).unwrap();
 
         // Set up listener BEFORE enqueueing the packet so the SYN finds it.
-        let id = handle.ensure_listener(8080, key).await.unwrap();
+        // Listener binds the gateway_port (where smoltcp actually sees the
+        // SYN), not the original dst_port.
+        let id = handle.ensure_listener(gateway_port, key).await.unwrap();
         assert_eq!(nat.get(key).unwrap().smoltcp_id, Some(id));
 
         handle.enqueue_inbound(syn);

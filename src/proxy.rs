@@ -56,7 +56,7 @@ async fn run_tcp_proxy(
     nat: Arc<NatTable>,
     mut msg_rx: mpsc::UnboundedReceiver<ProxyMsg>,
 ) -> Result<()> {
-    let dst = (key.original_dst_ip, key.local_port);
+    let dst = (key.original_dst_ip, key.original_dst_port);
     tracing::debug!(?key, "proxy: connecting OS stream → {}:{}", dst.0, dst.1);
 
     let stream = match TcpStream::connect(dst).await {

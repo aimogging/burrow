@@ -41,7 +41,7 @@ async fn run_udp_proxy(
     sink: PacketSink,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> Result<()> {
-    let dst: SocketAddr = (key.original_dst_ip, key.local_port).into();
+    let dst: SocketAddr = (key.original_dst_ip, key.original_dst_port).into();
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     socket.connect(dst).await?;
     tracing::debug!(?key, ?dst, local = ?socket.local_addr().ok(), "udp proxy bound");
@@ -57,7 +57,7 @@ async fn run_udp_proxy(
                     let pkt = build_udp_packet(
                         key.original_dst_ip,
                         key.peer_ip,
-                        key.local_port,
+                        key.original_dst_port,
                         key.peer_port,
                         &buf[..n],
                     );
@@ -136,9 +136,9 @@ mod tests {
             peer_ip: Ipv4Addr::new(10, 0, 0, 1),
             peer_port: 1234,
             original_dst_ip: Ipv4Addr::new(127, 0, 0, 1),
-            local_port: 5353,
+            original_dst_port: 5353,
         };
-        let dst: SocketAddr = (key.original_dst_ip, key.local_port).into();
+        let dst: SocketAddr = (key.original_dst_ip, key.original_dst_port).into();
         assert_eq!(dst.to_string(), "127.0.0.1:5353");
     }
 }
