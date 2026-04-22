@@ -43,3 +43,16 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+
+# Deploy profile: aggressive size optimization. Pairs with `silent` +
+# (optionally) `embedded-config` for a self-contained binary that emits
+# nothing on stdout/stderr. `panic = "abort"` removes unwind tables —
+# panics become immediate process exit instead of stack unwind.
+[profile.min]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
