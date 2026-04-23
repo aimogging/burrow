@@ -4,7 +4,7 @@ Userspace WireGuard gateway. No TUN, no kernel drivers, no admin.
 
 - [TL;DR](#tldr)
 - [Quick start](#quick-start)
-- [Reverse tunnels](#reverse-tunnels)
+- [Examples](#examples)
 - [Commands](#commands)
 - [How it works](#how-it-works)
 - [Limitations](#limitations)
@@ -80,19 +80,95 @@ just deploy-server --target root@vpn.example.com --teardown
 just deploy-client --teardown
 ```
 
-## Reverse tunnels
+## Examples
 
-From inside the client's netns:
+All of these run from inside the client netns (`just netns-shell`) so
+traffic uses the tunnel. `10.0.0.2` is the burrow host's WG address in
+the examples — adjust for your subnet.
+
+### Reach an internal host
+
+Plain clients over the tunnel. Nothing burrow-client-specific:
 
 ```sh
-burrow-client tunnel 10.0.0.2 start -R 443:127.0.0.1:8080
-# Anything that connects to the burrow host on port 443 tunnels back
-# here and lands on 127.0.0.1:8080. SSH -R, but over WG.
+curl http://192.168.1.10/
+ssh user@192.168.1.50
+psql -h 192.168.1.20 -U postgres
 ```
 
-`-R [BIND:]LISTEN:HOST:PORT` — BIND defaults to `0.0.0.0` (bind on all
-OS interfaces of the burrow host). Pin to a specific interface with
-e.g. `-R 192.168.1.50:443:127.0.0.1:8080`. `-U` for UDP.
+### DNS
+
+burrow answers A queries on `wg_ip:53` using the burrow host's system
+resolver (on by default; `DnsEnabled = true` in `burrow.conf`):
+
+```sh
+dig @10.0.0.2 internal.corp.lan
+```
+
+Pass `--dns 10.0.0.2` to `burrow-client gen` to have the generated
+client.conf set `DNS = 10.0.0.2`, so wg-quick points every tool's
+resolver at burrow automatically while the tunnel is up.
+
+### Reverse tunnel — expose a local service
+
+SSH `-R`, but over WG. The burrow host binds a real OS listener;
+connections tunnel back here and originate on `forward_to` locally.
+
+```sh
+# Anything that connects to burrow_host:443 lands on 127.0.0.1:8080.
+burrow-client tunnel 10.0.0.2 start -R 443:127.0.0.1:8080
+# Hold Ctrl-C to stop — burrow-client holds the control flow open
+# for the tunnel's lifetime.
+```
+
+`-R [BIND:]LISTEN:HOST:PORT` — BIND defaults to `0.0.0.0` (all OS
+interfaces on the burrow host). Pin to one interface with
+`-R 192.168.1.50:443:127.0.0.1:8080`. `-U` for UDP. Stop by id:
+
+```sh
+burrow-client tunnel 10.0.0.2 list
+burrow-client tunnel 10.0.0.2 stop 42
+```
+
+### Shell — interactive
+
+PTY session on the burrow host (default mode):
+
+```sh
+burrow-client shell 10.0.0.2
+# drops into cmd.exe on Windows, $SHELL / /bin/sh on Unix
+```
+
+### Shell — one-shot
+
+Run a command, capture stdout + stderr + exit code, return:
+
+```sh
+# `--output -` pipes captured output to the local terminal:
+burrow-client shell 10.0.0.2 --output - --program whoami
+
+# `--output <path>` writes it to a file (stderr still goes to terminal):
+burrow-client shell 10.0.0.2 --output build.log --program make
+```
+
+### Shell — fire-and-forget
+
+Spawn detached; the server returns the pid and the process outlives
+the `burrow-client` invocation. Nothing is captured.
+
+```sh
+burrow-client shell 10.0.0.2 --detach --program ./long-running-task
+# 47412        <- pid printed to local stdout
+```
+
+### Shell — custom program + argv
+
+`--program` picks the executable; anything after `--` is argv:
+
+```sh
+burrow-client shell 10.0.0.2 --program /usr/bin/python3 -- -i
+burrow-client shell 10.0.0.2 --program cmd.exe -- /c "dir C:\"
+```
 
 ## Commands
 
