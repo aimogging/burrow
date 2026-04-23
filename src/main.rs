@@ -16,7 +16,8 @@ use tracing_subscriber::EnvFilter;
 use wgnat::config;
 use wgnat::control::{listener_key, spawn_control_handler};
 use wgnat::icmp::{
-    send_dest_unreachable, IcmpForwarder, ICMP_CODE_HOST_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE,
+    build_echo_reply_for_wg_ip, send_dest_unreachable, IcmpForwarder,
+    ICMP_CODE_HOST_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE,
 };
 use wgnat::nat::{NatKey, NatTable};
 use wgnat::probe::{classify_connect_error, ConnectClass};
@@ -516,15 +517,17 @@ async fn ingest_tunnel_packet(
         smoltcp.enqueue_inbound(packet);
         return;
     }
-    // ICMP to wg_ip: let smoltcp answer. smoltcp's interface has
-    // built-in echo-request handling for packets addressed to any of
-    // its configured interface addresses (incl. the wg_ip/32 added in
-    // Phase 12), so peers can `ping wg_ip` for reachability checks
-    // without wgnat running its own ICMP state machine for itself.
-    // Other ICMP traffic (peers pinging LAN hosts) still goes through
-    // the raw-socket / fallback path in `IcmpForwarder`.
+    // ICMP to wg_ip: answer echo requests packet-level. smoltcp's
+    // built-in echo-reply is bypassed by `set_any_ip(true)` and
+    // binding an ICMP socket with a wildcard identifier isn't
+    // supported (Endpoint::Unspecified is reject-only). So we do the
+    // reply ourselves — swap src/dst, flip the ICMP type, echo the
+    // payload. Other ICMP traffic (peers pinging LAN hosts via
+    // wgnat's NAT path) continues through `IcmpForwarder`.
     if view.dst_ip == wg_ip && view.proto == PROTO_ICMP {
-        smoltcp.enqueue_inbound(packet);
+        if let Some(reply) = build_echo_reply_for_wg_ip(&packet, wg_ip) {
+            let _ = egress_tx.send(reply);
+        }
         return;
     }
     if view.dst_ip == wg_ip && view.proto == PROTO_UDP {

@@ -279,6 +279,42 @@ fn send_admin_prohibited(sink: &PacketSink, original: &[u8]) {
     send_dest_unreachable(sink, original, ICMP_CODE_ADMIN_PROHIBITED);
 }
 
+/// If `packet` is an ICMP echo request addressed to `wg_ip`, build and
+/// return the corresponding echo reply (type 0) with `src = wg_ip`,
+/// `dst = peer`. Returns `None` for anything else.
+///
+/// Used by `ingest_tunnel_packet` so peers can `ping wg_ip` for
+/// reachability checks without wgnat needing a raw socket bound to an
+/// address Windows doesn't own. Pings to LAN hosts still go through
+/// `IcmpForwarder::handle_inbound`.
+pub fn build_echo_reply_for_wg_ip(packet: &[u8], wg_ip: Ipv4Addr) -> Option<Vec<u8>> {
+    let view = parse_5tuple(packet).ok()?;
+    if view.proto != PROTO_ICMP || view.dst_ip != wg_ip {
+        return None;
+    }
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if packet.len() < ihl + 8 {
+        return None;
+    }
+    let icmp = &packet[ihl..];
+    if icmp[0] != ICMP_ECHO_REQUEST {
+        // Other ICMP types to wg_ip (unreachable, time-exceeded) aren't
+        // something we're meant to answer. Caller drops.
+        return None;
+    }
+    // Rebuild the ICMP body with type=0 (echo reply). ident/seq/data
+    // come from bytes [4..] of the original ICMP header+body.
+    let mut reply = Vec::with_capacity(icmp.len());
+    reply.push(ICMP_ECHO_REPLY);
+    reply.push(icmp[1]); // code (always 0 for echo request, echoed)
+    reply.extend_from_slice(&[0, 0]); // checksum placeholder
+    reply.extend_from_slice(&icmp[4..]); // ident + seq + payload
+    let csum = icmp_checksum(&reply);
+    reply[2..4].copy_from_slice(&csum.to_be_bytes());
+
+    Some(build_icmp_packet(wg_ip, view.src_ip, &reply))
+}
+
 /// Build an IPv4 header around `icmp_payload` and return a complete packet.
 fn build_icmp_packet(src: Ipv4Addr, dst: Ipv4Addr, icmp_payload: &[u8]) -> Vec<u8> {
     let total_len = 20 + icmp_payload.len();
