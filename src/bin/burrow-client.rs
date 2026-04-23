@@ -1,12 +1,12 @@
-//! Companion CLI for wgnat. Speaks the CBOR-framed control protocol
-//! over a plain TCP connection to `wgnat_wg_ip:CONTROL_PORT`.
+//! Companion CLI for burrow. Speaks the CBOR-framed control protocol
+//! over a plain TCP connection to `burrow_wg_ip:CONTROL_PORT`.
 //!
 //! The peer running this binary needs its own WireGuard stack
-//! configured so that `wgnat_wg_ip` routes through the tunnel —
-//! wgnat-client itself makes a normal TCP connect and is oblivious to
+//! configured so that `burrow_wg_ip` routes through the tunnel —
+//! burrow-client itself makes a normal TCP connect and is oblivious to
 //! WireGuard at the binary level.
 //!
-//! SSH-style positional: `wgnat-client <wgnat_wg_ip> <subcommand>`.
+//! SSH-style positional: `burrow-client <burrow_wg_ip> <subcommand>`.
 //!
 //! Phase 17a scope: non-interactive shell (--oneshot, --detach) +
 //! tunnel register/unregister/list. Interactive PTY mode lands with
@@ -26,22 +26,22 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
-use wgnat::config::DEFAULT_CONTROL_PORT;
-use wgnat::reverse_registry::OpenRequest;
-use wgnat::shell_protocol as sp;
-use wgnat::wire::{
+use burrow::config::DEFAULT_CONTROL_PORT;
+use burrow::reverse_registry::OpenRequest;
+use burrow::shell_protocol as sp;
+use burrow::wire::{
     read_frame, write_frame, BindAddr, ClientReq, ErrorKind, Proto, ServerResp, ShellMode,
     TunnelId, TunnelSpec,
 };
-use wgnat::yamux_bridge::{drive_connection, udp_frame};
+use burrow::yamux_bridge::{drive_connection, udp_frame};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "CLI peer for wgnat's control channel")]
+#[command(version, about = "CLI peer for burrow's control channel")]
 struct Cli {
-    /// WG address of the wgnat host to connect to.
-    wgnat_ip: Ipv4Addr,
+    /// WG address of the burrow host to connect to.
+    burrow_ip: Ipv4Addr,
 
-    /// Control port (defaults to wgnat's DEFAULT_CONTROL_PORT = 57821).
+    /// Control port (defaults to burrow's DEFAULT_CONTROL_PORT = 57821).
     #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
     control_port: u16,
 
@@ -56,7 +56,7 @@ enum Cmd {
         #[command(subcommand)]
         action: TunnelCmd,
     },
-    /// Run a command on the wgnat host.
+    /// Run a command on the burrow host.
     Shell(ShellArgs),
 }
 
@@ -64,7 +64,7 @@ enum Cmd {
 enum TunnelCmd {
     /// Start a reverse tunnel. Syntax: `-R LISTEN:HOST:PORT`.
     Start {
-        /// `LISTEN:HOST:PORT` — peers hit `wg_ip:LISTEN`, wgnat
+        /// `LISTEN:HOST:PORT` — peers hit `wg_ip:LISTEN`, burrow
         /// forwards to `HOST:PORT`. Default protocol is TCP.
         #[arg(short = 'R', value_name = "LISTEN:HOST:PORT")]
         spec: String,
@@ -98,7 +98,7 @@ struct ShellArgs {
     #[arg(long, conflicts_with_all = ["output", "detach"])]
     interactive: bool,
 
-    /// Executable to run on the wgnat host. Defaults per-OS on the
+    /// Executable to run on the burrow host. Defaults per-OS on the
     /// server side (cmd.exe on Windows, $SHELL / /bin/sh on Unix).
     #[arg(long)]
     program: Option<String>,
@@ -120,14 +120,14 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("wgnat-client: {e:#}");
+            eprintln!("burrow-client: {e:#}");
             ExitCode::from(1)
         }
     }
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
-    let addr = SocketAddrV4::new(cli.wgnat_ip, cli.control_port);
+    let addr = SocketAddrV4::new(cli.burrow_ip, cli.control_port);
     match cli.cmd {
         Cmd::Tunnel { action } => run_tunnel(addr, action).await,
         Cmd::Shell(args) => run_shell(addr, args).await,
@@ -137,7 +137,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 async fn connect_control(addr: SocketAddrV4) -> Result<TcpStream> {
     let stream = TcpStream::connect(addr)
         .await
-        .with_context(|| format!("connecting to wgnat control at {addr}"))?;
+        .with_context(|| format!("connecting to burrow control at {addr}"))?;
     stream.set_nodelay(true).ok();
     Ok(stream)
 }
@@ -274,7 +274,7 @@ async fn run_shell(addr: SocketAddrV4, args: ShellArgs) -> Result<ExitCode> {
 /// a peer connects to `wg_ip:listen_port`, the server opens a new
 /// outbound substream — this binary accepts it, dials `forward_to`
 /// locally, and pumps bytes. Exits on Ctrl-C or when the control flow
-/// drops (wgnat restarted, network blip, etc).
+/// drops (burrow restarted, network blip, etc).
 async fn run_tunnel_start(
     addr: SocketAddrV4,
     proto: Proto,

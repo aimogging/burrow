@@ -1,9 +1,9 @@
-//! Phase 17 integration test for the `wgnat-client` binary. Spins up
-//! a mock control server on 127.0.0.1, invokes wgnat-client as a
+//! Phase 17 integration test for the `burrow-client` binary. Spins up
+//! a mock control server on 127.0.0.1, invokes burrow-client as a
 //! subprocess, asserts the request on the wire and exit semantics.
 //!
 //! The mock server reads one CBOR `ClientReq`, validates it, writes a
-//! canned `ServerResp`, closes. Mirrors what wgnat's real control
+//! canned `ServerResp`, closes. Mirrors what burrow's real control
 //! handler does for `one_shot_request` flows.
 //!
 //! The `tunnel start` subcommand HOLDS THE FLOW OPEN under the
@@ -20,10 +20,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::Command as TokioCommand;
 
-use wgnat::wire::{ClientReq, Proto, ServerResp, TunnelId, TunnelSpec};
+use burrow::wire::{ClientReq, Proto, ServerResp, TunnelId, TunnelSpec};
 
-fn wgnat_client_path() -> &'static str {
-    env!("CARGO_BIN_EXE_wgnat-client")
+fn burrow_client_path() -> &'static str {
+    env!("CARGO_BIN_EXE_burrow-client")
 }
 
 async fn bind_mock_server() -> (TcpListener, SocketAddrV4) {
@@ -87,7 +87,7 @@ async fn tunnel_start_tcp_writes_correct_request() {
         .await;
     });
 
-    let mut child = TokioCommand::new(wgnat_client_path())
+    let mut child = TokioCommand::new(burrow_client_path())
         .args([
             &addr.ip().to_string(),
             "--control-port",
@@ -137,7 +137,7 @@ async fn tunnel_start_udp_flag_sets_proto() {
         .await;
     });
 
-    let mut child = TokioCommand::new(wgnat_client_path())
+    let mut child = TokioCommand::new(burrow_client_path())
         .args([
             &addr.ip().to_string(),
             "--control-port",
@@ -175,7 +175,7 @@ async fn shell_oneshot_prints_captured_stdout_and_exit_code() {
     let server = tokio::spawn(async move {
         handle_one(&listener, |req| match req {
             ClientReq::RequestShell { mode, .. } => {
-                assert!(matches!(mode, wgnat::wire::ShellMode::Oneshot));
+                assert!(matches!(mode, burrow::wire::ShellMode::Oneshot));
                 ServerResp::ShellResult {
                     exit_code: Some(0),
                     stdout: b"mock-stdout\n".to_vec(),
@@ -188,7 +188,7 @@ async fn shell_oneshot_prints_captured_stdout_and_exit_code() {
     });
 
     let out = tokio::task::spawn_blocking({
-        let client_path = wgnat_client_path().to_string();
+        let client_path = burrow_client_path().to_string();
         let ip = addr.ip().to_string();
         let port = addr.port().to_string();
         move || {
@@ -236,7 +236,7 @@ async fn shell_nonzero_exit_propagates() {
     });
 
     let out = tokio::task::spawn_blocking({
-        let client_path = wgnat_client_path().to_string();
+        let client_path = burrow_client_path().to_string();
         let ip = addr.ip().to_string();
         let port = addr.port().to_string();
         move || {
@@ -260,7 +260,7 @@ async fn shell_detach_prints_pid() {
     let server = tokio::spawn(async move {
         handle_one(&listener, |req| match req {
             ClientReq::RequestShell { mode, .. } => {
-                assert!(matches!(mode, wgnat::wire::ShellMode::FireAndForget));
+                assert!(matches!(mode, burrow::wire::ShellMode::FireAndForget));
                 ServerResp::ShellSpawned { pid: 1234 }
             }
             other => panic!("expected RequestShell, got {other:?}"),
@@ -269,7 +269,7 @@ async fn shell_detach_prints_pid() {
     });
 
     let out = tokio::task::spawn_blocking({
-        let client_path = wgnat_client_path().to_string();
+        let client_path = burrow_client_path().to_string();
         let ip = addr.ip().to_string();
         let port = addr.port().to_string();
         move || {

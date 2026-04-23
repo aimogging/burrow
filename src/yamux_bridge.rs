@@ -1,6 +1,6 @@
 //! Infrastructure for client-originated reverse tunnels.
 //!
-//! A running wgnat-client holds one TCP control flow open per tunnel;
+//! A running burrow-client holds one TCP control flow open per tunnel;
 //! both sides wrap that flow in yamux. The server never dials the
 //! tunnel's `forward_to`; instead, when a peer connects to the tunnel's
 //! listen port, the server opens an outbound yamux substream to the
@@ -190,7 +190,7 @@ pub async fn drive_connection<T>(
 /// ```
 ///
 /// `payload_len` is the bytes-after-the-header count, not the total.
-/// Only IPv4 for now (matches wgnat's smoltcp).
+/// Only IPv4 for now (matches burrow's smoltcp).
 pub mod udp_frame {
     use std::io;
     use std::net::Ipv4Addr;

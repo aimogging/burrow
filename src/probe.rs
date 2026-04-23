@@ -4,7 +4,7 @@
 //!
 //! Phase 11 fix #1 preserves the natural distinction a direct route would
 //! produce. The kernel's connect() enforces its own SYN-retry timeout
-//! (~21s Windows / ~127s Linux); wgnat does NOT overlay an artificial
+//! (~21s Windows / ~127s Linux); burrow does NOT overlay an artificial
 //! `tokio::time::timeout`, because doing so would conflate "peer firewall
 //! drops SYN" with "peer RST" — the exact signal Phase 11 is trying to
 //! preserve for nmap-style scanning.

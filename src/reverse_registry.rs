@@ -1,6 +1,6 @@
 //! Reverse-tunnel registry. Each entry records the tunnel metadata plus
 //! a handle to the owning client's yamux connection, so that when a
-//! peer hits the tunnel's listen port wgnat can open an outbound
+//! peer hits the tunnel's listen port burrow can open an outbound
 //! yamux substream to that client.
 //!
 //! Port-collision: first start on a `(proto, listen_port, bind)` combo

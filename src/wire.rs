@@ -1,4 +1,4 @@
-//! Wire protocol types for the wgnat control channel.
+//! Wire protocol types for the burrow control channel.
 //!
 //! Encoded as CBOR (via `ciborium`) to give us compact binary with field
 //! names preserved — good forward-compat for adding new variants without
@@ -89,9 +89,9 @@ pub enum ShellMode {
     Interactive,
 }
 
-/// Where on wgnat's smoltcp interface a reverse tunnel listens. `Default`
+/// Where on burrow's smoltcp interface a reverse tunnel listens. `Default`
 /// uses the WG IP; `Any` binds on 0.0.0.0 (peers can target any dst IP
-/// that the WG server routes to wgnat); `Ipv4` pins a specific address.
+/// that the WG server routes to burrow); `Ipv4` pins a specific address.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BindAddr {
     Default,
@@ -108,7 +108,7 @@ impl Default for BindAddr {
 /// Parameters for a reverse-tunnel start request. `forward_to` is a
 /// free-form string ("host:port") — resolved by the CLIENT when a
 /// substream lands. Lets the target be any hostname the client's
-/// machine can resolve + reach, regardless of what the wgnat host
+/// machine can resolve + reach, regardless of what the burrow host
 /// sees on its network.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TunnelSpec {

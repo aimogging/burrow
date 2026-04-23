@@ -1,6 +1,6 @@
 //! UDP ingress dispatch for wg_ip datagrams.
 //!
-//! Under the client-originated tunnel model, wgnat does NOT originate
+//! Under the client-originated tunnel model, burrow does NOT originate
 //! UDP to `forward_to`. When a peer sends a datagram to a registered
 //! `(wg_ip, listen_port)`, we look up the tunnel in the registry, find
 //! its `UdpTunnelHandle` in the side-table populated by

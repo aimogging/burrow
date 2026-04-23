@@ -1,4 +1,4 @@
-//! Phase 12 integration test: wgnat originates an outbound TCP connection
+//! Phase 12 integration test: burrow originates an outbound TCP connection
 //! on its WG IP and completes the handshake against a hand-rolled peer that
 //! replies with SYN-ACK. Verifies:
 //!   * `SmoltcpHandle::open_outbound_tcp` returns a fresh `ConnectionId`.
@@ -17,10 +17,10 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
-use wgnat::nat::NatTable;
-use wgnat::rewrite::{parse_5tuple, PROTO_TCP};
-use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent};
-use wgnat::test_helpers::{build_tcp, ACK, SYN};
+use burrow::nat::NatTable;
+use burrow::rewrite::{parse_5tuple, PROTO_TCP};
+use burrow::runtime::{spawn_smoltcp, SmoltcpEvent};
+use burrow::test_helpers::{build_tcp, ACK, SYN};
 
 const WG_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -71,7 +71,7 @@ async fn originated_tcp_completes_handshake() {
         .await
         .expect("open_outbound_tcp returns a ConnectionId");
 
-    // Drain tx_rx until we see the SYN from wgnat.
+    // Drain tx_rx until we see the SYN from burrow.
     let mut syn = None;
     for _ in 0..200 {
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -90,7 +90,7 @@ async fn originated_tcp_completes_handshake() {
     assert_eq!(view.dst_port, PEER_PORT);
     assert_eq!(tcp_flags(&syn) & 0x3F, 0x02, "SYN only");
 
-    // Craft a SYN-ACK for smoltcp's SYN. ack = wgnat_seq + 1.
+    // Craft a SYN-ACK for smoltcp's SYN. ack = burrow_seq + 1.
     let wg_seq = tcp_seq(&syn);
     let peer_seq: u32 = 0xDEAD_BEEF;
     let synack = build_synack(

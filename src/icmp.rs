@@ -284,7 +284,7 @@ fn send_admin_prohibited(sink: &PacketSink, original: &[u8]) {
 /// `dst = peer`. Returns `None` for anything else.
 ///
 /// Used by `ingest_tunnel_packet` so peers can `ping wg_ip` for
-/// reachability checks without wgnat needing a raw socket bound to an
+/// reachability checks without burrow needing a raw socket bound to an
 /// address Windows doesn't own. Pings to LAN hosts still go through
 /// `IcmpForwarder::handle_inbound`.
 pub fn build_echo_reply_for_wg_ip(packet: &[u8], wg_ip: Ipv4Addr) -> Option<Vec<u8>> {

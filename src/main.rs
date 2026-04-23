@@ -13,26 +13,26 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use wgnat::config;
-use wgnat::control::{listener_key, spawn_control_handler, UdpTunnelMap};
-use wgnat::icmp::{
+use burrow::config;
+use burrow::control::{listener_key, spawn_control_handler, UdpTunnelMap};
+use burrow::icmp::{
     build_echo_reply_for_wg_ip, send_dest_unreachable, IcmpForwarder,
     ICMP_CODE_HOST_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE,
 };
-use wgnat::nat::{NatKey, NatTable};
-use wgnat::probe::{classify_connect_error, ConnectClass};
-use wgnat::proxy::{spawn_tcp_proxy_with_stream, ProxyMsg};
-use wgnat::reverse_registry::{OpenRequest, ReverseRegistry};
-use wgnat::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
-use wgnat::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
-use wgnat::tunnel::WgTunnel;
-use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
-use wgnat::wire::Proto;
-use wgnat::yamux_bridge::bridge_yamux_to_smoltcp;
+use burrow::nat::{NatKey, NatTable};
+use burrow::probe::{classify_connect_error, ConnectClass};
+use burrow::proxy::{spawn_tcp_proxy_with_stream, ProxyMsg};
+use burrow::reverse_registry::{OpenRequest, ReverseRegistry};
+use burrow::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
+use burrow::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
+use burrow::tunnel::WgTunnel;
+use burrow::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
+use burrow::wire::Proto;
+use burrow::yamux_bridge::bridge_yamux_to_smoltcp;
 
 
 /// Optional config baked in at build time via the `embedded-config` feature.
-/// The path is taken from `WGNAT_EMBEDDED_CONFIG` at build time; `build.rs`
+/// The path is taken from `BURROW_EMBEDDED_CONFIG` at build time; `build.rs`
 /// reads the file and emits `$OUT_DIR/embedded_config.rs` containing
 /// `pub const EMBEDDED_CONFIG: &str = "..."`. Cargo's `rerun-if-changed`
 /// directive on that path means editing the .conf invalidates the build.
@@ -86,25 +86,25 @@ enum Cmd {
     },
     /// Generate an x25519 keypair (base64) for use in a wg-quick config.
     Keygen,
-    /// Generate a ready-to-use trio of configs: server.conf, wgnat.conf,
+    /// Generate a ready-to-use trio of configs: server.conf, burrow.conf,
     /// clientN.conf. The only required inputs are the WG server's public
-    /// endpoint and (optionally) the routes the wgnat host should expose;
+    /// endpoint and (optionally) the routes the burrow host should expose;
     /// everything else has a sane default.
     Gen {
         /// WG server's public `ip:port`.
         #[arg(long)]
         endpoint: String,
-        /// Routes (CIDRs) to expose via wgnat. Comma-separated; pass
+        /// Routes (CIDRs) to expose via burrow. Comma-separated; pass
         /// `--routes a,b,c` to expose multiple.
         #[arg(long, value_delimiter = ',', default_value = "")]
         routes: Vec<String>,
         /// DNS servers to write into each client.conf. Comma-separated.
         /// Omit (the default) for no `DNS = ` line — clients keep their
-        /// system resolver. Pass the wgnat WG IP (e.g. 10.0.0.2) to opt
-        /// clients into wgnat's built-in resolver.
+        /// system resolver. Pass the burrow host's WG IP (e.g. 10.0.0.2)
+        /// to opt clients into burrow's built-in resolver.
         #[arg(long, value_delimiter = ',', default_value = "")]
         dns: Vec<String>,
-        /// WG network subnet. Server=.1, wgnat=.2, clients=.10+.
+        /// WG network subnet. Server=.1, burrow=.2, clients=.10+.
         #[arg(long, default_value = "10.0.0.0/24")]
         subnet: String,
         /// Number of client peers to generate.
@@ -115,7 +115,7 @@ enum Cmd {
         listen_port: u16,
         /// Output directory (created if missing). Existing files are
         /// overwritten.
-        #[arg(long, default_value = "wgnat-configs")]
+        #[arg(long, default_value = "burrow-configs")]
         out: PathBuf,
     },
 }
@@ -156,8 +156,8 @@ fn gen_configs(
     listen_port: u16,
     out_dir: PathBuf,
 ) -> Result<()> {
-    use wgnat::config::{parse_ipv4_cidr, DEFAULT_CONTROL_PORT};
-    use wgnat::config_gen::{generate, GenParams};
+    use burrow::config::{parse_ipv4_cidr, DEFAULT_CONTROL_PORT};
+    use burrow::config_gen::{generate, GenParams};
 
     // clap's value_delimiter on a String with default_value = "" yields
     // vec![""] rather than empty — filter blanks here.
@@ -194,8 +194,8 @@ fn gen_configs(
     }
     println!();
     println!("next:");
-    println!("  server:  wg-quick up ./server.conf   (on the WG server)");
-    println!("  wgnat:   wgnat run --config ./wgnat.conf   (on the NAT host)");
+    println!("  server:  wg-quick up ./server.conf    (on the WG server)");
+    println!("  burrow:  burrow run --config ./burrow.conf   (on the gateway host)");
     if params.clients == 1 {
         println!("  client:  wg-quick up ./client1.conf   (on the client)");
     } else {
@@ -229,7 +229,7 @@ async fn run(
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,wgnat=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("info,burrow=debug")),
         )
         .init();
 
@@ -286,13 +286,13 @@ async fn run(
         endpoint = %cfg.peer.endpoint,
         address = %cfg.interface.address,
         keepalive = ?cfg.peer.persistent_keepalive,
-        "starting wgnat"
+        "starting burrow"
     );
     // Phase 11: the `Address` field is parsed for wg-quick file-format
     // compatibility but plays no runtime role. The smoltcp interface uses a
     // fixed synthetic CIDR (198.18.0.0/15) as opaque identifier space; the
     // egress rewrite restores the peer-visible src_ip before any packet
-    // leaves wgnat, so the configured Address never appears on the wire.
+    // leaves burrow, so the configured Address never appears on the wire.
     info!("interface Address is informational under Phase 11 (smoltcp side uses 198.18.0.0/15 internally)");
 
     let nat = Arc::new(NatTable::new());
@@ -520,7 +520,7 @@ async fn run(
                 if !removed.is_empty() {
                     debug!(count = removed.len(), "NAT entries swept (expired)");
                 }
-                let removed_udp = nat.sweep_udp_idle(now, wgnat::nat::DEFAULT_UDP_IDLE);
+                let removed_udp = nat.sweep_udp_idle(now, burrow::nat::DEFAULT_UDP_IDLE);
                 if !removed_udp.is_empty() {
                     let mut map = udp_proxies.lock().unwrap();
                     for k in &removed_udp {
@@ -601,7 +601,7 @@ async fn ingest_tunnel_packet(
             return;
         }
     };
-    // Packets addressed to wgnat's WG IP: smoltcp owns the TCP stack
+    // Packets addressed to burrow's WG IP: smoltcp owns the TCP stack
     // (control listener, reverse-tunnel TCP, originated outbound
     // responses). UDP is handled separately — it's intercepted here
     // for reverse-tunnel forwarding without going through smoltcp.
@@ -615,7 +615,7 @@ async fn ingest_tunnel_packet(
     // supported (Endpoint::Unspecified is reject-only). So we do the
     // reply ourselves — swap src/dst, flip the ICMP type, echo the
     // payload. Other ICMP traffic (peers pinging LAN hosts via
-    // wgnat's NAT path) continues through `IcmpForwarder`.
+    // burrow's NAT path) continues through `IcmpForwarder`.
     if view.dst_ip == wg_ip && view.proto == PROTO_ICMP {
         if let Some(reply) = build_echo_reply_for_wg_ip(&packet, wg_ip) {
             let _ = egress_tx.send(reply);
@@ -623,7 +623,7 @@ async fn ingest_tunnel_packet(
         return;
     }
     if view.dst_ip == wg_ip && view.proto == PROTO_UDP {
-        wgnat::udp_reverse::dispatch_udp_to_wg_ip(
+        burrow::udp_reverse::dispatch_udp_to_wg_ip(
             &packet,
             &view,
             wg_ip,
@@ -767,7 +767,7 @@ async fn egress_loop(
 ///     time out. Peer sees `filtered`.
 ///
 /// Pre-Phase-11 every failure synthesized a RST, which misreported firewall
-/// drops as closed ports (the exact nmap-is-through-wgnat tell Phase 11
+/// drops as closed ports (the exact nmap-is-through-burrow tell Phase 11
 /// closes). We also no longer wrap connect in `tokio::time::timeout`: the
 /// kernel's native SYN-retry budget (~21s Windows / ~127s Linux) is the
 /// right upper bound, and truncating it would reintroduce the same
@@ -888,7 +888,7 @@ fn send_rst(egress_tx: &mpsc::UnboundedSender<Vec<u8>>, key: NatKey, peer_seq: u
 fn spawn_reverse_tcp_yamux_bridge(
     incoming_id: ConnectionId,
     smoltcp: SmoltcpHandle,
-    entry: wgnat::reverse_registry::RegEntry,
+    entry: burrow::reverse_registry::RegEntry,
 ) -> mpsc::UnboundedSender<ProxyMsg> {
     let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ProxyMsg>();
     tokio::spawn(async move {
@@ -913,7 +913,7 @@ fn spawn_reverse_tcp_yamux_bridge(
         };
         // Wrap the smoltcp flow as a tokio DuplexStream and pump bytes
         // symmetrically between it and the yamux substream.
-        let duplex = wgnat::yamux_bridge::smoltcp_as_duplex(
+        let duplex = burrow::yamux_bridge::smoltcp_as_duplex(
             incoming_id,
             smoltcp.clone(),
             Vec::new(),

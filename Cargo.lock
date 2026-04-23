@@ -167,6 +167,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
+name = "burrow"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "boringtun",
+ "ciborium",
+ "clap",
+ "crossterm",
+ "futures",
+ "hickory-proto",
+ "portable-pty-psmux",
+ "serde",
+ "smoltcp",
+ "socket2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys 0.61.2",
+ "x25519-dalek",
+ "yamux",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1964,33 +1991,6 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "wgnat"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "boringtun",
- "ciborium",
- "clap",
- "crossterm",
- "futures",
- "hickory-proto",
- "portable-pty-psmux",
- "serde",
- "smoltcp",
- "socket2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "windows-sys 0.61.2",
- "x25519-dalek",
- "yamux",
 ]
 
 [[package]]

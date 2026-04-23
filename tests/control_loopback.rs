@@ -15,13 +15,13 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use wgnat::control::{listener_key, spawn_control_handler, UdpTunnelMap};
-use wgnat::nat::NatTable;
-use wgnat::proxy::ProxyMsg;
-use wgnat::reverse_registry::ReverseRegistry;
-use wgnat::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent};
-use wgnat::test_helpers::{build_tcp, ACK, FIN, PSH, SYN};
-use wgnat::wire::{BindAddr, ClientReq, Proto, ServerResp, TunnelSpec};
+use burrow::control::{listener_key, spawn_control_handler, UdpTunnelMap};
+use burrow::nat::NatTable;
+use burrow::proxy::ProxyMsg;
+use burrow::reverse_registry::ReverseRegistry;
+use burrow::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent};
+use burrow::test_helpers::{build_tcp, ACK, FIN, PSH, SYN};
+use burrow::wire::{BindAddr, ClientReq, Proto, ServerResp, TunnelSpec};
 
 const WG_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -132,7 +132,7 @@ async fn wait_for(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_register_roundtrip() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("warn,wgnat=info")
+        .with_env_filter("warn,burrow=info")
         .with_test_writer()
         .try_init();
 

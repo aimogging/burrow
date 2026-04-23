@@ -6,7 +6,7 @@
 //! Pre-fix: NAT keyed on (proto, peer_ip, peer_port, dst_port). 256
 //! distinct dst_ip's collided on the index, eviction left only the last
 //! one alive. SRV02 stress test confirmed this: only DC01 (kept warm by
-//! a long-lived hold) showed open ports through wgnat; DC02..SRV03 all
+//! a long-lived hold) showed open ports through burrow; DC02..SRV03 all
 //! filtered.
 //!
 //! Post-fix: each flow gets a per-flow `gateway_port` from the 32768..=65535
@@ -15,8 +15,8 @@
 
 use std::net::Ipv4Addr;
 
-use wgnat::nat::NatTable;
-use wgnat::rewrite::{parse_5tuple, PROTO_TCP};
+use burrow::nat::NatTable;
+use burrow::rewrite::{parse_5tuple, PROTO_TCP};
 
 fn build_tcp_syn(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
     let mut pkt = vec![0u8; 40];

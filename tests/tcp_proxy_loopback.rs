@@ -12,17 +12,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use wgnat::nat::NatTable;
-use wgnat::proxy::{spawn_tcp_proxy, ProxyMsg};
-use wgnat::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent};
-use wgnat::test_helpers::{build_tcp, ACK, FIN, PSH, SYN};
+use burrow::nat::NatTable;
+use burrow::proxy::{spawn_tcp_proxy, ProxyMsg};
+use burrow::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent};
+use burrow::test_helpers::{build_tcp, ACK, FIN, PSH, SYN};
 
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const PEER_PORT: u16 = 54321;
 
 /// Minimal hand-rolled TCP peer state — enough to do a 3-way handshake,
 /// push a data segment, and FIN. Operates on the *peer's* perspective:
-/// `local_*` is the peer side, `remote_*` is the original-dst (the wgnat
+/// `local_*` is the peer side, `remote_*` is the original-dst (the burrow
 /// gateway will rewrite the dst on inbound, but we always craft packets
 /// with the original-dst since that's what a real peer would emit).
 struct TcpPeer {
@@ -172,7 +172,7 @@ async fn wait_for(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_proxy_round_trips_via_loopback_echo() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("warn,wgnat=info")
+        .with_env_filter("warn,burrow=info")
         .with_test_writer()
         .try_init();
 
@@ -254,7 +254,7 @@ async fn tcp_proxy_round_trips_via_loopback_echo() {
     send_inbound(peer.ack_only());
 
     // 4. Send PSH+ACK with payload.
-    let payload = b"hello, wgnat";
+    let payload = b"hello, burrow";
     send_inbound(peer.psh_ack(payload));
 
     // 5. Wait for echoed data to come back.

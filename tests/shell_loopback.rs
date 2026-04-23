@@ -12,13 +12,13 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use wgnat::control::{listener_key, spawn_control_handler, UdpTunnelMap};
-use wgnat::nat::NatTable;
-use wgnat::proxy::ProxyMsg;
-use wgnat::reverse_registry::ReverseRegistry;
-use wgnat::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent};
-use wgnat::test_helpers::{build_tcp, ACK, PSH, SYN};
-use wgnat::wire::{ClientReq, ServerResp, ShellMode};
+use burrow::control::{listener_key, spawn_control_handler, UdpTunnelMap};
+use burrow::nat::NatTable;
+use burrow::proxy::ProxyMsg;
+use burrow::reverse_registry::ReverseRegistry;
+use burrow::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent};
+use burrow::test_helpers::{build_tcp, ACK, PSH, SYN};
+use burrow::wire::{ClientReq, ServerResp, ShellMode};
 
 const WG_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 2);
 const PEER_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 1);
@@ -42,7 +42,7 @@ fn encode_cbor<T: serde::Serialize>(value: &T) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shell_oneshot_returns_captured_output() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("warn,wgnat=info")
+        .with_env_filter("warn,burrow=info")
         .with_test_writer()
         .try_init();
 

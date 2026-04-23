@@ -14,8 +14,8 @@
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
-use wgnat::nat::NatTable;
-use wgnat::rewrite::{parse_5tuple, PROTO_TCP};
+use burrow::nat::NatTable;
+use burrow::rewrite::{parse_5tuple, PROTO_TCP};
 
 fn build_tcp_syn(src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
     let mut pkt = vec![0u8; 40];

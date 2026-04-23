@@ -1,7 +1,7 @@
 //! Phase 15 integration test: DNS service on `(wg_ip, 53/udp)`.
 //!
 //! A peer sends a standard DNS A query in a UDP datagram to
-//! `wg_ip:53`. wgnat's ingest dispatcher sees the port, delegates to
+//! `wg_ip:53`. burrow's ingest dispatcher sees the port, delegates to
 //! `dns_service::handle_query` (which uses `tokio::net::lookup_host` on
 //! the local machine), wraps the response in a UDP+IP frame, and emits
 //! it on the egress channel. The test asserts that the response is
@@ -22,11 +22,11 @@ use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::sync::mpsc;
 
-use wgnat::control::{UdpTunnelHandle, UdpTunnelMap};
-use wgnat::reverse_registry::{OpenRequest, ReverseRegistry, SubstreamOpener};
-use wgnat::rewrite::{build_udp_packet, parse_5tuple};
-use wgnat::udp_reverse::dispatch_udp_to_wg_ip;
-use wgnat::wire::{BindAddr, Proto, TunnelId};
+use burrow::control::{UdpTunnelHandle, UdpTunnelMap};
+use burrow::reverse_registry::{OpenRequest, ReverseRegistry, SubstreamOpener};
+use burrow::rewrite::{build_udp_packet, parse_5tuple};
+use burrow::udp_reverse::dispatch_udp_to_wg_ip;
+use burrow::wire::{BindAddr, Proto, TunnelId};
 
 const WG_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);

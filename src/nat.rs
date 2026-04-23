@@ -23,7 +23,7 @@
 //!
 //! Phase 11 reframes the identifier: `gateway_port` is not protocol-meaningful
 //! — it's just an opaque tag, present on the packet only between WG ingress
-//! and the egress rewrite (both internal to wgnat). The smoltcp interface IP
+//! and the egress rewrite (both internal to burrow). The smoltcp interface IP
 //! is similarly opaque. So we expand the identifier to `(virtual_ip,
 //! gateway_port)` drawn from `198.18.0.0/15` (RFC 2544 benchmark range,
 //! never on the public internet) × `1..=65535`. That's ~131070 virtual_ips
@@ -53,7 +53,7 @@ pub const DEFAULT_TCP_GRACE: Duration = Duration::from_secs(60);
 pub const DEFAULT_UDP_IDLE: Duration = Duration::from_secs(30);
 
 /// 198.18.0.0/15 — RFC 2544 benchmark range. Used purely as an internal
-/// identifier space; the addresses never appear on any wire outside wgnat
+/// identifier space; the addresses never appear on any wire outside burrow
 /// (the egress rewrite restores the original_dst_ip before the packet
 /// leaves the smoltcp side, and inbound packets are never sourced from
 /// these addresses). Recognizable as synthetic in debug logs.

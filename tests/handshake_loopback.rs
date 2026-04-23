@@ -9,8 +9,8 @@
 
 use std::net::Ipv4Addr;
 
-use wgnat::config::{Config, InterfaceConfig, PeerConfig};
-use wgnat::tunnel::{CoreStep, WgCore};
+use burrow::config::{Config, InterfaceConfig, PeerConfig};
+use burrow::tunnel::{CoreStep, WgCore};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 fn build_pair() -> (WgCore, WgCore) {
@@ -23,7 +23,7 @@ fn build_pair() -> (WgCore, WgCore) {
         interface: InterfaceConfig {
             private_key: client_secret,
             address: "10.0.0.1/24".parse().unwrap(),
-            control_port: wgnat::config::DEFAULT_CONTROL_PORT,
+            control_port: burrow::config::DEFAULT_CONTROL_PORT,
             dns_enabled: true,
         },
         peer: PeerConfig {
@@ -38,7 +38,7 @@ fn build_pair() -> (WgCore, WgCore) {
         interface: InterfaceConfig {
             private_key: server_secret,
             address: "10.0.0.2/24".parse().unwrap(),
-            control_port: wgnat::config::DEFAULT_CONTROL_PORT,
+            control_port: burrow::config::DEFAULT_CONTROL_PORT,
             dns_enabled: true,
         },
         peer: PeerConfig {

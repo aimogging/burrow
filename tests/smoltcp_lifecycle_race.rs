@@ -19,9 +19,9 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use wgnat::nat::{NatKey, NatTable, VIRTUAL_IFACE_ADDR};
-use wgnat::rewrite::PROTO_TCP;
-use wgnat::runtime::spawn_smoltcp;
+use burrow::nat::{NatKey, NatTable, VIRTUAL_IFACE_ADDR};
+use burrow::rewrite::PROTO_TCP;
+use burrow::runtime::spawn_smoltcp;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_write_after_close_does_not_panic() {

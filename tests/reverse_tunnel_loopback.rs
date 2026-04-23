@@ -6,7 +6,7 @@
 //!     drives it via `drive_connection`, exposing a `SubstreamOpener`
 //!     in the `ReverseRegistry`.
 //!   * Client side upgrades to `yamux::Mode::Client` and accepts
-//!     inbound substreams into a channel (same shape wgnat-client
+//!     inbound substreams into a channel (same shape burrow-client
 //!     uses in production).
 //!   * "Incoming peer" flow: use the registry's opener to open a new
 //!     outbound substream on the server side. Bytes written into that
@@ -24,21 +24,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
-use wgnat::reverse_registry::{OpenRequest, ReverseRegistry};
-use wgnat::wire::{
+use burrow::reverse_registry::{OpenRequest, ReverseRegistry};
+use burrow::wire::{
     read_frame, write_frame, BindAddr, ClientReq, Proto, ServerResp, TunnelSpec,
 };
-use wgnat::yamux_bridge::drive_connection;
+use burrow::yamux_bridge::drive_connection;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reverse_tunnel_substream_roundtrip() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("warn,wgnat=info")
+        .with_env_filter("warn,burrow=info")
         .with_test_writer()
         .try_init();
 
     // Single flow between "client" and "server" — this stands in for
-    // the smoltcp-carried TCP flow between wgnat-client and wgnat.
+    // the smoltcp-carried TCP flow between burrow-client and burrow.
     let (server_side, client_side) = tokio::io::duplex(64 * 1024);
 
     let registry = Arc::new(ReverseRegistry::new());
@@ -103,7 +103,7 @@ async fn reverse_tunnel_substream_roundtrip() {
         tokio::spawn(drive_connection(conn, opener_rx, Some(inbound_tx)));
 
     // Client-side "forward_to dialer": whatever bytes arrive on an
-    // inbound substream are echoed back. Mimics what wgnat-client would
+    // inbound substream are echoed back. Mimics what burrow-client would
     // do if its local forward_to were an echo server.
     let client_echoer = tokio::spawn(async move {
         while let Some(substream) = inbound_rx.recv().await {
@@ -130,7 +130,7 @@ async fn reverse_tunnel_substream_roundtrip() {
     });
 
     // ---- Simulate an incoming peer hitting the tunnel port ----
-    // Production wgnat does this from its smoltcp event loop via
+    // Production burrow does this from its smoltcp event loop via
     // spawn_reverse_tcp_yamux_bridge. Here we do the same thing by hand
     // against the registry's opener.
     let entry = {

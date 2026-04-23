@@ -12,9 +12,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use wgnat::nat::{NatKey, NatTable};
-use wgnat::rewrite::{parse_5tuple, PROTO_UDP};
-use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
+use burrow::nat::{NatKey, NatTable};
+use burrow::rewrite::{parse_5tuple, PROTO_UDP};
+use burrow::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
 
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const PEER_PORT: u16 = 33333;
@@ -23,7 +23,7 @@ const PEER_PORT: u16 = 33333;
 fn build_inbound_udp(dst_ip: Ipv4Addr, dst_port: u16, payload: &[u8]) -> Vec<u8> {
     // Reuse build_udp_packet via the public API by inverting roles. We need a
     // packet src=PEER, dst=dst_ip, src_port=PEER_PORT, dst_port=dst_port.
-    wgnat::rewrite::build_udp_packet(PEER_IP, dst_ip, PEER_PORT, dst_port, payload)
+    burrow::rewrite::build_udp_packet(PEER_IP, dst_ip, PEER_PORT, dst_port, payload)
 }
 
 /// Bind a UDP echo server on 127.0.0.1; returns its address.
@@ -44,7 +44,7 @@ async fn start_udp_echo() -> SocketAddr {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_proxy_round_trips_via_loopback_echo() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("warn,wgnat=debug")
+        .with_env_filter("warn,burrow=debug")
         .with_test_writer()
         .try_init();
 
@@ -97,7 +97,7 @@ async fn udp_proxy_round_trips_via_loopback_echo() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_proxy_idle_sweep_replaces_entry() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("warn,wgnat=debug")
+        .with_env_filter("warn,burrow=debug")
         .with_test_writer()
         .try_init();
 

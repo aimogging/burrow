@@ -38,7 +38,7 @@ pub fn parse_ipv4_cidr(s: &str) -> Result<Ipv4Cidr> {
 pub struct InterfaceConfig {
     pub private_key: StaticSecret,
     pub address: Ipv4Cidr,
-    /// TCP port on the WG interface address where wgnat accepts control
+    /// TCP port on the WG interface address where burrow accepts control
     /// requests (reverse-tunnel registrations, shell sessions in Phase
     /// 16). Default if unset: `DEFAULT_CONTROL_PORT` (57821).
     pub control_port: u16,
@@ -49,7 +49,7 @@ pub struct InterfaceConfig {
     pub dns_enabled: bool,
 }
 
-/// Default TCP port for the wgnat control channel on the WG interface
+/// Default TCP port for the burrow control channel on the WG interface
 /// address. Chosen to avoid common services and not collide with
 /// WireGuard's default 51820.
 pub const DEFAULT_CONTROL_PORT: u16 = 57821;

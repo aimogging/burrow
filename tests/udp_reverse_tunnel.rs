@@ -1,6 +1,6 @@
 //! Phase 14 integration test: UDP reverse-tunnel ingest dispatch.
 //!
-//! Under the client-originated tunnel model, wgnat does NOT originate
+//! Under the client-originated tunnel model, burrow does NOT originate
 //! UDP toward `forward_to`. Instead, a peer datagram to a registered
 //! `(wg_ip, listen_port)` gets pushed into the owning client's
 //! `UdpTunnelHandle` via the `UdpTunnelMap` side-table. The owning
@@ -19,11 +19,11 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use wgnat::control::{UdpTunnelHandle, UdpTunnelMap};
-use wgnat::reverse_registry::{OpenRequest, ReverseRegistry, SubstreamOpener};
-use wgnat::rewrite::{build_udp_packet, parse_5tuple};
-use wgnat::udp_reverse::dispatch_udp_to_wg_ip;
-use wgnat::wire::{BindAddr, Proto, TunnelId};
+use burrow::control::{UdpTunnelHandle, UdpTunnelMap};
+use burrow::reverse_registry::{OpenRequest, ReverseRegistry, SubstreamOpener};
+use burrow::rewrite::{build_udp_packet, parse_5tuple};
+use burrow::udp_reverse::dispatch_udp_to_wg_ip;
+use burrow::wire::{BindAddr, Proto, TunnelId};
 
 const WG_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -77,11 +77,11 @@ async fn udp_reverse_forwards_to_tunnel_handle() {
     assert_eq!(peer_port, PEER_PORT);
     assert_eq!(payload, query);
 
-    // No outbound UDP packet should leave wgnat — the client is the
+    // No outbound UDP packet should leave burrow — the client is the
     // origination point under the new model.
     assert!(
         egress_rx.try_recv().is_err(),
-        "wgnat must not originate UDP in the client-originated model"
+        "burrow must not originate UDP in the client-originated model"
     );
 
     // A second datagram on the same flow goes through the same handle.

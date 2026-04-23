@@ -27,9 +27,9 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
-use wgnat::nat::NatTable;
-use wgnat::rewrite::PROTO_TCP;
-use wgnat::runtime::{spawn_smoltcp, SmoltcpEvent};
+use burrow::nat::NatTable;
+use burrow::rewrite::PROTO_TCP;
+use burrow::runtime::{spawn_smoltcp, SmoltcpEvent};
 
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const ORIGINAL_DST: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 50);
@@ -206,7 +206,7 @@ async fn syn_scan_style_rst_reaps_listener_and_nat_entry() {
     // Sanity: the gateway_port pool isn't wedged — a fresh listener for a
     // different key allocates cleanly. (If allocation failed, this would
     // hang or panic.)
-    let new_key = wgnat::nat::NatKey {
+    let new_key = burrow::nat::NatKey {
         proto: PROTO_TCP,
         peer_ip: PEER_IP,
         peer_port: PEER_PORT.wrapping_add(1),

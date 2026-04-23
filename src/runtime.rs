@@ -83,7 +83,7 @@ pub enum SmoltcpCmd {
         key: NatKey,
         ready: oneshot::Sender<ConnectionId>,
     },
-    /// Open an outbound TCP connection originated by wgnat itself (reverse
+    /// Open an outbound TCP connection originated by burrow itself (reverse
     /// tunnels, future DNS/control flows). smoltcp binds the socket on
     /// `local` (which should be `(wg_ip, ephemeral_port)`) and calls
     /// `connect` to `remote`. Replies once the SYN has been dispatched with
@@ -242,7 +242,7 @@ pub fn spawn_smoltcp(
     let nat_thread = Arc::clone(&nat);
 
     thread::Builder::new()
-        .name("wgnat-smoltcp".into())
+        .name("burrow-smoltcp".into())
         .spawn(move || run_smoltcp_thread(rx_rx, tx_tx, cmd_rx, evt_tx, nat_thread, wg_ip))
         .expect("spawn smoltcp thread");
 

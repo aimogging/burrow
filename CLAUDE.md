@@ -1,4 +1,4 @@
-# wgnat — WireGuard Userspace NAT Gateway
+# burrow — WireGuard Userspace Gateway
 
 A CLI tool that runs on a host inside a private network, connects outbound to a WireGuard server, and acts as a transparent MASQUERADE NAT gateway for other WireGuard peers — with no TUN interface, no kernel drivers, and no OS network configuration required.
 
@@ -19,7 +19,7 @@ Enable a host behind NAT on a private network to act as a gateway for external W
 [WireGuard server]  ← standard Linux WireGuard, publicly reachable
     | routes via AllowedIPs
     v
-[wgnat — NAT gateway]  ← behind NAT on internal network, connects outbound
+[burrow — NAT gateway]  ← behind NAT on internal network, connects outbound
     | real OS sockets
     v
 [internal network hosts]
@@ -36,7 +36,7 @@ PublicKey = ...
 AllowedIPs = 10.0.0.1/32
 
 [Peer]
-# wgnat (this tool)
+# burrow (this tool)
 PublicKey = ...
 AllowedIPs = 10.0.0.2/32, 192.168.1.0/24   # advertises the internal network
 ```

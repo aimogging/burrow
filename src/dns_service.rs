@@ -1,6 +1,6 @@
 //! Built-in DNS service on `(wg_ip, 53/udp)`.
 //!
-//! Minimal DNS responder — answers A queries using the wgnat host's
+//! Minimal DNS responder — answers A queries using the burrow host's
 //! system resolver via `tokio::net::lookup_host`. Any non-A query type
 //! gets a `NotImp` response code so peers see a clean protocol-level
 //! answer rather than a silent drop.

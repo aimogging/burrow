@@ -1,17 +1,17 @@
-//! Config generator for a full wgnat deployment. Given the WG server's
-//! public endpoint and the routes the wgnat host should expose, emits
+//! Config generator for a full burrow deployment. Given the WG server's
+//! public endpoint and the routes the burrow host should expose, emits
 //! three kinds of file:
 //!
-//!   * `server.conf` — for the WG server. Multi-peer (wgnat + each
+//!   * `server.conf` — for the WG server. Multi-peer (burrow + each
 //!     client). Consumed by `wg-quick` on the server, not by our own
 //!     single-peer parser.
-//!   * `wgnat.conf` — fed to `wgnat run --config wgnat.conf`.
+//!   * `burrow.conf` — fed to `burrow run --config burrow.conf`.
 //!   * `clientN.conf` — one per client peer, starting at N=1.
 //!     Consumed by `wg-quick` on each client machine.
 //!
 //! IP layout inside the subnet:
 //!   * `.1` → WG server
-//!   * `.2` → wgnat
+//!   * `.2` → burrow (the gateway host)
 //!   * `.10..` → clients (one per requested client, sequential)
 //!
 //! Pure — returns the list of `(filename, contents)` pairs so the
@@ -19,7 +19,7 @@
 //! responsible for file IO and permissions.
 //!
 //! Single-peer parser limitation: `config::parse_str` only supports
-//! one `[Peer]`. `wgnat.conf` and each `clientN.conf` are single-peer
+//! one `[Peer]`. `burrow.conf` and each `clientN.conf` are single-peer
 //! and therefore round-trippable through our parser; `server.conf` is
 //! not — the server-side config is for `wg-quick`, which is the
 //! canonical multi-peer consumer.
@@ -33,21 +33,21 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::config::{Ipv4Cidr, DEFAULT_CONTROL_PORT};
 
 /// First octet-offset used for client peers. `.1` = server, `.2` =
-/// wgnat, `.3..=.9` reserved for future service roles, `.10+` = clients.
+/// gateway, `.3..=.9` reserved for future service roles, `.10+` = clients.
 const CLIENT_OFFSET: u32 = 10;
 
 pub struct GenParams {
     /// WG server's public `ip:port` (goes into each peer's `Endpoint`).
     pub endpoint: String,
-    /// Routes the wgnat host will expose (CIDRs). Empty = pure
+    /// Routes the burrow host will expose (CIDRs). Empty = pure
     /// peer-to-peer WG with no subnet exposure — clients can still use
-    /// wgnat's DNS / reverse-tunnel services.
+    /// burrow's DNS / reverse-tunnel services.
     pub routes: Vec<String>,
     /// DNS resolvers to write into each client's `[Interface]` as
     /// `DNS = ...`. Empty (the default) means no `DNS =` line —
-    /// clients keep their system resolver. Pass wgnat's WG IP to opt
-    /// clients into wgnat's built-in resolver; append public
-    /// resolvers (e.g. `1.1.1.1`) if you want wg-quick fallback.
+    /// clients keep their system resolver. Pass the burrow host's
+    /// WG IP to opt clients into burrow's built-in resolver; append
+    /// public resolvers (e.g. `1.1.1.1`) if you want wg-quick fallback.
     pub dns: Vec<String>,
     /// WG network subnet (e.g. `10.0.0.0/24`). Must have room for
     /// `.1`, `.2`, and `.10..=.(10 + clients - 1)`.
@@ -57,7 +57,7 @@ pub struct GenParams {
     /// WG server's UDP listen port (goes into `server.conf` and each
     /// peer's `Endpoint` port).
     pub listen_port: u16,
-    /// wgnat control port (goes into `wgnat.conf`).
+    /// burrow control port (goes into `burrow.conf`).
     pub control_port: u16,
 }
 
@@ -81,7 +81,7 @@ pub struct GeneratedConfig {
 }
 
 /// Generate the full trio (+ N-1 extra client configs). Order of the
-/// returned vec: `server.conf`, `wgnat.conf`, `client1.conf`, ...,
+/// returned vec: `server.conf`, `burrow.conf`, `client1.conf`, ...,
 /// `clientN.conf`.
 pub fn generate(params: &GenParams) -> Result<Vec<GeneratedConfig>> {
     if params.clients == 0 {
@@ -91,11 +91,11 @@ pub fn generate(params: &GenParams) -> Result<Vec<GeneratedConfig>> {
         bail!("--endpoint is required (ip:port)");
     }
 
-    let (server_ip, wgnat_ip, client_ips) = allocate_ips(&params.subnet, params.clients)?;
+    let (server_ip, gateway_ip, client_ips) = allocate_ips(&params.subnet, params.clients)?;
     let prefix = params.subnet.prefix_len();
 
     let server = Keypair::new();
-    let wgnat = Keypair::new();
+    let gateway = Keypair::new();
     let clients: Vec<Keypair> = (0..params.clients).map(|_| Keypair::new()).collect();
 
     let routes_suffix = if params.routes.is_empty() {
@@ -111,8 +111,8 @@ pub fn generate(params: &GenParams) -> Result<Vec<GeneratedConfig>> {
             params,
             &server,
             server_ip,
-            &wgnat,
-            wgnat_ip,
+            &gateway,
+            gateway_ip,
             &clients,
             &client_ips,
             &routes_suffix,
@@ -120,8 +120,8 @@ pub fn generate(params: &GenParams) -> Result<Vec<GeneratedConfig>> {
         ),
     });
     out.push(GeneratedConfig {
-        filename: "wgnat.conf".into(),
-        contents: build_wgnat_conf(params, &wgnat, wgnat_ip, &server, prefix),
+        filename: "burrow.conf".into(),
+        contents: build_burrow_conf(params, &gateway, gateway_ip, &server, prefix),
     });
     for (i, c) in clients.iter().enumerate() {
         out.push(GeneratedConfig {
@@ -136,8 +136,8 @@ fn build_server_conf(
     params: &GenParams,
     server: &Keypair,
     server_ip: Ipv4Addr,
-    wgnat: &Keypair,
-    wgnat_ip: Ipv4Addr,
+    gateway: &Keypair,
+    gateway_ip: Ipv4Addr,
     clients: &[Keypair],
     client_ips: &[Ipv4Addr],
     routes_suffix: &str,
@@ -149,8 +149,8 @@ fn build_server_conf(
         server.private, params.listen_port, server_ip, prefix
     ));
     s.push_str(&format!(
-        "\n# wgnat\n[Peer]\nPublicKey = {}\nAllowedIPs = {}/32{}\n",
-        wgnat.public, wgnat_ip, routes_suffix
+        "\n# burrow\n[Peer]\nPublicKey = {}\nAllowedIPs = {}/32{}\n",
+        gateway.public, gateway_ip, routes_suffix
     ));
     for (i, c) in clients.iter().enumerate() {
         s.push_str(&format!(
@@ -163,10 +163,10 @@ fn build_server_conf(
     s
 }
 
-fn build_wgnat_conf(
+fn build_burrow_conf(
     params: &GenParams,
-    wgnat: &Keypair,
-    wgnat_ip: Ipv4Addr,
+    gateway: &Keypair,
+    gateway_ip: Ipv4Addr,
     server: &Keypair,
     prefix: u8,
 ) -> String {
@@ -182,8 +182,8 @@ fn build_wgnat_conf(
          Endpoint = {}\n\
          AllowedIPs = {}/{}\n\
          PersistentKeepalive = 25\n",
-        wgnat.private,
-        wgnat_ip,
+        gateway.private,
+        gateway_ip,
         prefix,
         params.control_port,
         server.public,
@@ -250,7 +250,7 @@ impl Keypair {
     }
 }
 
-/// Lay out `.1` for the server, `.2` for wgnat, and `.10..` for
+/// Lay out `.1` for the server, `.2` for the gateway, and `.10..` for
 /// clients within the subnet. Errors if the subnet can't fit them all.
 fn allocate_ips(
     subnet: &Ipv4Cidr,
@@ -260,7 +260,7 @@ fn allocate_ips(
     let prefix = subnet.prefix_len();
     let host_bits = 32 - prefix;
     // Minimum: CLIENT_OFFSET + clients + 1 distinct host indices
-    // (server, wgnat, N clients — plus network+broadcast reserved).
+    // (server, gateway, N clients — plus network+broadcast reserved).
     // For /28 (14 usable) with clients=1, highest needed = 10 + 1 - 1 = 10.
     // Broadcast is at index (2^host_bits) - 1.
     let highest_index = CLIENT_OFFSET + u32::from(clients) - 1;
@@ -277,11 +277,11 @@ fn allocate_ips(
 
     let base = u32::from(network);
     let server = Ipv4Addr::from(base + 1);
-    let wgnat = Ipv4Addr::from(base + 2);
+    let gateway = Ipv4Addr::from(base + 2);
     let client_ips: Vec<Ipv4Addr> = (0..u32::from(clients))
         .map(|i| Ipv4Addr::from(base + CLIENT_OFFSET + i))
         .collect();
-    Ok((server, wgnat, client_ips))
+    Ok((server, gateway, client_ips))
 }
 
 #[cfg(test)]
@@ -301,7 +301,7 @@ mod tests {
     fn single_client_default_subnet() {
         let out = generate(&default_params()).unwrap();
         let names: Vec<&str> = out.iter().map(|c| c.filename.as_str()).collect();
-        assert_eq!(names, vec!["server.conf", "wgnat.conf", "client1.conf"]);
+        assert_eq!(names, vec!["server.conf", "burrow.conf", "client1.conf"]);
     }
 
     #[test]
@@ -314,7 +314,7 @@ mod tests {
             names,
             vec![
                 "server.conf",
-                "wgnat.conf",
+                "burrow.conf",
                 "client1.conf",
                 "client2.conf",
                 "client3.conf",
@@ -339,10 +339,10 @@ mod tests {
     }
 
     #[test]
-    fn wgnat_conf_roundtrips_through_parser() {
+    fn burrow_conf_roundtrips_through_parser() {
         let out = generate(&default_params()).unwrap();
-        let wgnat = out.iter().find(|c| c.filename == "wgnat.conf").unwrap();
-        let cfg = parse_str(&wgnat.contents).expect("wgnat.conf must parse cleanly");
+        let gw = out.iter().find(|c| c.filename == "burrow.conf").unwrap();
+        let cfg = parse_str(&gw.contents).expect("burrow.conf must parse cleanly");
         assert_eq!(cfg.interface.address.prefix_len(), 24);
         assert_eq!(cfg.interface.address.address(), Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(cfg.interface.control_port, DEFAULT_CONTROL_PORT);
@@ -358,7 +358,6 @@ mod tests {
         let cfg = parse_str(&client.contents).expect("client1.conf must parse cleanly");
         assert_eq!(cfg.interface.address.address(), Ipv4Addr::new(10, 0, 0, 10));
         assert_eq!(cfg.peer.endpoint, "198.51.100.1:51820");
-        // AllowedIPs contains the subnet AND the route.
         let allowed: Vec<String> = cfg
             .peer
             .allowed_ips
@@ -378,18 +377,18 @@ mod tests {
         let iface_count = server.contents.matches("[Interface]").count();
         let peer_count = server.contents.matches("[Peer]").count();
         assert_eq!(iface_count, 1);
-        // 1 wgnat peer + 2 clients = 3.
+        // 1 burrow peer + 2 clients = 3.
         assert_eq!(peer_count, 3);
-        // wgnat peer carries the routes.
+        // burrow peer carries the routes.
         assert!(server.contents.contains("192.168.1.0/24"));
     }
 
     #[test]
     fn ip_allocation_in_custom_subnet() {
         let subnet = parse_ipv4_cidr("10.50.0.0/24").unwrap();
-        let (server, wgnat, clients) = allocate_ips(&subnet, 2).unwrap();
+        let (server, gateway, clients) = allocate_ips(&subnet, 2).unwrap();
         assert_eq!(server, Ipv4Addr::new(10, 50, 0, 1));
-        assert_eq!(wgnat, Ipv4Addr::new(10, 50, 0, 2));
+        assert_eq!(gateway, Ipv4Addr::new(10, 50, 0, 2));
         assert_eq!(clients, vec![
             Ipv4Addr::new(10, 50, 0, 10),
             Ipv4Addr::new(10, 50, 0, 11),
@@ -401,9 +400,9 @@ mod tests {
         // Caller passes "10.0.0.50/24" — we still allocate .1/.2/.10..
         // relative to the network (10.0.0.0), not the configured address.
         let subnet = parse_ipv4_cidr("10.0.0.50/24").unwrap();
-        let (server, wgnat, clients) = allocate_ips(&subnet, 1).unwrap();
+        let (server, gateway, clients) = allocate_ips(&subnet, 1).unwrap();
         assert_eq!(server, Ipv4Addr::new(10, 0, 0, 1));
-        assert_eq!(wgnat, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(gateway, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(clients, vec![Ipv4Addr::new(10, 0, 0, 10)]);
     }
 
@@ -464,11 +463,9 @@ mod tests {
         };
         let out = generate(&p).unwrap();
         let server = out.iter().find(|c| c.filename == "server.conf").unwrap();
-        // Both routes ride along with wgnat's [Peer] AllowedIPs.
         assert!(server.contents.contains("192.168.1.0/24"));
         assert!(server.contents.contains("10.50.0.0/24"));
         let client = out.iter().find(|c| c.filename == "client1.conf").unwrap();
-        // Client's AllowedIPs = subnet + each route.
         assert!(client.contents.contains("192.168.1.0/24"));
         assert!(client.contents.contains("10.50.0.0/24"));
     }
@@ -481,11 +478,8 @@ mod tests {
         };
         let out = generate(&p).unwrap();
         let server = out.iter().find(|c| c.filename == "server.conf").unwrap();
-        // wgnat peer's AllowedIPs is bare `wgnat_ip/32` with no
-        // trailing comma.
         assert!(server.contents.contains("AllowedIPs = 10.0.0.2/32\n"));
         let client = out.iter().find(|c| c.filename == "client1.conf").unwrap();
-        // Client's AllowedIPs is just the subnet, no trailing comma.
         assert!(client.contents.contains("AllowedIPs = 10.0.0.0/24\n"));
     }
 
@@ -494,7 +488,6 @@ mod tests {
         let mut p = default_params();
         p.clients = 2;
         let out = generate(&p).unwrap();
-        // Pull the PrivateKey lines and assert all four are unique.
         let keys: Vec<&str> = out
             .iter()
             .filter_map(|c| {
@@ -504,7 +497,7 @@ mod tests {
                     .map(|l| l.trim_start_matches("PrivateKey = "))
             })
             .collect();
-        assert_eq!(keys.len(), 4); // server, wgnat, 2 clients
+        assert_eq!(keys.len(), 4); // server, gateway, 2 clients
         let mut sorted = keys.clone();
         sorted.sort();
         sorted.dedup();

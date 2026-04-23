@@ -15,12 +15,12 @@ use std::net::Ipv4Addr;
 
 use tokio::sync::mpsc;
 
-use wgnat::icmp::{
+use burrow::icmp::{
     send_dest_unreachable, ICMP_CODE_ADMIN_PROHIBITED, ICMP_CODE_HOST_UNREACHABLE,
     ICMP_CODE_NET_UNREACHABLE,
 };
-use wgnat::probe::{classify_connect_error, ConnectClass};
-use wgnat::rewrite::{parse_5tuple, PROTO_ICMP, PROTO_TCP};
+use burrow::probe::{classify_connect_error, ConnectClass};
+use burrow::rewrite::{parse_5tuple, PROTO_ICMP, PROTO_TCP};
 
 fn synthetic_os_error(code: i32) -> io::Error {
     io::Error::from_raw_os_error(code)

@@ -1,8 +1,8 @@
 [package]
-name = "wgnat"
+name = "burrow"
 version = "0.1.0"
 edition = "2021"
-description = "WireGuard userspace NAT gateway - no TUN, no kernel drivers"
+description = "WireGuard userspace gateway - no TUN, no kernel drivers"
 license = "BSD-3-Clause"
 
 [dependencies]
@@ -21,38 +21,38 @@ serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
 hickory-proto = { version = "0.24", default-features = false }
 # Multiplexed substreams over the control flow for client-originated
-# reverse tunnels (TCP + UDP). One wgnat-client process holds one
+# reverse tunnels (TCP + UDP). One burrow-client process holds one
 # yamux connection per tunnel; the server opens an outbound substream
 # per incoming peer flow.
 yamux = "0.13"
 futures = "0.3"
 # Bridge yamux's `futures::io::AsyncRead/Write` to tokio's equivalents.
 tokio-util = { version = "0.7", features = ["compat"] }
-# Phase 17b interactive shell: community fork of portable-pty with the
-# modern Windows ConPTY flags (PSEUDOCONSOLE_RESIZE_QUIRK,
-# WIN32_INPUT_MODE, PASSTHROUGH_MODE) that upstream portable-pty is
-# missing. Cross-platform (Unix forkpty + Win ConPTY).
+# Interactive shell: community fork of portable-pty with the modern
+# Windows ConPTY flags (PSEUDOCONSOLE_RESIZE_QUIRK, WIN32_INPUT_MODE,
+# PASSTHROUGH_MODE) that upstream portable-pty is missing.
+# Cross-platform (Unix forkpty + Win ConPTY).
 portable-pty = { package = "portable-pty-psmux", version = "0.9" }
 # Client-side raw terminal + window-resize events.
 crossterm = "0.28"
 
 [[bin]]
-name = "wgnat"
+name = "burrow"
 path = "src/main.rs"
 
 [[bin]]
-name = "wgnat-client"
-path = "src/bin/wgnat-client.rs"
+name = "burrow-client"
+path = "src/bin/burrow-client.rs"
 
 [features]
-# Bake the wg-quick config at $WGNAT_EMBEDDED_CONFIG into the binary as a
-# `&'static str`, so `wgnat run` works without `--config`. Intended for
+# Bake the wg-quick config at $BURROW_EMBEDDED_CONFIG into the binary as a
+# `&'static str`, so `burrow run` works without `--config`. Intended for
 # "build once, deploy one self-contained binary" workflows. The PrivateKey
 # ends up in the binary's read-only data segment — anyone with read access
 # to the binary can extract it via `strings`, so don't ship the resulting
 # binary to anyone you wouldn't trust with the .conf itself.
 #
-# Build with: `WGNAT_EMBEDDED_CONFIG=./deploy.conf cargo build --release \
+# Build with: `BURROW_EMBEDDED_CONFIG=./deploy.conf cargo build --release \
 #                  --features embedded-config`
 embedded-config = []
 

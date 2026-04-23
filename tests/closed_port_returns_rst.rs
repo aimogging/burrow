@@ -2,7 +2,7 @@
 //! destination fails, the gateway must synthesize a TCP RST in userspace
 //! and tunnel it back to the peer — never let smoltcp answer the SYN with
 //! a SYN-ACK. Pre-fix nmap saw closed ports as `open` because smoltcp
-//! optimistically completed the 3-way handshake before wgnat even tried
+//! optimistically completed the 3-way handshake before burrow even tried
 //! to connect.
 //!
 //! `connect_probe` itself lives in the binary (`src/main.rs`), so this
@@ -21,8 +21,8 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
-use wgnat::nat::{NatKey, NatTable};
-use wgnat::rewrite::{build_tcp_rst, parse_5tuple, PROTO_TCP};
+use burrow::nat::{NatKey, NatTable};
+use burrow::rewrite::{build_tcp_rst, parse_5tuple, PROTO_TCP};
 
 #[tokio::test]
 async fn probe_failure_synthesizes_rst_and_releases_slot() {
