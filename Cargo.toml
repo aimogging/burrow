@@ -77,6 +77,13 @@ tempfile = "3"
 # (optionally) `embedded-config` for a self-contained binary that emits
 # nothing on stdout/stderr. `panic = "abort"` removes unwind tables —
 # panics become immediate process exit instead of stack unwind.
+#
+# Source paths (from `unwrap`/`expect`/`assert!` panic locations) leak
+# the build user's home dir + cargo registry hash if compiled vanilla.
+# The `embed` justfile recipe sets RUSTFLAGS with `--remap-path-prefix`
+# entries that rewrite those to short labels (`cargo`, `deps`, `src`).
+# `trim-paths = "all"` would do this for free at the profile level but
+# still requires nightly cargo as of 1.95.
 [profile.min]
 inherits = "release"
 opt-level = "z"

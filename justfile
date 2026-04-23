@@ -47,22 +47,44 @@ release TARGET=target:
     cargo build --release {{ if TARGET == "" { "" } else { "--target " + TARGET } }}
 
 # Min-sized silent burrow with CONFIG embedded, plus matching burrow-client.
+#
+# Computes RUSTFLAGS with `--remap-path-prefix` entries so that source
+# paths embedded in panic strings (from `unwrap`/`expect`/`assert!` in
+# any crate) don't leak the build user's home dir, the cargo registry
+# hash, or the working-directory layout. `cargo` and `deps` and `src`
+# replace the real prefixes.
 [unix]
 embed CONFIG TARGET=target:
     #!/usr/bin/env bash
     set -eu
+    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+    rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+    repo="$(pwd)"
+    registry_src="$(find "$cargo_home/registry/src" -maxdepth 1 -type d -name 'index.crates.io-*' 2>/dev/null | head -1)"
+    remap="--remap-path-prefix=$repo=src --remap-path-prefix=$cargo_home=cargo --remap-path-prefix=$rustup_home=rustup"
+    if [ -n "$registry_src" ]; then
+        remap="$remap --remap-path-prefix=$registry_src=deps"
+    fi
     target_flag=""
     if [ -n "{{TARGET}}" ]; then
         target_flag="--target {{TARGET}}"
     fi
-    BURROW_EMBEDDED_CONFIG="$(realpath '{{CONFIG}}')" \
+    BURROW_EMBEDDED_CONFIG="$(realpath '{{CONFIG}}')" RUSTFLAGS="$remap" \
         cargo build --bin burrow --profile min \
         --features embedded-config,silent $target_flag
-    cargo build --bin burrow-client --profile min --features silent $target_flag
+    RUSTFLAGS="$remap" \
+        cargo build --bin burrow-client --profile min --features silent $target_flag
 
 # Min-sized silent burrow with CONFIG embedded, plus matching burrow-client.
 [windows]
 embed CONFIG TARGET=target:
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }; \
+    $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }; \
+    $repo = (Get-Location).Path; \
+    $registrySrc = (Get-ChildItem "$cargoHome\registry\src" -Directory -Filter 'index.crates.io-*' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName; \
+    $remap = "--remap-path-prefix=$repo=src --remap-path-prefix=$cargoHome=cargo --remap-path-prefix=$rustupHome=rustup"; \
+    if ($registrySrc) { $remap = "$remap --remap-path-prefix=$registrySrc=deps" }; \
+    $env:RUSTFLAGS = $remap; \
     $env:BURROW_EMBEDDED_CONFIG = (Resolve-Path '{{CONFIG}}').Path; \
     $t = if ('{{TARGET}}' -eq '') { @() } else { @('--target','{{TARGET}}') }; \
     cargo build --bin burrow --profile min --features embedded-config,silent @t; \
