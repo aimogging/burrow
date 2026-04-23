@@ -21,17 +21,22 @@ a DNS resolver, and a remote shell over one control channel.
 Built on [boringtun](https://github.com/cloudflare/boringtun) and
 [smoltcp](https://github.com/smoltcp-rs/smoltcp).
 
+Forward direction (the NAT gateway role):
+
+```mermaid
+flowchart LR
+    peer([peer]) -->|WireGuard| wg([WG server])
+    wg -->|AllowedIPs route| burrow([burrow])
+    burrow -->|real OS sockets<br/>MASQUERADEd| lan([internal hosts])
 ```
-[peer]                          [anyone with net access]
-  | WireGuard                     | TCP/UDP
-  v                               v
-[WG server]                     [burrow host]:LISTEN  <- reverse tunnels land here
-  | AllowedIPs                   |
-  v                              | yamux substream over WG
-[burrow]  -- real OS sockets --> | (to the client that `tunnel start`ed)
-  |
-  v
-[LAN hosts]                     [client]:forward_to   <- originated locally
+
+Reverse direction (SSH `-R`-style tunnels):
+
+```mermaid
+flowchart LR
+    caller([anyone with network<br/>access to burrow]) -->|TCP/UDP| listener[["burrow host<br/>:LISTEN"]]
+    listener -. "yamux substream<br/>over the WG control flow" .-> client([burrow-client<br/>holding the tunnel open])
+    client -->|originates locally| forward_to([forward_to<br/>HOST:PORT])
 ```
 
 ## Quick start
