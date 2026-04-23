@@ -7,7 +7,7 @@
 //!
 //! Lifetime: registrations are fire-and-forget — the registering client
 //! disconnects immediately after the `Ok` response. Registrations persist
-//! until `UnregisterReverse` or wgnat restart. There's no automatic reap
+//! until `StopReverse` or wgnat restart. There's no automatic reap
 //! in Phase 13; `ttl` is reserved as a follow-up.
 
 use std::collections::HashMap;
@@ -46,17 +46,17 @@ struct Inner {
     /// enforced here (collision check on insert).
     by_port: HashMap<(Proto, u16), RegEntry>,
     /// Secondary index: tunnel_id → (proto, listen_port). Lets
-    /// `unregister` find the primary entry without a linear scan.
+    /// `stop` find the primary entry without a linear scan.
     by_id: HashMap<TunnelId, (Proto, u16)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum RegisterError {
+pub enum StartError {
     PortInUse,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum UnregisterError {
+pub enum StopError {
     UnknownTunnel,
 }
 
@@ -73,15 +73,15 @@ impl ReverseRegistry {
         }
     }
 
-    pub fn register(
+    pub fn start(
         &self,
         proto: Proto,
         listen_port: u16,
         forward_to: SocketAddrV4,
-    ) -> Result<TunnelId, RegisterError> {
+    ) -> Result<TunnelId, StartError> {
         let mut inner = self.inner.lock().unwrap();
         if inner.by_port.contains_key(&(proto, listen_port)) {
-            return Err(RegisterError::PortInUse);
+            return Err(StartError::PortInUse);
         }
         let tunnel_id = TunnelId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let entry = RegEntry {
@@ -95,10 +95,10 @@ impl ReverseRegistry {
         Ok(tunnel_id)
     }
 
-    pub fn unregister(&self, tunnel_id: TunnelId) -> Result<(), UnregisterError> {
+    pub fn stop(&self, tunnel_id: TunnelId) -> Result<(), StopError> {
         let mut inner = self.inner.lock().unwrap();
         let Some(key) = inner.by_id.remove(&tunnel_id) else {
-            return Err(UnregisterError::UnknownTunnel);
+            return Err(StopError::UnknownTunnel);
         };
         inner.by_port.remove(&key);
         Ok(())
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn register_and_lookup_roundtrip() {
         let reg = ReverseRegistry::new();
-        let id = reg.register(Proto::Tcp, 8080, sa(9000)).unwrap();
+        let id = reg.start(Proto::Tcp, 8080, sa(9000)).unwrap();
         let entry = reg.lookup(Proto::Tcp, 8080).unwrap();
         assert_eq!(entry.tunnel_id, id);
         assert_eq!(entry.forward_to, sa(9000));
@@ -161,18 +161,18 @@ mod tests {
     #[test]
     fn port_collision_rejected() {
         let reg = ReverseRegistry::new();
-        reg.register(Proto::Tcp, 443, sa(443)).unwrap();
-        let err = reg.register(Proto::Tcp, 443, sa(8443));
-        assert_eq!(err, Err(RegisterError::PortInUse));
+        reg.start(Proto::Tcp, 443, sa(443)).unwrap();
+        let err = reg.start(Proto::Tcp, 443, sa(8443));
+        assert_eq!(err, Err(StartError::PortInUse));
     }
 
     #[test]
     fn unregister_frees_port() {
         let reg = ReverseRegistry::new();
-        let id = reg.register(Proto::Tcp, 8080, sa(9000)).unwrap();
-        reg.unregister(id).unwrap();
+        let id = reg.start(Proto::Tcp, 8080, sa(9000)).unwrap();
+        reg.stop(id).unwrap();
         // Now a fresh register should succeed.
-        reg.register(Proto::Tcp, 8080, sa(9001)).unwrap();
+        reg.start(Proto::Tcp, 8080, sa(9001)).unwrap();
         let entry = reg.lookup(Proto::Tcp, 8080).unwrap();
         assert_eq!(entry.forward_to, sa(9001));
     }
@@ -180,16 +180,16 @@ mod tests {
     #[test]
     fn unregister_unknown_errors() {
         let reg = ReverseRegistry::new();
-        let err = reg.unregister(TunnelId(999));
-        assert_eq!(err, Err(UnregisterError::UnknownTunnel));
+        let err = reg.stop(TunnelId(999));
+        assert_eq!(err, Err(StopError::UnknownTunnel));
     }
 
     #[test]
     fn list_returns_all_entries() {
         let reg = ReverseRegistry::new();
-        reg.register(Proto::Tcp, 80, sa(80)).unwrap();
-        reg.register(Proto::Tcp, 443, sa(443)).unwrap();
-        reg.register(Proto::Udp, 53, sa(53)).unwrap();
+        reg.start(Proto::Tcp, 80, sa(80)).unwrap();
+        reg.start(Proto::Tcp, 443, sa(443)).unwrap();
+        reg.start(Proto::Udp, 53, sa(53)).unwrap();
         let list = reg.list();
         assert_eq!(list.len(), 3);
     }
@@ -197,8 +197,8 @@ mod tests {
     #[test]
     fn tunnel_ids_are_unique() {
         let reg = ReverseRegistry::new();
-        let a = reg.register(Proto::Tcp, 1, sa(1)).unwrap();
-        let b = reg.register(Proto::Tcp, 2, sa(2)).unwrap();
+        let a = reg.start(Proto::Tcp, 1, sa(1)).unwrap();
+        let b = reg.start(Proto::Tcp, 2, sa(2)).unwrap();
         assert_ne!(a, b);
     }
 }

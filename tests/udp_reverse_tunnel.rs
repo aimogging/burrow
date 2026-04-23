@@ -31,7 +31,7 @@ async fn udp_reverse_forward_and_reply() {
     let registry = Arc::new(ReverseRegistry::new());
     let state = Arc::new(UdpReverseState::new());
     registry
-        .register(
+        .start(
             Proto::Udp,
             LISTEN_PORT,
             SocketAddrV4::new(FORWARD_IP, FORWARD_PORT),

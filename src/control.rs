@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::nat::NatKey;
 use crate::proxy::ProxyMsg;
-use crate::reverse_registry::{RegisterError, ReverseRegistry, UnregisterError};
+use crate::reverse_registry::{ReverseRegistry, StartError, StopError};
 use crate::rewrite::PROTO_TCP;
 use crate::runtime::{ConnectionId, SmoltcpHandle};
 use crate::shell_handler::{handle_shell_request, run_interactive};
@@ -133,17 +133,17 @@ async fn handle_request(
     wg_ip: Ipv4Addr,
 ) -> ServerResp {
     match req {
-        ClientReq::RegisterReverse {
+        ClientReq::StartReverse {
             proto,
             listen_port,
             forward_to,
         } => {
-            let tunnel_id = match registry.register(proto, listen_port, forward_to) {
+            let tunnel_id = match registry.start(proto, listen_port, forward_to) {
                 Ok(id) => id,
-                Err(RegisterError::PortInUse) => {
+                Err(StartError::PortInUse) => {
                     return ServerResp::Error {
                         kind: ErrorKind::PortInUse,
-                        msg: format!("port {listen_port}/{proto:?} already registered"),
+                        msg: format!("port {listen_port}/{proto:?} already started"),
                     }
                 }
             };
@@ -154,7 +154,7 @@ async fn handle_request(
             if matches!(proto, Proto::Tcp) {
                 let lk = listener_key(wg_ip, listen_port);
                 if smoltcp.ensure_listener(wg_ip, listen_port, lk).await.is_err() {
-                    let _ = registry.unregister(tunnel_id);
+                    let _ = registry.stop(tunnel_id);
                     return ServerResp::Error {
                         kind: ErrorKind::Internal,
                         msg: "failed to create listener".into(),
@@ -166,16 +166,16 @@ async fn handle_request(
                 listen_port,
                 ?forward_to,
                 ?tunnel_id,
-                "reverse tunnel registered"
+                "reverse tunnel started"
             );
-            ServerResp::Ok { tunnel_id }
+            ServerResp::Started { tunnel_id }
         }
-        ClientReq::UnregisterReverse { tunnel_id } => match registry.unregister(tunnel_id) {
+        ClientReq::StopReverse { tunnel_id } => match registry.stop(tunnel_id) {
             Ok(()) => {
-                tracing::info!(?tunnel_id, "reverse tunnel unregistered");
-                ServerResp::Unregistered
+                tracing::info!(?tunnel_id, "reverse tunnel stopped");
+                ServerResp::Stopped
             }
-            Err(UnregisterError::UnknownTunnel) => ServerResp::Error {
+            Err(StopError::UnknownTunnel) => ServerResp::Error {
                 kind: ErrorKind::UnknownTunnel,
                 msg: format!("tunnel {tunnel_id:?} not found"),
             },

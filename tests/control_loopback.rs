@@ -223,8 +223,8 @@ async fn control_register_roundtrip() {
     // 3. Complete handshake with a pure ACK.
     runtime.enqueue_inbound(peer.ack_only());
 
-    // 4. Send the CBOR RegisterReverse frame.
-    let req = ClientReq::RegisterReverse {
+    // 4. Send the CBOR StartReverse frame.
+    let req = ClientReq::StartReverse {
         proto: Proto::Tcp,
         listen_port: 8080,
         forward_to: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 9000),
@@ -274,7 +274,7 @@ async fn control_register_roundtrip() {
     // 6. Decode the CBOR response.
     let resp: ServerResp = ciborium::de::from_reader(&resp_bytes[4..]).unwrap();
     let tunnel_id = match resp {
-        ServerResp::Ok { tunnel_id } => tunnel_id,
+        ServerResp::Started { tunnel_id } => tunnel_id,
         other => panic!("expected Ok{{tunnel_id}}, got {other:?}"),
     };
 

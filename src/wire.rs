@@ -17,7 +17,7 @@
 //! ## TunnelId opacity
 //!
 //! `TunnelId` is a plain wrapper around `u64` — server-assigned, client
-//! stores it only so it can `UnregisterReverse`. Clients MUST NOT
+//! stores it only so it can `StopReverse`. Clients MUST NOT
 //! interpret the value; format/layout is unspecified and may change.
 //!
 //! ## Frame-size cap
@@ -45,7 +45,7 @@ pub enum Proto {
 }
 
 /// Server-assigned opaque handle. Clients pass it back for
-/// `UnregisterReverse`. Server chooses the allocation scheme.
+/// `StopReverse`. Server chooses the allocation scheme.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TunnelId(pub u64);
 
@@ -90,12 +90,12 @@ pub enum ShellMode {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientReq {
-    RegisterReverse {
+    StartReverse {
         proto: Proto,
         listen_port: u16,
         forward_to: SocketAddrV4,
     },
-    UnregisterReverse {
+    StopReverse {
         tunnel_id: TunnelId,
     },
     ListReverse,
@@ -112,8 +112,8 @@ pub enum ClientReq {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ServerResp {
-    Ok { tunnel_id: TunnelId },
-    Unregistered,
+    Started { tunnel_id: TunnelId },
+    Stopped,
     ReverseList(Vec<ReverseEntry>),
     /// Response for `ShellMode::Oneshot`. `exit_code` is `None` if the
     /// process was terminated by a signal (Unix) or stopped via an
@@ -183,9 +183,9 @@ mod tests {
     use tokio::io::duplex;
 
     #[tokio::test]
-    async fn roundtrip_register_reverse() {
+    async fn roundtrip_start_reverse() {
         let (mut a, mut b) = duplex(4096);
-        let req = ClientReq::RegisterReverse {
+        let req = ClientReq::StartReverse {
             proto: Proto::Tcp,
             listen_port: 8080,
             forward_to: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000),
@@ -193,7 +193,7 @@ mod tests {
         write_frame(&mut a, &req).await.unwrap();
         let got: ClientReq = read_frame(&mut b).await.unwrap();
         match got {
-            ClientReq::RegisterReverse {
+            ClientReq::StartReverse {
                 proto,
                 listen_port,
                 forward_to,

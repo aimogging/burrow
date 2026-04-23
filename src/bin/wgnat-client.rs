@@ -56,8 +56,8 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum TunnelCmd {
-    /// Register a reverse tunnel. Syntax: `-R LISTEN:HOST:PORT`.
-    Register {
+    /// Start a reverse tunnel. Syntax: `-R LISTEN:HOST:PORT`.
+    Start {
         /// `LISTEN:HOST:PORT` — peers hit `wg_ip:LISTEN`, wgnat
         /// forwards to `HOST:PORT`. Default protocol is TCP.
         #[arg(short = 'R', value_name = "LISTEN:HOST:PORT")]
@@ -66,8 +66,8 @@ enum TunnelCmd {
         #[arg(short = 'U', long)]
         udp: bool,
     },
-    /// Remove a previously-registered tunnel by id.
-    Unregister { tunnel_id: u64 },
+    /// Stop a previously-started tunnel by id.
+    Stop { tunnel_id: u64 },
     /// List active reverse tunnels.
     List,
 }
@@ -138,38 +138,38 @@ async fn connect_control(addr: SocketAddrV4) -> Result<TcpStream> {
 
 async fn run_tunnel(addr: SocketAddrV4, action: TunnelCmd) -> Result<ExitCode> {
     match action {
-        TunnelCmd::Register { spec, udp } => {
+        TunnelCmd::Start { spec, udp } => {
             let (listen_port, forward_to) = parse_r_spec(&spec)?;
-            let req = ClientReq::RegisterReverse {
+            let req = ClientReq::StartReverse {
                 proto: if udp { Proto::Udp } else { Proto::Tcp },
                 listen_port,
                 forward_to,
             };
             let resp = one_shot_request(addr, &req).await?;
             match resp {
-                ServerResp::Ok { tunnel_id } => {
+                ServerResp::Started { tunnel_id } => {
                     println!("{}", tunnel_id.0);
                     Ok(ExitCode::SUCCESS)
                 }
                 ServerResp::Error { kind, msg } => {
-                    eprintln!("register failed: {kind:?}: {msg}");
+                    eprintln!("tunnel start failed: {kind:?}: {msg}");
                     Ok(ExitCode::from(2))
                 }
                 other => bail!("unexpected response: {other:?}"),
             }
         }
-        TunnelCmd::Unregister { tunnel_id } => {
-            let req = ClientReq::UnregisterReverse {
+        TunnelCmd::Stop { tunnel_id } => {
+            let req = ClientReq::StopReverse {
                 tunnel_id: TunnelId(tunnel_id),
             };
             let resp = one_shot_request(addr, &req).await?;
             match resp {
-                ServerResp::Unregistered => {
-                    println!("unregistered {tunnel_id}");
+                ServerResp::Stopped => {
+                    println!("stopped {tunnel_id}");
                     Ok(ExitCode::SUCCESS)
                 }
                 ServerResp::Error { kind, msg } => {
-                    eprintln!("unregister failed: {kind:?}: {msg}");
+                    eprintln!("tunnel stop failed: {kind:?}: {msg}");
                     Ok(ExitCode::from(2))
                 }
                 other => bail!("unexpected response: {other:?}"),

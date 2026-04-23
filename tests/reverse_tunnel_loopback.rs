@@ -5,7 +5,7 @@
 //! packets are demuxed by destination IP.
 //!
 //! Flow:
-//!   1. Control peer registers the tunnel via CBOR `RegisterReverse`.
+//!   1. Control peer registers the tunnel via CBOR `StartReverse`.
 //!   2. Incoming peer does a TCP handshake to `(wg_ip, 8080)`.
 //!   3. Bridge opens an outbound smoltcp flow to `(responder_ip, 9000)`
 //!      with `src = wg_ip`.
@@ -248,8 +248,8 @@ async fn reverse_tunnel_end_to_end() {
     ctrl.ack = synack.seq.wrapping_add(1);
     runtime.enqueue_inbound(ctrl.ack_only());
 
-    // Send RegisterReverse.
-    let req = ClientReq::RegisterReverse {
+    // Send StartReverse.
+    let req = ClientReq::StartReverse {
         proto: Proto::Tcp,
         listen_port: TUNNEL_LISTEN_PORT,
         forward_to: SocketAddrV4::new(RESPONDER_IP, RESPONDER_PORT),
@@ -283,7 +283,7 @@ async fn reverse_tunnel_end_to_end() {
     }
     let resp: ServerResp = ciborium::de::from_reader(&resp_bytes[4..]).unwrap();
     match resp {
-        ServerResp::Ok { .. } => (),
+        ServerResp::Started { .. } => (),
         other => panic!("expected Ok, got {other:?}"),
     }
 

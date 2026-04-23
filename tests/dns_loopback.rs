@@ -83,7 +83,7 @@ async fn dns_disabled_passes_port_53_to_reverse_registry() {
     let registry = Arc::new(ReverseRegistry::new());
     let state = Arc::new(UdpReverseState::new());
     registry
-        .register(
+        .start(
             Proto::Udp,
             53,
             SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 5353),
@@ -111,7 +111,7 @@ async fn reverse_tunnel_on_port_53_overrides_dns_even_when_enabled() {
     let registry = Arc::new(ReverseRegistry::new());
     let state = Arc::new(UdpReverseState::new());
     registry
-        .register(
+        .start(
             Proto::Udp,
             53,
             SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 5353),

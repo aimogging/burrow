@@ -57,7 +57,7 @@ async fn tunnel_register_prints_tunnel_id_and_exits_zero() {
     let server = tokio::spawn(async move {
         handle_one(&listener, |req| {
             match req {
-                ClientReq::RegisterReverse {
+                ClientReq::StartReverse {
                     proto,
                     listen_port,
                     forward_to,
@@ -69,9 +69,9 @@ async fn tunnel_register_prints_tunnel_id_and_exits_zero() {
                         SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 9000)
                     );
                 }
-                other => panic!("expected RegisterReverse, got {other:?}"),
+                other => panic!("expected StartReverse, got {other:?}"),
             }
-            ServerResp::Ok {
+            ServerResp::Started {
                 tunnel_id: TunnelId(42),
             }
         })
@@ -89,7 +89,7 @@ async fn tunnel_register_prints_tunnel_id_and_exits_zero() {
                     "--control-port",
                     &port,
                     "tunnel",
-                    "register",
+                    "start",
                     "-R",
                     "8080:127.0.0.1:9000",
                 ])
@@ -119,13 +119,13 @@ async fn tunnel_register_udp_flag_sets_proto() {
 
     let server = tokio::spawn(async move {
         handle_one(&listener, |req| match req {
-            ClientReq::RegisterReverse { proto, .. } => {
+            ClientReq::StartReverse { proto, .. } => {
                 assert_eq!(proto, Proto::Udp);
-                ServerResp::Ok {
+                ServerResp::Started {
                     tunnel_id: TunnelId(7),
                 }
             }
-            other => panic!("expected RegisterReverse, got {other:?}"),
+            other => panic!("expected StartReverse, got {other:?}"),
         })
         .await;
     });
@@ -141,7 +141,7 @@ async fn tunnel_register_udp_flag_sets_proto() {
                     "--control-port",
                     &port,
                     "tunnel",
-                    "register",
+                    "start",
                     "-U",
                     "-R",
                     "53:127.0.0.1:53",
