@@ -43,6 +43,12 @@ pub struct GenParams {
     /// peer-to-peer WG with no subnet exposure — clients can still use
     /// wgnat's DNS / reverse-tunnel services.
     pub routes: Vec<String>,
+    /// DNS resolvers to write into each client's `[Interface]` as
+    /// `DNS = ...`. Empty (the default) means no `DNS =` line —
+    /// clients keep their system resolver. Pass wgnat's WG IP to opt
+    /// clients into wgnat's built-in resolver; append public
+    /// resolvers (e.g. `1.1.1.1`) if you want wg-quick fallback.
+    pub dns: Vec<String>,
     /// WG network subnet (e.g. `10.0.0.0/24`). Must have room for
     /// `.1`, `.2`, and `.10..=.(10 + clients - 1)`.
     pub subnet: Ipv4Cidr,
@@ -60,6 +66,7 @@ impl Default for GenParams {
         Self {
             endpoint: String::new(),
             routes: Vec::new(),
+            dns: Vec::new(),
             subnet: Ipv4Cidr::new(Ipv4Addr::new(10, 0, 0, 0), 24),
             clients: 1,
             listen_port: 51820,
@@ -119,15 +126,7 @@ pub fn generate(params: &GenParams) -> Result<Vec<GeneratedConfig>> {
     for (i, c) in clients.iter().enumerate() {
         out.push(GeneratedConfig {
             filename: format!("client{}.conf", i + 1),
-            contents: build_client_conf(
-                params,
-                c,
-                client_ips[i],
-                wgnat_ip,
-                &server,
-                &routes_suffix,
-                prefix,
-            ),
+            contents: build_client_conf(params, c, client_ips[i], &server, &routes_suffix, prefix),
         });
     }
     Ok(out)
@@ -198,20 +197,24 @@ fn build_client_conf(
     params: &GenParams,
     client: &Keypair,
     client_ip: Ipv4Addr,
-    wgnat_ip: Ipv4Addr,
     server: &Keypair,
     routes_suffix: &str,
     prefix: u8,
 ) -> String {
-    // `DNS = wgnat_ip` tells wg-quick to point the peer's resolver at
-    // wgnat's built-in DNS service while the tunnel is up. Works on
-    // Linux/macOS via resolvconf and on Windows via the official
-    // WireGuard client.
+    // `DNS = ...` is wg-quick's hook for flipping the peer's system
+    // resolver while the tunnel is up (resolvconf on Linux/macOS, the
+    // official WireGuard client on Windows). Emit it only if the user
+    // explicitly asked — silent DNS rerouting is surprising.
+    let dns_line = if params.dns.is_empty() {
+        String::new()
+    } else {
+        format!("DNS = {}\n", params.dns.join(", "))
+    };
     format!(
         "[Interface]\n\
          PrivateKey = {}\n\
          Address = {}/{}\n\
-         DNS = {}\n\
+         {}\
          \n\
          [Peer]\n\
          PublicKey = {}\n\
@@ -221,7 +224,7 @@ fn build_client_conf(
         client.private,
         client_ip,
         prefix,
-        wgnat_ip,
+        dns_line,
         server.public,
         params.endpoint,
         params.subnet.network().address(),
@@ -417,14 +420,57 @@ mod tests {
     }
 
     #[test]
-    fn client_conf_points_dns_at_wgnat() {
+    fn client_conf_has_no_dns_by_default() {
         let out = generate(&default_params()).unwrap();
         let client = out.iter().find(|c| c.filename == "client1.conf").unwrap();
         assert!(
-            client.contents.contains("DNS = 10.0.0.2\n"),
-            "client.conf must set DNS to wgnat_ip; got:\n{}",
+            !client.contents.contains("DNS ="),
+            "default gen must not emit a DNS line; got:\n{}",
             client.contents
         );
+    }
+
+    #[test]
+    fn client_conf_emits_dns_line_when_requested() {
+        let mut p = default_params();
+        p.dns = vec!["10.0.0.2".into()];
+        let out = generate(&p).unwrap();
+        let client = out.iter().find(|c| c.filename == "client1.conf").unwrap();
+        assert!(
+            client.contents.contains("DNS = 10.0.0.2\n"),
+            "expected `DNS = 10.0.0.2`, got:\n{}",
+            client.contents
+        );
+    }
+
+    #[test]
+    fn client_conf_joins_multiple_dns_servers() {
+        let mut p = default_params();
+        p.dns = vec!["10.0.0.2".into(), "1.1.1.1".into(), "9.9.9.9".into()];
+        let out = generate(&p).unwrap();
+        let client = out.iter().find(|c| c.filename == "client1.conf").unwrap();
+        assert!(
+            client.contents.contains("DNS = 10.0.0.2, 1.1.1.1, 9.9.9.9\n"),
+            "expected comma-joined DNS list, got:\n{}",
+            client.contents
+        );
+    }
+
+    #[test]
+    fn multiple_routes_propagate_to_server_and_clients() {
+        let p = GenParams {
+            routes: vec!["192.168.1.0/24".into(), "10.50.0.0/24".into()],
+            ..default_params()
+        };
+        let out = generate(&p).unwrap();
+        let server = out.iter().find(|c| c.filename == "server.conf").unwrap();
+        // Both routes ride along with wgnat's [Peer] AllowedIPs.
+        assert!(server.contents.contains("192.168.1.0/24"));
+        assert!(server.contents.contains("10.50.0.0/24"));
+        let client = out.iter().find(|c| c.filename == "client1.conf").unwrap();
+        // Client's AllowedIPs = subnet + each route.
+        assert!(client.contents.contains("192.168.1.0/24"));
+        assert!(client.contents.contains("10.50.0.0/24"));
     }
 
     #[test]

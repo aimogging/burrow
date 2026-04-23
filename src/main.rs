@@ -94,9 +94,16 @@ enum Cmd {
         /// WG server's public `ip:port`.
         #[arg(long)]
         endpoint: String,
-        /// Routes (CIDRs) to expose via wgnat. Comma-separated.
+        /// Routes (CIDRs) to expose via wgnat. Comma-separated; pass
+        /// `--routes a,b,c` to expose multiple.
         #[arg(long, value_delimiter = ',', default_value = "")]
         routes: Vec<String>,
+        /// DNS servers to write into each client.conf. Comma-separated.
+        /// Omit (the default) for no `DNS = ` line — clients keep their
+        /// system resolver. Pass the wgnat WG IP (e.g. 10.0.0.2) to opt
+        /// clients into wgnat's built-in resolver.
+        #[arg(long, value_delimiter = ',', default_value = "")]
+        dns: Vec<String>,
         /// WG network subnet. Server=.1, wgnat=.2, clients=.10+.
         #[arg(long, default_value = "10.0.0.0/24")]
         subnet: String,
@@ -122,11 +129,12 @@ async fn main() -> Result<()> {
         Cmd::Gen {
             endpoint,
             routes,
+            dns,
             subnet,
             clients,
             listen_port,
             out,
-        } => return gen_configs(endpoint, routes, subnet, clients, listen_port, out),
+        } => return gen_configs(endpoint, routes, dns, subnet, clients, listen_port, out),
     }
 }
 
@@ -142,6 +150,7 @@ fn keygen() -> Result<()> {
 fn gen_configs(
     endpoint: String,
     routes: Vec<String>,
+    dns: Vec<String>,
     subnet: String,
     clients: u16,
     listen_port: u16,
@@ -152,15 +161,17 @@ fn gen_configs(
 
     // clap's value_delimiter on a String with default_value = "" yields
     // vec![""] rather than empty — filter blanks here.
-    let routes: Vec<String> = routes
-        .into_iter()
-        .filter(|s| !s.trim().is_empty())
-        .collect();
+    let filter_blank = |v: Vec<String>| -> Vec<String> {
+        v.into_iter().filter(|s| !s.trim().is_empty()).collect()
+    };
+    let routes = filter_blank(routes);
+    let dns = filter_blank(dns);
     let subnet = parse_ipv4_cidr(&subnet)
         .with_context(|| format!("invalid --subnet `{subnet}`"))?;
     let params = GenParams {
         endpoint,
         routes,
+        dns,
         subnet,
         clients,
         listen_port,
