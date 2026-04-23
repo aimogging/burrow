@@ -21,22 +21,42 @@ a DNS resolver, and a remote shell over one control channel.
 Built on [boringtun](https://github.com/cloudflare/boringtun) and
 [smoltcp](https://github.com/smoltcp-rs/smoltcp).
 
-Forward direction (the NAT gateway role):
+Three-party setup: a publicly-reachable WG server in the middle, a
+burrow gateway sitting inside some private network, and any number of
+WG peers (your laptop, a VPS, whatever). burrow bridges the WG side to
+the private LAN.
 
 ```mermaid
 flowchart LR
-    peer([peer]) -->|WireGuard| wg([WG server])
-    wg -->|AllowedIPs route| burrow([burrow])
-    burrow -->|real OS sockets<br/>MASQUERADEd| lan([internal hosts])
+    subgraph peers ["WG peers<br/>(anywhere)"]
+        laptop[laptop]
+        vps[VPS]
+    end
+    subgraph pub ["Public internet"]
+        wgs["WG Server<br/>(kernel wireguard)"]
+    end
+    subgraph priv ["Private network<br/>(NAT'd, no inbound)"]
+        burrow["burrow<br/>userspace gateway"]
+        h1[internal host]
+        h2[internal host]
+    end
+    laptop <-->|WireGuard| wgs
+    vps <-->|WireGuard| wgs
+    wgs <-->|WireGuard| burrow
+    burrow --- h1
+    burrow --- h2
 ```
 
-Reverse direction (SSH `-R`-style tunnels):
+Reverse tunnels flip the direction. Any machine on burrow's network
+(WG peer, LAN host, the public internet if burrow is reachable there)
+hits a real OS listener on the burrow host; the connection rides back
+to whichever client called `tunnel start` and is originated locally.
 
 ```mermaid
 flowchart LR
-    caller([anyone with network<br/>access to burrow]) -->|TCP/UDP| listener[["burrow host<br/>:LISTEN"]]
-    listener -. "yamux substream<br/>over the WG control flow" .-> client([burrow-client<br/>holding the tunnel open])
-    client -->|originates locally| forward_to([forward_to<br/>HOST:PORT])
+    caller([anyone with network<br/>access to burrow]) -->|plain TCP/UDP| listener["burrow:LISTEN_PORT"]
+    listener -.->|through the WG mesh| client["burrow-client<br/>(holding the tunnel open)"]
+    client -->|plain TCP/UDP| dst([forward_to])
 ```
 
 ## Quick start
@@ -124,6 +144,17 @@ connections tunnel back here and originate on `forward_to` locally.
 burrow-client tunnel 10.0.0.2 start -R 443:127.0.0.1:8080
 # Hold Ctrl-C to stop — burrow-client holds the control flow open
 # for the tunnel's lifetime.
+```
+
+`HOST` can be a hostname — resolved on the machine running
+`burrow-client` when a connection arrives, using whatever DNS
+the client's system has configured. That includes burrow's built-in
+resolver if `client.conf` set `DNS = 10.0.0.2` (pass `--dns` to
+`burrow-client gen`); otherwise it uses the client's system resolver
+/ `/etc/resolv.conf`.
+
+```sh
+burrow-client tunnel 10.0.0.2 start -R 443:db.internal.example.com:5432
 ```
 
 `-R [BIND:]LISTEN:HOST:PORT` — BIND defaults to `0.0.0.0` (all OS
