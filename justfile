@@ -92,9 +92,6 @@ embed CONFIG TARGET=target:
     cargo build --bin burrow-client --profile min --features silent @t
 
 # Generate the config trio AND build min-sized binaries in one step.
-# `cargo run` is always host-arch (we need the binary that produces the
-# configs to run here); the embed step honors `target` (set via env var
-# BURROW_TARGET or `just target=X gen-embed ...`).
 gen-embed *GEN_ARGS:
     cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs
     @just embed ./burrow-configs/burrow.conf {{target}}
@@ -130,6 +127,14 @@ fmt:
 # Wipe build artifacts.
 clean:
     cargo clean
+
+# Bring a WG server up on a remote Linux host inside a netns.
+deploy-server *ARGS:
+    bash scripts/deploy-server.sh {{ARGS}}
+
+# Bring a WG client up on a remote Linux host inside a netns.
+deploy-client *ARGS:
+    bash scripts/deploy-client.sh {{ARGS}}
 
 # List sizes of built burrow / burrow-client binaries across profiles.
 [unix]

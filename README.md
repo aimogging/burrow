@@ -32,6 +32,7 @@ only) and [smoltcp](https://github.com/smoltcp-rs/smoltcp) (userspace TCP/IP).
 - [Commands](#commands)
 - [Examples](#examples)
 - [Deploy: single self-contained binary](#deploy-single-self-contained-binary)
+- [Remote deploy helpers](#remote-deploy-helpers)
 - [Logging](#logging)
 - [How it works](#how-it-works)
 - [Limitations](#limitations)
@@ -148,6 +149,13 @@ sudo wg-quick up ./burrow-configs/client1.conf
 ```
 
 The client can now reach anything in `192.168.1.0/24` through burrow.
+
+For ephemeral / scratch deploys to a remote Linux box, the helper
+scripts in `scripts/` (and matching `just deploy-server` /
+`just deploy-client` recipes) bring up the server or a client inside
+a network namespace, with no systemd unit and no `/etc/wireguard`
+file. State lives in the namespace; teardown or reboot wipes it. See
+[Remote deploy helpers](#remote-deploy-helpers).
 
 ## Install
 
@@ -351,6 +359,50 @@ The resulting binary contains the config as a `&'static str` in its read-only
 data segment, so plain `burrow` works without `--config`. Anyone with read
 access to the binary can extract the PrivateKey via `strings` — do not ship
 this binary to anyone you would not trust with the `.conf` itself.
+
+## Remote deploy helpers
+
+For scratch deploys (a fresh test peer, a one-off staging server, etc.)
+the scripts in `scripts/` push a config to a remote Linux host and
+bring up WireGuard inside a network namespace. State lives in the
+namespace plus a `/tmp/burrow-<ns>.conf`; no systemd unit, no
+`/etc/wireguard` file. Teardown or reboot wipes everything.
+
+```sh
+# Server side. Three target shapes — anything `ssh` accepts:
+just deploy-server --target myhost --config burrow-configs/server.conf
+just deploy-server --target root@1.2.3.4 --config burrow-configs/server.conf --key ~/.ssh/id_ed25519
+just deploy-server --target root@1.2.3.4 --config burrow-configs/server.conf --password hunter2
+
+# Client side. Same shape; routes for [Peer] AllowedIPs are auto-added
+# inside the namespace.
+just deploy-client --target peer1 --config burrow-configs/client1.conf
+
+# Tear down.
+just deploy-server --target root@1.2.3.4 --teardown
+just deploy-client --target peer1 --teardown
+```
+
+The WG UDP socket runs in the host network namespace (so the server is
+publicly reachable / the client can dial the server's public IP); the
+`wg` interface lives in the target namespace. This is the standard
+pattern from <https://www.wireguard.com/netns/>.
+
+After deploy, operate on the remote inside the namespace:
+
+```sh
+ssh root@1.2.3.4 sudo ip netns exec burrow wg show
+ssh root@1.2.3.4 sudo ip netns exec burrow bash      # interactive shell in the netns
+```
+
+Requirements on the remote: `wireguard-tools` + `iproute2` (script
+auto-installs via `apt-get` / `yum` if missing); a sudoer SSH user (or
+log in as root). Requirement on the local side: `ssh` + `scp`, plus
+`sshpass` if you use `--password`.
+
+`--namespace NAME` (default `burrow`) lets you name the netns / wg
+interface. Run multiple isolated instances on the same host by giving
+each a distinct namespace.
 
 ## Logging
 
