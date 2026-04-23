@@ -1,4 +1,5 @@
 pub mod config;
+pub mod config_gen;
 pub mod control;
 pub mod dns_service;
 pub mod icmp;

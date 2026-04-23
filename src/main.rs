@@ -86,6 +86,31 @@ enum Cmd {
     },
     /// Generate an x25519 keypair (base64) for use in a wg-quick config.
     Keygen,
+    /// Generate a ready-to-use trio of configs: server.conf, wgnat.conf,
+    /// clientN.conf. The only required inputs are the WG server's public
+    /// endpoint and (optionally) the routes the wgnat host should expose;
+    /// everything else has a sane default.
+    Gen {
+        /// WG server's public `ip:port`.
+        #[arg(long)]
+        endpoint: String,
+        /// Routes (CIDRs) to expose via wgnat. Comma-separated.
+        #[arg(long, value_delimiter = ',', default_value = "")]
+        routes: Vec<String>,
+        /// WG network subnet. Server=.1, wgnat=.2, clients=.10+.
+        #[arg(long, default_value = "10.0.0.0/24")]
+        subnet: String,
+        /// Number of client peers to generate.
+        #[arg(long, default_value_t = 1)]
+        clients: u16,
+        /// WG server's UDP listen port.
+        #[arg(long, default_value_t = 51820)]
+        listen_port: u16,
+        /// Output directory (created if missing). Existing files are
+        /// overwritten.
+        #[arg(long, default_value = "wgnat-configs")]
+        out: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -94,6 +119,14 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Keygen => return keygen(),
         Cmd::Run { config, endpoint, keepalive } => run(config, endpoint, keepalive).await,
+        Cmd::Gen {
+            endpoint,
+            routes,
+            subnet,
+            clients,
+            listen_port,
+            out,
+        } => return gen_configs(endpoint, routes, subnet, clients, listen_port, out),
     }
 }
 
@@ -104,6 +137,77 @@ fn keygen() -> Result<()> {
     println!("PrivateKey = {}", b64.encode(secret.to_bytes()));
     println!("PublicKey  = {}", b64.encode(public.as_bytes()));
     Ok(())
+}
+
+fn gen_configs(
+    endpoint: String,
+    routes: Vec<String>,
+    subnet: String,
+    clients: u16,
+    listen_port: u16,
+    out_dir: PathBuf,
+) -> Result<()> {
+    use wgnat::config::{parse_ipv4_cidr, DEFAULT_CONTROL_PORT};
+    use wgnat::config_gen::{generate, GenParams};
+
+    // clap's value_delimiter on a String with default_value = "" yields
+    // vec![""] rather than empty — filter blanks here.
+    let routes: Vec<String> = routes
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    let subnet = parse_ipv4_cidr(&subnet)
+        .with_context(|| format!("invalid --subnet `{subnet}`"))?;
+    let params = GenParams {
+        endpoint,
+        routes,
+        subnet,
+        clients,
+        listen_port,
+        control_port: DEFAULT_CONTROL_PORT,
+    };
+    let configs = generate(&params)?;
+
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("failed to create {}", out_dir.display()))?;
+    for c in &configs {
+        let path = out_dir.join(&c.filename);
+        std::fs::write(&path, &c.contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        set_private_file_permissions(&path);
+    }
+
+    println!("wrote {} config(s) to {}:", configs.len(), out_dir.display());
+    for c in &configs {
+        println!("  {}", c.filename);
+    }
+    println!();
+    println!("next:");
+    println!("  server:  wg-quick up ./server.conf   (on the WG server)");
+    println!("  wgnat:   wgnat run --config ./wgnat.conf   (on the NAT host)");
+    if params.clients == 1 {
+        println!("  client:  wg-quick up ./client1.conf   (on the client)");
+    } else {
+        println!(
+            "  clients: wg-quick up ./clientN.conf   (N = 1..{}, one per client machine)",
+            params.clients
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &std::path::Path) {
+    // Windows: NTFS ACLs are the right tool; setting them non-trivially
+    // is out of scope for v1. The files inherit the parent directory's
+    // ACL. Callers handling sensitive keys on Windows should place the
+    // output directory somewhere ACL-restricted.
 }
 
 async fn run(
