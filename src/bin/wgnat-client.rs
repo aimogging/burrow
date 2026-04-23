@@ -15,13 +15,16 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
 use wgnat::config::DEFAULT_CONTROL_PORT;
+use wgnat::shell_protocol as sp;
 use wgnat::wire::{
     read_frame, write_frame, ClientReq, ErrorKind, Proto, ServerResp, ShellMode, TunnelId,
 };
@@ -208,6 +211,11 @@ async fn run_shell(addr: SocketAddrV4, args: ShellArgs) -> Result<ExitCode> {
     } else {
         ShellMode::Oneshot
     };
+    // Interactive takes over the flow after ShellReady. Hand off to a
+    // dedicated handler rather than using the one-shot request helper.
+    if mode == ShellMode::Interactive {
+        return run_shell_interactive(addr, args.program, args.args).await;
+    }
     let req = ClientReq::RequestShell {
         mode,
         program: args.program,
@@ -272,6 +280,254 @@ async fn one_shot_request(addr: SocketAddrV4, req: &ClientReq) -> Result<ServerR
         .map_err(|e| anyhow!("reading response: {e}"))?;
     let _ = stream.shutdown().await;
     Ok(resp)
+}
+
+/// Restore terminal raw mode (and Windows console modes) on scope
+/// exit, including panic unwind. On Windows, crossterm's raw mode
+/// doesn't touch `ENABLE_VIRTUAL_TERMINAL_INPUT` /
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, so arrow keys arrive as
+/// Windows-native console events (which cmd.exe's line editor can't
+/// parse as VT sequences) and PTY-generated ANSI on the way back isn't
+/// processed. We set both flags explicitly and save the prior modes
+/// for restoration.
+struct TermGuard {
+    #[cfg(windows)]
+    prev_stdin_mode: Option<u32>,
+    #[cfg(windows)]
+    prev_stdout_mode: Option<u32>,
+}
+
+impl TermGuard {
+    fn new() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode().context("enable_raw_mode")?;
+        #[cfg(windows)]
+        {
+            let (prev_stdin_mode, prev_stdout_mode) = configure_windows_console();
+            return Ok(Self {
+                prev_stdin_mode,
+                prev_stdout_mode,
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self {})
+        }
+    }
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            restore_windows_console(self.prev_stdin_mode, self.prev_stdout_mode);
+        }
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+#[cfg(windows)]
+fn configure_windows_console() -> (Option<u32>, Option<u32>) {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, DISABLE_NEWLINE_AUTO_RETURN,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+    let (mut prev_in, mut prev_out) = (None, None);
+    unsafe {
+        let h_in = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode: u32 = 0;
+        if !h_in.is_null() && GetConsoleMode(h_in, &mut mode) != 0 {
+            prev_in = Some(mode);
+            let _ = SetConsoleMode(h_in, mode | ENABLE_VIRTUAL_TERMINAL_INPUT);
+        }
+        let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode: u32 = 0;
+        if !h_out.is_null() && GetConsoleMode(h_out, &mut mode) != 0 {
+            prev_out = Some(mode);
+            let _ = SetConsoleMode(
+                h_out,
+                mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN,
+            );
+        }
+    }
+    (prev_in, prev_out)
+}
+
+#[cfg(windows)]
+fn restore_windows_console(prev_stdin: Option<u32>, prev_stdout: Option<u32>) {
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    unsafe {
+        if let Some(m) = prev_stdin {
+            let h = GetStdHandle(STD_INPUT_HANDLE);
+            if !h.is_null() {
+                let _ = SetConsoleMode(h, m);
+            }
+        }
+        if let Some(m) = prev_stdout {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            if !h.is_null() {
+                let _ = SetConsoleMode(h, m);
+            }
+        }
+    }
+}
+
+/// Drive an interactive shell session. After the CBOR request/ShellReady
+/// handshake, the control flow carries the framed stdio protocol in
+/// both directions: STDIN / RESIZE / STDIN_EOF client→server, STDOUT /
+/// EXIT server→client.
+async fn run_shell_interactive(
+    addr: SocketAddrV4,
+    program: Option<String>,
+    cmd_args: Vec<String>,
+) -> Result<ExitCode> {
+    let mut stream = connect_control(addr).await?;
+    let req = ClientReq::RequestShell {
+        mode: ShellMode::Interactive,
+        program,
+        args: cmd_args,
+    };
+    write_frame(&mut stream, &req).await?;
+    let resp: ServerResp = read_frame(&mut stream)
+        .await
+        .map_err(|e| anyhow!("reading ShellReady: {e}"))?;
+    match resp {
+        ServerResp::ShellReady => {}
+        ServerResp::Error { kind, msg } => {
+            eprintln!("interactive shell: {kind:?}: {msg}");
+            return Ok(ExitCode::from(match kind {
+                ErrorKind::NotYetSupported => 3,
+                _ => 2,
+            }));
+        }
+        other => bail!("unexpected response: {other:?}"),
+    }
+
+    // Enable raw mode before we start reading stdin or writing PTY
+    // output. `_guard` restores on drop, including the panic path.
+    let _guard = TermGuard::new()?;
+    // Best-effort: a panic hook that disables raw mode before the
+    // default handler runs, so stack traces print cleanly.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        default_hook(info);
+    }));
+
+    let (mut reader, mut writer) = stream.into_split();
+
+    // Send the initial terminal size so the server sizes the PTY
+    // correctly on the first prompt render.
+    let (cols0, rows0) = crossterm::terminal::size().unwrap_or((80, 24));
+    sp::write_resize(&mut writer, cols0, rows0).await?;
+
+    // Single writer channel: stdin bytes and resize events both funnel
+    // through here so writes to the socket are serialized.
+    enum Out {
+        Stdin(Vec<u8>),
+        Resize(u16, u16),
+        StdinEof,
+    }
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Out>();
+
+    // stdin pump — reads raw bytes from the local terminal and forwards
+    // as STDIN frames. Ends on EOF or error.
+    let stdin_tx = out_tx.clone();
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = vec![0u8; 4096];
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = stdin_tx.send(Out::StdinEof);
+                    break;
+                }
+                Ok(n) => {
+                    if stdin_tx.send(Out::Stdin(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Resize poller — crossterm's EventStream would be the idiomatic
+    // cross-platform path but requires an extra feature. Polling
+    // `terminal::size()` at 200 ms is simpler and works on all targets;
+    // SIGWINCH-driven precision doesn't matter for terminal resize UX.
+    let resize_tx = out_tx.clone();
+    let resize_task = tokio::spawn(async move {
+        let mut last = (cols0, rows0);
+        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            interval.tick().await;
+            match crossterm::terminal::size() {
+                Ok(size) if size != last => {
+                    last = size;
+                    if resize_tx.send(Out::Resize(size.0, size.1)).is_err() {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Writer task: serializes frames to the TCP half.
+    let writer_task = tokio::spawn(async move {
+        while let Some(out) = out_rx.recv().await {
+            let res = match out {
+                Out::Stdin(data) => sp::write_stdin(&mut writer, &data).await,
+                Out::Resize(cols, rows) => sp::write_resize(&mut writer, cols, rows).await,
+                Out::StdinEof => {
+                    let r = sp::write_stdin_eof(&mut writer).await;
+                    if r.is_err() {
+                        break;
+                    }
+                    // After EOF we keep the channel open for resize
+                    // events — the shell might still be running.
+                    continue;
+                }
+            };
+            if res.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Main read loop — decode STDOUT / EXIT frames, write to local
+    // stdout.
+    let mut stdout = tokio::io::stdout();
+    let mut scratch = Vec::new();
+    let mut exit_code: i32 = 0;
+    loop {
+        match sp::read_frame(&mut reader, &mut scratch).await {
+            Ok(sp::Frame::Stdout(data)) => {
+                if stdout.write_all(data).await.is_err() {
+                    break;
+                }
+                let _ = stdout.flush().await;
+            }
+            Ok(sp::Frame::Exit(code)) => {
+                exit_code = code;
+                break;
+            }
+            Ok(_) => { /* ignore unknown or server-only frames */ }
+            Err(_) => break,
+        }
+    }
+
+    stdin_task.abort();
+    resize_task.abort();
+    writer_task.abort();
+    // `_guard` drops here → raw mode restored.
+    // Clamp negative / large codes to 1..=255 so ExitCode is sane.
+    Ok(ExitCode::from(match exit_code {
+        0 => 0u8,
+        c if (1..=255).contains(&c) => c as u8,
+        _ => 1,
+    }))
 }
 
 /// Parse `LISTEN:HOST:PORT`. LISTEN and PORT are u16; HOST is an

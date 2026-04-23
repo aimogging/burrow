@@ -10,6 +10,7 @@ pub mod reverse_registry;
 pub mod rewrite;
 pub mod runtime;
 pub mod shell_handler;
+pub mod shell_protocol;
 pub mod smoltcp_iface;
 pub mod test_helpers;
 pub mod tunnel;

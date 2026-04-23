@@ -8,7 +8,7 @@ license = "BSD-3-Clause"
 [dependencies]
 boringtun = "0.7"
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "fs", "signal", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "io-std", "fs", "signal", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
@@ -20,6 +20,13 @@ socket2 = { version = "0.6", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
 hickory-proto = { version = "0.24", default-features = false }
+# Phase 17b interactive shell: community fork of portable-pty with the
+# modern Windows ConPTY flags (PSEUDOCONSOLE_RESIZE_QUIRK,
+# WIN32_INPUT_MODE, PASSTHROUGH_MODE) that upstream portable-pty is
+# missing. Cross-platform (Unix forkpty + Win ConPTY).
+portable-pty = { package = "portable-pty-psmux", version = "0.9" }
+# Client-side raw terminal + window-resize events.
+crossterm = "0.28"
 
 [[bin]]
 name = "wgnat"
@@ -49,7 +56,7 @@ embedded-config = []
 silent = ["tracing/release_max_level_off"]
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Console"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

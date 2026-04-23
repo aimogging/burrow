@@ -22,8 +22,8 @@ use crate::proxy::ProxyMsg;
 use crate::reverse_registry::{RegisterError, ReverseRegistry, UnregisterError};
 use crate::rewrite::PROTO_TCP;
 use crate::runtime::{ConnectionId, SmoltcpHandle};
-use crate::shell_handler::handle_shell_request;
-use crate::wire::{ClientReq, ErrorKind, Proto, ServerResp, MAX_FRAME_LEN};
+use crate::shell_handler::{handle_shell_request, run_interactive};
+use crate::wire::{ClientReq, ErrorKind, Proto, ServerResp, ShellMode, MAX_FRAME_LEN};
 
 /// Build a unique synthetic `NatKey` for a service listener on
 /// `(wg_ip, port)` — shared between `main.rs` and this handler so the
@@ -98,6 +98,27 @@ async fn run_once(
             return Ok(());
         }
     };
+
+    // Interactive shell takes over the flow. Write ShellReady, then
+    // hand msg_rx + any leftover bytes to the framed pump.
+    if let ClientReq::RequestShell {
+        mode: ShellMode::Interactive,
+        program,
+        args,
+    } = &req
+    {
+        write_resp(&smoltcp, id, &ServerResp::ShellReady).await;
+        run_interactive(
+            id,
+            smoltcp,
+            leftover,
+            msg_rx,
+            program.clone(),
+            args.clone(),
+        )
+        .await;
+        return Ok(());
+    }
 
     let resp = handle_request(req, &registry, &smoltcp, wg_ip).await;
     write_resp(&smoltcp, id, &resp).await;
