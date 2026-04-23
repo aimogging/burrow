@@ -123,6 +123,7 @@ pub fn generate(params: &GenParams) -> Result<Vec<GeneratedConfig>> {
                 params,
                 c,
                 client_ips[i],
+                wgnat_ip,
                 &server,
                 &routes_suffix,
                 prefix,
@@ -197,14 +198,20 @@ fn build_client_conf(
     params: &GenParams,
     client: &Keypair,
     client_ip: Ipv4Addr,
+    wgnat_ip: Ipv4Addr,
     server: &Keypair,
     routes_suffix: &str,
     prefix: u8,
 ) -> String {
+    // `DNS = wgnat_ip` tells wg-quick to point the peer's resolver at
+    // wgnat's built-in DNS service while the tunnel is up. Works on
+    // Linux/macOS via resolvconf and on Windows via the official
+    // WireGuard client.
     format!(
         "[Interface]\n\
          PrivateKey = {}\n\
          Address = {}/{}\n\
+         DNS = {}\n\
          \n\
          [Peer]\n\
          PublicKey = {}\n\
@@ -214,6 +221,7 @@ fn build_client_conf(
         client.private,
         client_ip,
         prefix,
+        wgnat_ip,
         server.public,
         params.endpoint,
         params.subnet.network().address(),
@@ -406,6 +414,17 @@ mod tests {
         let subnet = parse_ipv4_cidr("10.0.0.0/28").unwrap();
         assert!(allocate_ips(&subnet, 5).is_ok());
         assert!(allocate_ips(&subnet, 6).is_err());
+    }
+
+    #[test]
+    fn client_conf_points_dns_at_wgnat() {
+        let out = generate(&default_params()).unwrap();
+        let client = out.iter().find(|c| c.filename == "client1.conf").unwrap();
+        assert!(
+            client.contents.contains("DNS = 10.0.0.2\n"),
+            "client.conf must set DNS to wgnat_ip; got:\n{}",
+            client.contents
+        );
     }
 
     #[test]
