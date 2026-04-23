@@ -5,8 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use base64::Engine;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::mpsc;
@@ -56,167 +55,32 @@ const EMBEDDED_CONFIG: Option<&str> = {
 /// held; tokio's Mutex pays for park/unpark uncontended for no benefit.
 type UdpProxyMap = Arc<Mutex<HashMap<NatKey, mpsc::UnboundedSender<Vec<u8>>>>>;
 
+/// The gateway binary is intentionally minimal: just the runtime. All
+/// utility commands (keygen, gen) live in `burrow-client` so they
+/// don't bloat the deploy binary.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(version, about = "WireGuard userspace gateway")]
 struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
-}
+    /// Path to a wg-quick style configuration file. Optional when the
+    /// binary was built with the `embedded-config` feature; required
+    /// otherwise. An explicit `--config` always overrides the embedded
+    /// one (useful for testing the same binary against a throwaway).
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 
-#[derive(Subcommand, Debug)]
-enum Cmd {
-    /// Run the NAT gateway against a wg-quick style config.
-    Run {
-        /// Path to a wg-quick style configuration file. Optional when the
-        /// binary was built with the `embedded-config` feature; required
-        /// otherwise. An explicit `--config` always overrides the embedded
-        /// one (useful for testing the same binary against a throwaway).
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+    /// Override the peer endpoint from the config file (host:port).
+    #[arg(long)]
+    endpoint: Option<String>,
 
-        /// Override the peer endpoint from the config file (host:port).
-        #[arg(long)]
-        endpoint: Option<String>,
-
-        /// Override PersistentKeepalive (seconds; 0 disables).
-        #[arg(long)]
-        keepalive: Option<u16>,
-    },
-    /// Generate an x25519 keypair (base64) for use in a wg-quick config.
-    Keygen,
-    /// Generate a ready-to-use trio of configs: server.conf, burrow.conf,
-    /// clientN.conf. The only required inputs are the WG server's public
-    /// endpoint and (optionally) the routes the burrow host should expose;
-    /// everything else has a sane default.
-    Gen {
-        /// WG server's public `ip:port`.
-        #[arg(long)]
-        endpoint: String,
-        /// Routes (CIDRs) to expose via burrow. Comma-separated; pass
-        /// `--routes a,b,c` to expose multiple.
-        #[arg(long, value_delimiter = ',', default_value = "")]
-        routes: Vec<String>,
-        /// DNS servers to write into each client.conf. Comma-separated.
-        /// Omit (the default) for no `DNS = ` line — clients keep their
-        /// system resolver. Pass the burrow host's WG IP (e.g. 10.0.0.2)
-        /// to opt clients into burrow's built-in resolver.
-        #[arg(long, value_delimiter = ',', default_value = "")]
-        dns: Vec<String>,
-        /// WG network subnet. Server=.1, burrow=.2, clients=.10+.
-        #[arg(long, default_value = "10.0.0.0/24")]
-        subnet: String,
-        /// Number of client peers to generate.
-        #[arg(long, default_value_t = 1)]
-        clients: u16,
-        /// WG server's UDP listen port.
-        #[arg(long, default_value_t = 51820)]
-        listen_port: u16,
-        /// Output directory (created if missing). Existing files are
-        /// overwritten.
-        #[arg(long, default_value = "burrow-configs")]
-        out: PathBuf,
-    },
+    /// Override PersistentKeepalive (seconds; 0 disables).
+    #[arg(long)]
+    keepalive: Option<u16>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.cmd {
-        Cmd::Keygen => return keygen(),
-        Cmd::Run { config, endpoint, keepalive } => run(config, endpoint, keepalive).await,
-        Cmd::Gen {
-            endpoint,
-            routes,
-            dns,
-            subnet,
-            clients,
-            listen_port,
-            out,
-        } => return gen_configs(endpoint, routes, dns, subnet, clients, listen_port, out),
-    }
-}
-
-fn keygen() -> Result<()> {
-    let secret = x25519_dalek::StaticSecret::random();
-    let public = x25519_dalek::PublicKey::from(&secret);
-    let b64 = base64::engine::general_purpose::STANDARD;
-    println!("PrivateKey = {}", b64.encode(secret.to_bytes()));
-    println!("PublicKey  = {}", b64.encode(public.as_bytes()));
-    Ok(())
-}
-
-fn gen_configs(
-    endpoint: String,
-    routes: Vec<String>,
-    dns: Vec<String>,
-    subnet: String,
-    clients: u16,
-    listen_port: u16,
-    out_dir: PathBuf,
-) -> Result<()> {
-    use burrow::config::{parse_ipv4_cidr, DEFAULT_CONTROL_PORT};
-    use burrow::config_gen::{generate, GenParams};
-
-    // clap's value_delimiter on a String with default_value = "" yields
-    // vec![""] rather than empty — filter blanks here.
-    let filter_blank = |v: Vec<String>| -> Vec<String> {
-        v.into_iter().filter(|s| !s.trim().is_empty()).collect()
-    };
-    let routes = filter_blank(routes);
-    let dns = filter_blank(dns);
-    let subnet = parse_ipv4_cidr(&subnet)
-        .with_context(|| format!("invalid --subnet `{subnet}`"))?;
-    let params = GenParams {
-        endpoint,
-        routes,
-        dns,
-        subnet,
-        clients,
-        listen_port,
-        control_port: DEFAULT_CONTROL_PORT,
-    };
-    let configs = generate(&params)?;
-
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("failed to create {}", out_dir.display()))?;
-    for c in &configs {
-        let path = out_dir.join(&c.filename);
-        std::fs::write(&path, &c.contents)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        set_private_file_permissions(&path);
-    }
-
-    println!("wrote {} config(s) to {}:", configs.len(), out_dir.display());
-    for c in &configs {
-        println!("  {}", c.filename);
-    }
-    println!();
-    println!("next:");
-    println!("  server:  wg-quick up ./server.conf    (on the WG server)");
-    println!("  burrow:  burrow run --config ./burrow.conf   (on the gateway host)");
-    if params.clients == 1 {
-        println!("  client:  wg-quick up ./client1.conf   (on the client)");
-    } else {
-        println!(
-            "  clients: wg-quick up ./clientN.conf   (N = 1..{}, one per client machine)",
-            params.clients
-        );
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_private_file_permissions(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &std::path::Path) {
-    // Windows: NTFS ACLs are the right tool; setting them non-trivially
-    // is out of scope for v1. The files inherit the parent directory's
-    // ACL. Callers handling sensitive keys on Windows should place the
-    // output directory somewhere ACL-restricted.
+    run(cli.config, cli.endpoint, cli.keepalive).await
 }
 
 async fn run(

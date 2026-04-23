@@ -108,24 +108,24 @@ The control channel rides on `wg_ip`; the listeners do not.
 
 - DNS resolver on `(wg_ip, 53/udp)` answering A queries via the burrow
   host's system resolver. Opt-in for clients via `--dns 10.0.0.2` to
-  `burrow gen`, or by setting `DNS = 10.0.0.2` in the client's
+  `burrow-client gen`, or by setting `DNS = 10.0.0.2` in the client's
   `[Interface]` section.
 - Remote shell. `burrow-client shell` gives you an interactive PTY, a
   one-shot capture, or fire-and-forget.
-- Config generator. `burrow gen` writes a ready-to-use trio of wg-quick
+- Config generator. `burrow-client gen` writes a ready-to-use trio of wg-quick
   configs in one shot.
 
 ## Quick start
 
 The three-party setup needs a WireGuard server, a burrow host, and at least
-one client peer. `burrow gen` bootstraps everything.
+one client peer. `burrow-client gen` bootstraps everything.
 
 ```sh
 # 1. build
 cargo build --release
 
 # 2. generate the trio (keys, IPs, subnet, routes all in one go)
-./target/release/burrow gen \
+./target/release/burrow-client gen \
     --endpoint your.server.example:51820 \
     --routes 192.168.1.0/24 \
     --clients 1
@@ -140,7 +140,7 @@ sudo sysctl -w net.ipv4.ip_forward=1
 sudo wg-quick up ./burrow-configs/server.conf
 
 # on the burrow host (anywhere tokio runs):
-./target/release/burrow run --config ./burrow-configs/burrow.conf
+./target/release/burrow --config ./burrow-configs/burrow.conf
 
 # on the client:
 sudo wg-quick up ./burrow-configs/client1.conf
@@ -187,24 +187,26 @@ path.
 ## Commands
 
 ```
-burrow run --config <PATH> [--endpoint host:port] [--keepalive <secs>]
-burrow gen --endpoint <ip:port>
-           [--routes cidr[,cidr...]]
-           [--dns ip[,ip...]]
-           [--subnet 10.0.0.0/24]
-           [--clients N]
-           [--listen-port 51820]
-           [--out ./burrow-configs]
-burrow keygen
+# Gateway (intentionally minimal — just the runtime).
+burrow [--config <PATH>] [--endpoint host:port] [--keepalive <secs>]
 
-burrow-client <wg_ip> tunnel start -R [BIND:]LISTEN:HOST:PORT [-U]
-burrow-client <wg_ip> tunnel stop  <tunnel_id>
-burrow-client <wg_ip> tunnel list
-burrow-client <wg_ip> shell                                  # interactive PTY
-burrow-client <wg_ip> shell --output -                       # one-shot to local stdio
-burrow-client <wg_ip> shell --output run.log                 # one-shot to file
-burrow-client <wg_ip> shell --detach                         # fire-and-forget (returns pid)
-burrow-client <wg_ip> shell --program <exe> -- <args...>     # custom program + argv
+# Companion CLI: tunnels, shell, plus local utilities (keygen, gen).
+burrow-client tunnel <wg_ip> [--control-port N] start -R [BIND:]LISTEN:HOST:PORT [-U]
+burrow-client tunnel <wg_ip> [--control-port N] stop <tunnel_id>
+burrow-client tunnel <wg_ip> [--control-port N] list
+burrow-client shell  <wg_ip> [--control-port N]                          # interactive PTY
+burrow-client shell  <wg_ip> [--control-port N] --output -               # one-shot to local stdio
+burrow-client shell  <wg_ip> [--control-port N] --output run.log         # one-shot to file
+burrow-client shell  <wg_ip> [--control-port N] --detach                 # fire-and-forget (returns pid)
+burrow-client shell  <wg_ip> [--control-port N] --program <exe> -- <args...>
+burrow-client keygen
+burrow-client gen --endpoint <ip:port>
+                  [--routes cidr[,cidr...]]
+                  [--dns ip[,ip...]]
+                  [--subnet 10.0.0.0/24]
+                  [--clients N]
+                  [--listen-port 51820]
+                  [--out ./burrow-configs]
 ```
 
 `BIND` (optional) selects which OS interface on the burrow host the
@@ -218,7 +220,7 @@ address, same rule as any program calling `bind()`).
 ### Generate configs for three clients with public DNS fallback
 
 ```sh
-burrow gen \
+burrow-client gen \
     --endpoint vpn.example.com:51820 \
     --routes 10.50.0.0/24,192.168.1.0/24 \
     --dns 10.0.0.2,1.1.1.1 \
@@ -238,7 +240,7 @@ LAN can hit `192.168.1.50:443` and reach the laptop's dev server.
 
 ```sh
 # on the laptop:
-burrow-client 10.0.0.2 tunnel start -R 443:127.0.0.1:8080
+burrow-client tunnel 10.0.0.2 start -R 443:127.0.0.1:8080
 # tunnel 1 started (Tcp 0.0.0.0:443 -> 127.0.0.1:8080). press ctrl-c to stop.
 ```
 
@@ -252,7 +254,7 @@ Hostnames for the forward target work: `-R 443:internal.corp.lan:8080`.
 ### Pin the listener to a single interface
 
 ```sh
-burrow-client 10.0.0.2 tunnel start -R 192.168.1.50:443:127.0.0.1:8080
+burrow-client tunnel 10.0.0.2 start -R 192.168.1.50:443:127.0.0.1:8080
 # binds only on the burrow host's 192.168.1.50 interface; loopback /
 # other LAN segments / etc are not exposed
 ```
@@ -264,7 +266,7 @@ burrow on a VPS with public IP `203.0.113.7`. Home service on
 
 ```sh
 # on the home machine:
-burrow-client 10.0.0.2 tunnel start -R 0.0.0.0:443:127.0.0.1:8000
+burrow-client tunnel 10.0.0.2 start -R 0.0.0.0:443:127.0.0.1:8000
 # anyone hitting 203.0.113.7:443 reaches the home machine's :8000
 ```
 
@@ -274,26 +276,26 @@ burrow exposes `0.0.0.0:5353/udp` on its host network; client machine
 forwards each datagram to Cloudflare's `1.1.1.1:53`.
 
 ```sh
-burrow-client 10.0.0.2 tunnel start -U -R 5353:1.1.1.1:53
+burrow-client tunnel 10.0.0.2 start -U -R 5353:1.1.1.1:53
 ```
 
 ### Interactive shell on the burrow host
 
 ```sh
-burrow-client 10.0.0.2 shell
+burrow-client shell 10.0.0.2
 # drops into cmd.exe on Windows, $SHELL on Unix
 ```
 
 Custom program:
 
 ```sh
-burrow-client 10.0.0.2 shell --program /usr/bin/python3 -- -i
+burrow-client shell 10.0.0.2 --program /usr/bin/python3 -- -i
 ```
 
 Capture the output of a one-shot command:
 
 ```sh
-burrow-client 10.0.0.2 shell --output - --program cmd.exe -- /c "dir C:\"
+burrow-client shell 10.0.0.2 --output - --program cmd.exe -- /c "dir C:\"
 ```
 
 ### Query burrow's DNS directly
@@ -305,7 +307,7 @@ dig @10.0.0.2 example.com
 ```
 
 Or set `10.0.0.2` as the peer's system resolver via `DNS = 10.0.0.2` in the
-client's `[Interface]` section (or pass `--dns 10.0.0.2` to `burrow gen`).
+client's `[Interface]` section (or pass `--dns 10.0.0.2` to `burrow-client gen`).
 
 ## Deploy: single self-contained binary
 
@@ -326,7 +328,7 @@ BURROW_EMBEDDED_CONFIG=./path/to/burrow.conf \
 ```
 
 The resulting binary contains the config as a `&'static str` in its read-only
-data segment, so `burrow run` works without `--config`. Anyone with read
+data segment, so plain `burrow` works without `--config`. Anyone with read
 access to the binary can extract the PrivateKey via `strings` — do not ship
 this binary to anyone you would not trust with the `.conf` itself.
 
@@ -336,7 +338,7 @@ Controlled via `RUST_LOG` (env-filter syntax). Default is `info,burrow=debug`.
 The `silent` feature compiles out all `tracing` events in release builds.
 
 ```sh
-RUST_LOG=burrow=trace burrow run --config burrow.conf
+RUST_LOG=burrow=trace burrow --config burrow.conf
 ```
 
 Useful filters:

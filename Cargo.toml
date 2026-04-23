@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "WireGuard userspace gateway - no TUN, no kernel drivers"
 license = "BSD-3-Clause"
+# `cargo run` would otherwise error since the package ships two
+# binaries (`burrow` and `burrow-client`).
+default-run = "burrow"
 
 [dependencies]
 boringtun = "0.7"

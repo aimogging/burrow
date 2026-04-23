@@ -89,10 +89,10 @@ async fn tunnel_start_tcp_writes_correct_request() {
 
     let mut child = TokioCommand::new(burrow_client_path())
         .args([
+            "tunnel",
             &addr.ip().to_string(),
             "--control-port",
             &addr.port().to_string(),
-            "tunnel",
             "start",
             "-R",
             "8080:127.0.0.1:9000",
@@ -139,10 +139,10 @@ async fn tunnel_start_udp_flag_sets_proto() {
 
     let mut child = TokioCommand::new(burrow_client_path())
         .args([
+            "tunnel",
             &addr.ip().to_string(),
             "--control-port",
             &addr.port().to_string(),
-            "tunnel",
             "start",
             "-U",
             "-R",
@@ -194,10 +194,10 @@ async fn shell_oneshot_prints_captured_stdout_and_exit_code() {
         move || {
             Command::new(&client_path)
                 .args([
+                    "shell",
                     &ip,
                     "--control-port",
                     &port,
-                    "shell",
                     "--output",
                     "-",
                     "--program",
@@ -241,7 +241,7 @@ async fn shell_nonzero_exit_propagates() {
         let port = addr.port().to_string();
         move || {
             Command::new(&client_path)
-                .args([&ip, "--control-port", &port, "shell", "--output", "-"])
+                .args(["shell", &ip, "--control-port", &port, "--output", "-"])
                 .output()
                 .unwrap()
         }
@@ -274,7 +274,7 @@ async fn shell_detach_prints_pid() {
         let port = addr.port().to_string();
         move || {
             Command::new(&client_path)
-                .args([&ip, "--control-port", &port, "shell", "--detach"])
+                .args(["shell", &ip, "--control-port", &port, "--detach"])
                 .stdout(Stdio::piped())
                 .output()
                 .unwrap()

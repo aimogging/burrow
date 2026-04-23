@@ -1,16 +1,13 @@
-//! Companion CLI for burrow. Speaks the CBOR-framed control protocol
-//! over a plain TCP connection to `burrow_wg_ip:CONTROL_PORT`.
+//! Companion CLI for burrow. Holds the local-side utilities (`keygen`
+//! and `gen` for generating configs) plus the remote operations that
+//! talk to a running burrow over the CBOR-framed control protocol
+//! (`tunnel`, `shell`).
 //!
-//! The peer running this binary needs its own WireGuard stack
-//! configured so that `burrow_wg_ip` routes through the tunnel —
-//! burrow-client itself makes a normal TCP connect and is oblivious to
-//! WireGuard at the binary level.
-//!
-//! SSH-style positional: `burrow-client <burrow_wg_ip> <subcommand>`.
-//!
-//! Phase 17a scope: non-interactive shell (--oneshot, --detach) +
-//! tunnel register/unregister/list. Interactive PTY mode lands with
-//! Phase 17b when portable-pty comes in.
+//! Remote subcommands take `<burrow_wg_ip>` as their first positional;
+//! local utilities don't need it. The peer running this binary needs
+//! its own WireGuard stack configured so that `burrow_wg_ip` routes
+//! through the tunnel — burrow-client itself makes a normal TCP
+//! connect and is oblivious to WireGuard at the binary level.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -20,13 +17,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine;
 use clap::{Parser, Subcommand, ValueEnum};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
-use burrow::config::DEFAULT_CONTROL_PORT;
+use burrow::config::{parse_ipv4_cidr, DEFAULT_CONTROL_PORT};
+use burrow::config_gen::{generate, GenParams};
 use burrow::reverse_registry::OpenRequest;
 use burrow::shell_protocol as sp;
 use burrow::wire::{
@@ -36,37 +35,47 @@ use burrow::wire::{
 use burrow::yamux_bridge::{drive_connection, udp_frame};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "CLI peer for burrow's control channel")]
+#[command(version, about = "burrow companion CLI: tunnels, shell, keygen, config gen")]
 struct Cli {
-    /// WG address of the burrow host to connect to.
-    burrow_ip: Ipv4Addr,
-
-    /// Control port (defaults to burrow's DEFAULT_CONTROL_PORT = 57821).
-    #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
-    control_port: u16,
-
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Reverse-tunnel management.
+    /// Reverse-tunnel management against a running burrow at <burrow_wg_ip>.
     Tunnel {
+        burrow_ip: Ipv4Addr,
+        /// Control port (defaults to burrow's DEFAULT_CONTROL_PORT = 57821).
+        #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
+        control_port: u16,
         #[command(subcommand)]
         action: TunnelCmd,
     },
-    /// Run a command on the burrow host.
-    Shell(ShellArgs),
+    /// Run / open a shell on the burrow host at <burrow_wg_ip>.
+    Shell {
+        burrow_ip: Ipv4Addr,
+        /// Control port (defaults to burrow's DEFAULT_CONTROL_PORT = 57821).
+        #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
+        control_port: u16,
+        #[command(flatten)]
+        args: ShellArgs,
+    },
+    /// Generate an x25519 keypair (base64) for use in a wg-quick config.
+    Keygen,
+    /// Generate a ready-to-use trio of configs: server.conf, burrow.conf,
+    /// clientN.conf.
+    Gen(GenArgs),
 }
 
 #[derive(Subcommand, Debug)]
 enum TunnelCmd {
-    /// Start a reverse tunnel. Syntax: `-R LISTEN:HOST:PORT`.
+    /// Start a reverse tunnel. Syntax: `-R [BIND:]LISTEN:HOST:PORT`.
     Start {
-        /// `LISTEN:HOST:PORT` — peers hit `wg_ip:LISTEN`, burrow
-        /// forwards to `HOST:PORT`. Default protocol is TCP.
-        #[arg(short = 'R', value_name = "LISTEN:HOST:PORT")]
+        /// `[BIND:]LISTEN:HOST:PORT` — burrow listens on `<BIND>:<LISTEN>`
+        /// (default BIND = 0.0.0.0); incoming connections tunnel back to
+        /// the client and originate as `HOST:PORT` locally.
+        #[arg(short = 'R', value_name = "[BIND:]LISTEN:HOST:PORT")]
         spec: String,
         /// Use UDP instead of TCP.
         #[arg(short = 'U', long)]
@@ -108,6 +117,35 @@ struct ShellArgs {
     args: Vec<String>,
 }
 
+#[derive(clap::Args, Debug)]
+struct GenArgs {
+    /// WG server's public `ip:port`.
+    #[arg(long)]
+    endpoint: String,
+    /// Routes (CIDRs) to expose via burrow. Comma-separated; pass
+    /// `--routes a,b,c` to expose multiple.
+    #[arg(long, value_delimiter = ',', default_value = "")]
+    routes: Vec<String>,
+    /// DNS servers to write into each client.conf. Comma-separated.
+    /// Omit (the default) for no `DNS = ` line — clients keep their
+    /// system resolver. Pass the burrow host's WG IP (e.g. 10.0.0.2)
+    /// to opt clients into burrow's built-in resolver.
+    #[arg(long, value_delimiter = ',', default_value = "")]
+    dns: Vec<String>,
+    /// WG network subnet. Server=.1, burrow=.2, clients=.10+.
+    #[arg(long, default_value = "10.0.0.0/24")]
+    subnet: String,
+    /// Number of client peers to generate.
+    #[arg(long, default_value_t = 1)]
+    clients: u16,
+    /// WG server's UDP listen port.
+    #[arg(long, default_value_t = 51820)]
+    listen_port: u16,
+    /// Output directory (created if missing). Existing files are overwritten.
+    #[arg(long, default_value = "burrow-configs")]
+    out: PathBuf,
+}
+
 #[derive(ValueEnum, Clone, Debug)]
 enum OutputTarget {
     Stdout,
@@ -127,11 +165,87 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
-    let addr = SocketAddrV4::new(cli.burrow_ip, cli.control_port);
     match cli.cmd {
-        Cmd::Tunnel { action } => run_tunnel(addr, action).await,
-        Cmd::Shell(args) => run_shell(addr, args).await,
+        Cmd::Tunnel { burrow_ip, control_port, action } => {
+            let addr = SocketAddrV4::new(burrow_ip, control_port);
+            run_tunnel(addr, action).await
+        }
+        Cmd::Shell { burrow_ip, control_port, args } => {
+            let addr = SocketAddrV4::new(burrow_ip, control_port);
+            run_shell(addr, args).await
+        }
+        Cmd::Keygen => keygen(),
+        Cmd::Gen(args) => gen_configs(args),
     }
+}
+
+fn keygen() -> Result<ExitCode> {
+    let secret = x25519_dalek::StaticSecret::random();
+    let public = x25519_dalek::PublicKey::from(&secret);
+    let b64 = base64::engine::general_purpose::STANDARD;
+    println!("PrivateKey = {}", b64.encode(secret.to_bytes()));
+    println!("PublicKey  = {}", b64.encode(public.as_bytes()));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn gen_configs(args: GenArgs) -> Result<ExitCode> {
+    // clap's value_delimiter on a String with default_value = "" yields
+    // vec![""] rather than empty — filter blanks here.
+    let filter_blank =
+        |v: Vec<String>| -> Vec<String> { v.into_iter().filter(|s| !s.trim().is_empty()).collect() };
+    let routes = filter_blank(args.routes);
+    let dns = filter_blank(args.dns);
+    let subnet = parse_ipv4_cidr(&args.subnet)
+        .with_context(|| format!("invalid --subnet `{}`", args.subnet))?;
+    let params = GenParams {
+        endpoint: args.endpoint,
+        routes,
+        dns,
+        subnet,
+        clients: args.clients,
+        listen_port: args.listen_port,
+        control_port: DEFAULT_CONTROL_PORT,
+    };
+    let configs = generate(&params)?;
+
+    std::fs::create_dir_all(&args.out)
+        .with_context(|| format!("failed to create {}", args.out.display()))?;
+    for c in &configs {
+        let path = args.out.join(&c.filename);
+        std::fs::write(&path, &c.contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        set_private_file_permissions(&path);
+    }
+
+    println!("wrote {} config(s) to {}:", configs.len(), args.out.display());
+    for c in &configs {
+        println!("  {}", c.filename);
+    }
+    println!();
+    println!("next:");
+    println!("  server:  wg-quick up ./server.conf    (on the WG server)");
+    println!("  burrow:  burrow --config ./burrow.conf   (on the gateway host)");
+    if params.clients == 1 {
+        println!("  client:  wg-quick up ./client1.conf   (on the client)");
+    } else {
+        println!(
+            "  clients: wg-quick up ./clientN.conf   (N = 1..{}, one per client machine)",
+            params.clients
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &std::path::Path) {
+    // Windows: NTFS ACLs are the right tool; setting them non-trivially
+    // is out of scope for v1. Files inherit the parent directory's ACL.
 }
 
 async fn connect_control(addr: SocketAddrV4) -> Result<TcpStream> {
