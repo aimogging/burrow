@@ -98,6 +98,34 @@ Three machines:
 - **Client** (step 4): this box, running in an isolated netns so the
   tunnel doesn't touch host routing.
 
+### `--routes`: split tunnel vs full tunnel
+
+`--routes` controls which destinations get directed through burrow.
+Two modes:
+
+- **Split tunnel** (typical): one or more specific CIDRs. Only traffic
+  destined for those ranges rides the tunnel; everything else uses
+  the client's normal network.
+
+  ```sh
+  just gen-embed --endpoint vpn.example.com:51820 \
+      --routes 192.168.1.0/24,10.50.0.0/24
+  ```
+
+- **Full tunnel**: `0.0.0.0/0`. All client traffic goes through the WG
+  server, through burrow, and out burrow's LAN uplink — burrow
+  becomes a self-hosted VPN egress. MASQUERADE is implicit (it's
+  already how burrow handles outbound). Pair with `--dns` so DNS has
+  a reachable resolver through the tunnel:
+
+  ```sh
+  just gen-embed --endpoint vpn.example.com:51820 \
+      --routes 0.0.0.0/0 --dns 10.0.0.2
+  ```
+
+  Throughput is bounded by burrow's LAN pipe; fine for a handful of
+  peers, not a commercial-grade VPN service.
+
 Teardown mirrors deploy:
 
 ```sh
