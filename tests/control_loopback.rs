@@ -10,12 +10,12 @@
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use burrow::control::{listener_key, spawn_control_handler, UdpTunnelMap};
+use burrow::control::{listener_key, spawn_control_handler};
 use burrow::nat::NatTable;
 use burrow::proxy::ProxyMsg;
 use burrow::reverse_registry::ReverseRegistry;
@@ -139,8 +139,6 @@ async fn control_register_roundtrip() {
     let nat = Arc::new(NatTable::new());
     let (runtime, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), WG_IP);
     let registry = Arc::new(ReverseRegistry::new());
-    let udp_tunnels: UdpTunnelMap = Arc::new(Mutex::new(HashMap::new()));
-    let (egress_tx, _egress_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // Bootstrap the initial control listener — same as main.rs startup.
     let _ = runtime
@@ -152,8 +150,6 @@ async fn control_register_roundtrip() {
     let event_task = tokio::spawn({
         let runtime = runtime.clone();
         let registry = Arc::clone(&registry);
-        let udp_tunnels = Arc::clone(&udp_tunnels);
-        let egress_tx = egress_tx.clone();
         async move {
             let mut proxies: HashMap<ConnectionId, mpsc::UnboundedSender<ProxyMsg>> =
                 HashMap::new();
@@ -170,10 +166,7 @@ async fn control_register_roundtrip() {
                             let tx = spawn_control_handler(
                                 id,
                                 runtime.clone(),
-                                WG_IP,
                                 Arc::clone(&registry),
-                                Arc::clone(&udp_tunnels),
-                                egress_tx.clone(),
                             );
                             proxies.insert(id, tx);
                         } else {
@@ -231,7 +224,10 @@ async fn control_register_roundtrip() {
 
     // 4. Send the CBOR StartTcpTunnel frame.
     let req = ClientReq::StartTcpTunnel(TunnelSpec {
-        listen_port: 8080,
+        // High port unlikely to collide with anything in the test env.
+        // The test asks for BindAddr::Default (0.0.0.0), so the control
+        // handler's real OS listener actually binds 0.0.0.0:58080.
+        listen_port: 58080,
         forward_to: "10.0.0.3:9000".to_string(),
         bind: BindAddr::Default,
     });
@@ -286,7 +282,7 @@ async fn control_register_roundtrip() {
 
     // 7. Verify the registry state.
     let entry = registry
-        .lookup(Proto::Tcp, WG_IP, 8080, WG_IP)
+        .lookup(Proto::Tcp, WG_IP, 58080, WG_IP)
         .expect("registry should contain the new tunnel");
     assert_eq!(entry.tunnel_id, tunnel_id);
     assert_eq!(entry.forward_to, "10.0.0.3:9000");

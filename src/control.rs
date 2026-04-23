@@ -6,33 +6,44 @@
 //!   pump in `shell_handler::run_interactive`.
 //! * `RequestShell { Oneshot | FireAndForget }` — synchronous response
 //!   with the captured output / pid, close.
-//! * `StartTcpTunnel` / `StartUdpTunnel` — register, write
-//!   `ServerResp::Started`, then upgrade the flow to yamux. Server
-//!   opens outbound substreams on demand (one per peer connection for
-//!   TCP; one shared substream carrying framed datagrams for UDP).
+//! * `StartTcpTunnel` / `StartUdpTunnel` — bind a real OS listener on
+//!   the burrow host's OS interface(s), write `ServerResp::Started`,
+//!   then upgrade the flow to yamux. For each peer that connects to
+//!   the listener, the server opens an outbound yamux substream to
+//!   the owning client; the client dials `forward_to` locally and
+//!   pipes bytes. UDP uses one substream for the tunnel with
+//!   framed datagrams.
+//!
+//! `BindAddr` maps to an OS interface:
+//!   * `Default` / `Any` → `0.0.0.0` (INADDR_ANY, all OS interfaces)
+//!   * `Ipv4(x)` → bind to that specific interface address
+//!
+//! The host has to actually own the requested address for the bind to
+//! succeed (same rule as any other program).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use crate::nat::NatKey;
 use crate::proxy::ProxyMsg;
-use crate::reverse_registry::{ReverseRegistry, StartError, StopError, SubstreamOpener};
+use crate::reverse_registry::{OpenRequest, ReverseRegistry, StartError, StopError, SubstreamOpener};
 use crate::rewrite::PROTO_TCP;
 use crate::runtime::{ConnectionId, SmoltcpHandle};
 use crate::shell_handler::{handle_shell_request, run_interactive};
 use crate::wire::{
     BindAddr, ClientReq, ErrorKind, Proto, ServerResp, ShellMode, TunnelSpec, MAX_FRAME_LEN,
 };
-use crate::yamux_bridge::{drive_connection, smoltcp_as_duplex};
+use crate::yamux_bridge::{drive_connection, smoltcp_as_duplex, udp_frame};
 
-/// Build a unique synthetic `NatKey` for a service listener on
-/// `(wg_ip, port)` — shared between `main.rs` and this handler so the
-/// runtime's `conns` map never sees duplicate keys across control and
-/// reverse-tunnel listeners.
+/// Build a unique synthetic `NatKey` for the control-port listener
+/// (which does live on smoltcp, since that's how WG peers reach the
+/// burrow host's `wg_ip`). The counter-suffixed peer_port lets main.rs
+/// re-arm the listener after each accept without key collisions.
 pub fn listener_key(wg_ip: Ipv4Addr, port: u16) -> NatKey {
     static COUNTER: AtomicU16 = AtomicU16::new(1);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -45,34 +56,16 @@ pub fn listener_key(wg_ip: Ipv4Addr, port: u16) -> NatKey {
     }
 }
 
-/// Passed to the `udp_reverse` module on UDP tunnel start so the ingest
-/// path can push datagrams into the owning client's yamux substream.
-/// The handle internally fans (peer, payload) messages into the single
-/// writer task for a tunnel.
-pub type UdpTunnelHandle =
-    mpsc::UnboundedSender<(std::net::Ipv4Addr, u16, Vec<u8>)>;
-
-/// Side-table (one entry per active UDP tunnel) that the ingest path
-/// consults to route incoming datagrams into the right yamux substream.
-pub type UdpTunnelMap = Arc<std::sync::Mutex<
-    std::collections::HashMap<crate::wire::TunnelId, UdpTunnelHandle>,
->>;
-
 /// Spawn the per-flow handler. Returns the `ProxyMsg` sender that the
 /// event loop feeds with `TcpData` / `PeerFin` / `Closed`.
 pub fn spawn_control_handler(
     id: ConnectionId,
     smoltcp: SmoltcpHandle,
-    wg_ip: Ipv4Addr,
     registry: Arc<ReverseRegistry>,
-    udp_tunnels: UdpTunnelMap,
-    egress_tx: mpsc::UnboundedSender<Vec<u8>>,
 ) -> mpsc::UnboundedSender<ProxyMsg> {
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        if let Err(e) = run_once(id, smoltcp, wg_ip, msg_rx, registry, udp_tunnels, egress_tx)
-            .await
-        {
+        if let Err(e) = run_once(id, smoltcp, msg_rx, registry).await {
             tracing::debug!(?id, error = %e, "control handler exited");
         }
     });
@@ -82,11 +75,8 @@ pub fn spawn_control_handler(
 async fn run_once(
     id: ConnectionId,
     smoltcp: SmoltcpHandle,
-    wg_ip: Ipv4Addr,
     mut msg_rx: mpsc::UnboundedReceiver<ProxyMsg>,
     registry: Arc<ReverseRegistry>,
-    udp_tunnels: UdpTunnelMap,
-    egress_tx: mpsc::UnboundedSender<Vec<u8>>,
 ) -> anyhow::Result<()> {
     let mut leftover: Vec<u8> = Vec::new();
 
@@ -128,15 +118,7 @@ async fn run_once(
     } = &req
     {
         write_resp(&smoltcp, id, &ServerResp::ShellReady).await;
-        run_interactive(
-            id,
-            smoltcp,
-            leftover,
-            msg_rx,
-            program.clone(),
-            args.clone(),
-        )
-        .await;
+        run_interactive(id, smoltcp, leftover, msg_rx, program.clone(), args.clone()).await;
         return Ok(());
     }
 
@@ -148,34 +130,17 @@ async fn run_once(
         } else {
             Proto::Udp
         };
-        start_tunnel(
-            id,
-            smoltcp,
-            wg_ip,
-            leftover,
-            msg_rx,
-            registry,
-            udp_tunnels,
-            egress_tx,
-            proto,
-            spec.clone(),
-        )
-        .await;
+        start_tunnel(id, smoltcp, leftover, msg_rx, registry, proto, spec.clone()).await;
         return Ok(());
     }
 
-    let resp = handle_request(req, &registry, &smoltcp, wg_ip).await;
+    let resp = handle_request(req, &registry).await;
     write_resp(&smoltcp, id, &resp).await;
     smoltcp.close_tcp(id);
     Ok(())
 }
 
-async fn handle_request(
-    req: ClientReq,
-    registry: &ReverseRegistry,
-    _smoltcp: &SmoltcpHandle,
-    _wg_ip: Ipv4Addr,
-) -> ServerResp {
+async fn handle_request(req: ClientReq, registry: &ReverseRegistry) -> ServerResp {
     match req {
         ClientReq::StartTcpTunnel(_) | ClientReq::StartUdpTunnel(_) => {
             // Dispatched above; reaching here means a wiring mistake.
@@ -195,47 +160,95 @@ async fn handle_request(
             },
         },
         ClientReq::ListReverse => ServerResp::ReverseList(registry.list()),
-        ClientReq::RequestShell {
-            mode,
-            program,
-            args,
-        } => handle_shell_request(mode, program, args).await,
+        ClientReq::RequestShell { mode, program, args } => {
+            handle_shell_request(mode, program, args).await
+        }
     }
 }
 
-/// Start a reverse tunnel. Flow sequence:
-///   1. Validate bind (Default only for now; log NotYetSupported otherwise).
-///   2. Allocate an opener channel + register in the tunnel registry.
-///   3. For TCP, create a smoltcp listener on the bind/port.
-///   4. Write `ServerResp::Started{tunnel_id}`.
-///   5. Wrap the smoltcp flow as a duplex stream, hand to yamux::Connection
-///      (server mode).
-///   6. Run the yamux driver until the connection closes. Then tear down
-///      the registry entry (and for UDP, the side-table handle).
+/// Resolve `BindAddr` to the concrete OS interface address to bind on.
+/// `Default` / `Any` both map to INADDR_ANY; `Ipv4` is a specific
+/// interface (which the host must actually own — otherwise the bind
+/// fails with AddrNotAvailable).
+fn bind_ip(bind: BindAddr) -> Ipv4Addr {
+    match bind {
+        BindAddr::Default | BindAddr::Any => Ipv4Addr::UNSPECIFIED,
+        BindAddr::Ipv4(x) => x,
+    }
+}
+
+/// Start a reverse tunnel.
+///   1. Resolve bind → OS socket address.
+///   2. Bind a real OS listener (`TcpListener` or `UdpSocket`) so that
+///      any connection on that port reaches this process through the
+///      kernel's network stack.
+///   3. Register in `ReverseRegistry` with the opener channel.
+///   4. Write `ServerResp::Started`.
+///   5. Spawn the per-proto accept loop (each accepted flow requests a
+///      yamux substream via the opener, then bridges bytes).
+///   6. Upgrade the control flow to yamux server and drive_connection.
+///   7. When the client disconnects, `drive_connection` exits; we drop
+///      the listener (which terminates the accept loop) and
+///      deregister.
 #[allow(clippy::too_many_arguments)]
 async fn start_tunnel(
     id: ConnectionId,
     smoltcp: SmoltcpHandle,
-    wg_ip: Ipv4Addr,
     leftover: Vec<u8>,
     msg_rx: mpsc::UnboundedReceiver<ProxyMsg>,
     registry: Arc<ReverseRegistry>,
-    udp_tunnels: UdpTunnelMap,
-    egress_tx: mpsc::UnboundedSender<Vec<u8>>,
     proto: Proto,
     spec: TunnelSpec,
 ) {
-    if !matches!(spec.bind, BindAddr::Default) {
-        send_error(
-            &smoltcp,
-            id,
-            ErrorKind::NotYetSupported,
-            "bind addresses other than Default not yet implemented".into(),
-        )
-        .await;
-        smoltcp.close_tcp(id);
-        return;
+    let bind_ipv4 = bind_ip(spec.bind);
+    let bind_sock = SocketAddr::V4(SocketAddrV4::new(bind_ipv4, spec.listen_port));
+
+    // Bind the real OS listener up front so we can surface a clean
+    // error (e.g. AddrInUse, AddrNotAvailable) before writing Started.
+    enum Listener {
+        Tcp(TcpListener),
+        Udp(UdpSocket),
     }
+    let listener = match proto {
+        Proto::Tcp => match TcpListener::bind(bind_sock).await {
+            Ok(l) => Listener::Tcp(l),
+            Err(e) => {
+                let kind = match e.kind() {
+                    std::io::ErrorKind::AddrInUse => ErrorKind::PortInUse,
+                    std::io::ErrorKind::AddrNotAvailable => ErrorKind::InvalidRequest,
+                    _ => ErrorKind::Internal,
+                };
+                send_error(
+                    &smoltcp,
+                    id,
+                    kind,
+                    format!("tcp bind {bind_sock}: {e}"),
+                )
+                .await;
+                smoltcp.close_tcp(id);
+                return;
+            }
+        },
+        Proto::Udp => match UdpSocket::bind(bind_sock).await {
+            Ok(s) => Listener::Udp(s),
+            Err(e) => {
+                let kind = match e.kind() {
+                    std::io::ErrorKind::AddrInUse => ErrorKind::PortInUse,
+                    std::io::ErrorKind::AddrNotAvailable => ErrorKind::InvalidRequest,
+                    _ => ErrorKind::Internal,
+                };
+                send_error(
+                    &smoltcp,
+                    id,
+                    kind,
+                    format!("udp bind {bind_sock}: {e}"),
+                )
+                .await;
+                smoltcp.close_tcp(id);
+                return;
+            }
+        },
+    };
 
     let (opener_tx, opener_rx) = mpsc::unbounded_channel();
     let tunnel_id = match registry.start(
@@ -252,8 +265,8 @@ async fn start_tunnel(
                 id,
                 ErrorKind::PortInUse,
                 format!(
-                    "port {}/{:?} already has a tunnel bound on {:?}",
-                    spec.listen_port, proto, spec.bind
+                    "tunnel {:?}/{} already registered on {:?}",
+                    proto, spec.listen_port, spec.bind
                 ),
             )
             .await;
@@ -262,132 +275,153 @@ async fn start_tunnel(
         }
     };
 
-    // For TCP, create the smoltcp listener so incoming peer SYNs land.
-    // UDP skips this — the ingest path intercepts datagrams directly.
-    if matches!(proto, Proto::Tcp) {
-        let lk = listener_key(wg_ip, spec.listen_port);
-        if smoltcp
-            .ensure_listener(wg_ip, spec.listen_port, lk)
-            .await
-            .is_err()
-        {
-            let _ = registry.stop(tunnel_id);
-            send_error(
-                &smoltcp,
-                id,
-                ErrorKind::Internal,
-                "failed to create smoltcp listener".into(),
-            )
-            .await;
-            smoltcp.close_tcp(id);
-            return;
-        }
-    }
-
-    // Respond Started before the yamux handshake.
     write_resp(&smoltcp, id, &ServerResp::Started { tunnel_id }).await;
 
-    // For UDP, open a single long-lived substream for framed datagrams
-    // and kick off reader/writer tasks. Put the writer sender into the
-    // udp_tunnels side-table so ingest can push datagrams into it.
-    if matches!(proto, Proto::Udp) {
-        spawn_udp_side(&opener_tx, tunnel_id, wg_ip, spec.listen_port, udp_tunnels.clone(), egress_tx.clone()).await;
-    }
-
-    // Upgrade the control flow to yamux.
     tracing::info!(
         ?proto,
-        listen_port = spec.listen_port,
+        bind = %bind_sock,
         forward_to = %spec.forward_to,
         ?tunnel_id,
-        "reverse tunnel started; upgrading flow to yamux"
+        "reverse tunnel listening; upgrading control flow to yamux"
     );
+
+    // Spawn the accept loop. It holds the listener and owns the opener
+    // clone used to request substreams for each accepted flow.
+    let accept_task = match listener {
+        Listener::Tcp(l) => tokio::spawn(tcp_accept_loop(l, opener_tx.clone())),
+        Listener::Udp(s) => tokio::spawn(udp_accept_loop(s, opener_tx.clone())),
+    };
+
+    // Upgrade the control flow to yamux.
     let duplex = smoltcp_as_duplex(id, smoltcp.clone(), leftover, msg_rx);
     let conn = yamux::Connection::new(
         duplex.compat(),
         yamux::Config::default(),
         yamux::Mode::Server,
     );
-    // Server doesn't expect inbound substreams from the client;
-    // inbound_tx = None. If one ever arrives, drive_connection logs.
     drive_connection(conn, opener_rx, None).await;
 
-    // Client disconnected — teardown.
+    // Client disconnected or control flow closed — terminate the accept
+    // loop (dropping the listener closes the port) and drop the tunnel.
+    accept_task.abort();
     let _ = registry.stop(tunnel_id);
-    udp_tunnels.lock().unwrap().remove(&tunnel_id);
-    tracing::info!(?tunnel_id, ?proto, "reverse tunnel yamux closed; removed");
+    tracing::info!(?tunnel_id, ?proto, "reverse tunnel closed");
 }
 
-/// Open the per-UDP-tunnel yamux substream and spawn the I/O tasks that
-/// connect the UDP ingest path to it.
-async fn spawn_udp_side(
-    opener_tx: &SubstreamOpener,
-    tunnel_id: crate::wire::TunnelId,
-    wg_ip: Ipv4Addr,
-    listen_port: u16,
-    udp_tunnels: UdpTunnelMap,
-    egress_tx: mpsc::UnboundedSender<Vec<u8>>,
-) {
-    // Ask the driver to open a substream for this UDP tunnel. We do
-    // this AFTER drive_connection starts polling — but that start is
-    // below in the caller. Work around by spawning a task that waits
-    // until opener can produce a stream.
-    let opener_for_task = opener_tx.clone();
-    tokio::spawn(async move {
-        // Brief backoff loop: the driver isn't running yet when we
-        // get here; wait until it picks up the OpenRequest.
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if opener_for_task
-            .send(crate::reverse_registry::OpenRequest { reply: reply_tx })
-            .is_err()
-        {
-            tracing::debug!(?tunnel_id, "udp tunnel: opener channel closed before use");
-            return;
-        }
-        let stream = match reply_rx.await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                tracing::warn!(?tunnel_id, error = %e, "udp tunnel: yamux open_stream failed");
+/// TCP accept loop: on each peer connection, request a fresh yamux
+/// substream from the owning client and bridge bytes in both
+/// directions until either side closes.
+async fn tcp_accept_loop(listener: TcpListener, opener: SubstreamOpener) {
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::debug!(error = %e, "tcp accept failed; stopping tunnel");
                 return;
             }
-            Err(_) => return,
         };
-
-        // Split the yamux stream into reader / writer halves via the
-        // tokio compat shim.
-        use tokio_util::compat::FuturesAsyncReadCompatExt;
-        let compat = stream.compat();
-        let (mut y_r, mut y_w) = tokio::io::split(compat);
-
-        // Writer: ingest → substream.
-        let (send_tx, mut send_rx) =
-            mpsc::unbounded_channel::<(Ipv4Addr, u16, Vec<u8>)>();
-        udp_tunnels.lock().unwrap().insert(tunnel_id, send_tx);
+        let _ = tcp.set_nodelay(true);
+        tracing::debug!(%peer, "tcp tunnel: accepted, requesting substream");
+        let opener = opener.clone();
         tokio::spawn(async move {
-            while let Some((peer_ip, peer_port, payload)) = send_rx.recv().await {
-                if crate::yamux_bridge::udp_frame::write(&mut y_w, peer_ip, peer_port, &payload)
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
+            let Some(substream) = open_substream(&opener).await else {
+                return;
+            };
+            bridge_tcp_to_yamux(tcp, substream).await;
         });
+    }
+}
 
-        // Reader: substream → egress (construct UDP packet + inject).
-        tokio::spawn(async move {
-            loop {
-                let (peer_ip, peer_port, payload) =
-                    match crate::yamux_bridge::udp_frame::read(&mut y_r).await {
-                        Ok(tuple) => tuple,
-                        Err(_) => break,
-                    };
-                let pkt =
-                    crate::rewrite::build_udp_packet(wg_ip, peer_ip, listen_port, peer_port, &payload);
-                let _ = egress_tx.send(pkt);
+async fn bridge_tcp_to_yamux(tcp: TcpStream, substream: yamux::Stream) {
+    let compat = substream.compat();
+    let (mut y_r, mut y_w) = tokio::io::split(compat);
+    let (mut t_r, mut t_w) = tcp.into_split();
+    let a = tokio::io::copy(&mut y_r, &mut t_w);
+    let b = tokio::io::copy(&mut t_r, &mut y_w);
+    let _ = tokio::try_join!(a, b);
+}
+
+/// UDP accept loop: open a single substream for the tunnel, serialize
+/// outbound frames through a channel-backed writer, and run a reader
+/// that decodes frames coming back from the client and sends them to
+/// the tagged peer via the local UdpSocket.
+async fn udp_accept_loop(socket: UdpSocket, opener: SubstreamOpener) {
+    let Some(substream) = open_substream(&opener).await else {
+        return;
+    };
+    let compat = substream.compat();
+    let (mut y_r, mut y_w) = tokio::io::split(compat);
+
+    // Writer side: frames emitted into this channel are serialized and
+    // written to the yamux substream.
+    let (frame_tx, mut frame_rx) =
+        mpsc::unbounded_channel::<(Ipv4Addr, u16, Vec<u8>)>();
+    let writer = tokio::spawn(async move {
+        while let Some((ip, port, payload)) = frame_rx.recv().await {
+            if udp_frame::write(&mut y_w, ip, port, &payload).await.is_err() {
+                break;
             }
-        });
+        }
     });
+
+    let socket = Arc::new(socket);
+
+    // Reader side: client responses come back as framed datagrams on
+    // the substream; we sendto the tagged peer using the OS socket.
+    let sock_r = Arc::clone(&socket);
+    let reader = tokio::spawn(async move {
+        loop {
+            let (peer_ip, peer_port, payload) = match udp_frame::read(&mut y_r).await {
+                Ok(t) => t,
+                Err(_) => break,
+            };
+            let addr = SocketAddr::V4(SocketAddrV4::new(peer_ip, peer_port));
+            let _ = sock_r.send_to(&payload, addr).await;
+        }
+    });
+
+    // Recv loop: each datagram → framed push.
+    let mut buf = vec![0u8; 65_535];
+    loop {
+        let (n, peer) = match socket.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::debug!(error = %e, "udp recv_from failed; stopping tunnel");
+                break;
+            }
+        };
+        let SocketAddr::V4(peer) = peer else {
+            // IPv6 peers aren't modelled by the frame format yet.
+            continue;
+        };
+        if frame_tx
+            .send((*peer.ip(), peer.port(), buf[..n].to_vec()))
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    reader.abort();
+    writer.abort();
+}
+
+/// Request a new outbound substream on the owning client's yamux
+/// connection via the shared `SubstreamOpener` channel.
+async fn open_substream(opener: &SubstreamOpener) -> Option<yamux::Stream> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if opener.send(OpenRequest { reply: reply_tx }).is_err() {
+        tracing::debug!("opener channel closed; skipping substream");
+        return None;
+    }
+    match reply_rx.await {
+        Ok(Ok(s)) => Some(s),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "yamux open_stream failed");
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 async fn read_n(
@@ -450,5 +484,15 @@ mod tests {
         let a = listener_key(Ipv4Addr::new(10, 0, 0, 2), 57821);
         let b = listener_key(Ipv4Addr::new(10, 0, 0, 2), 57821);
         assert_ne!(a, b, "each listener_key call must produce a fresh key");
+    }
+
+    #[test]
+    fn bind_ip_resolves() {
+        assert_eq!(bind_ip(BindAddr::Default), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(bind_ip(BindAddr::Any), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            bind_ip(BindAddr::Ipv4(Ipv4Addr::new(192, 168, 1, 1))),
+            Ipv4Addr::new(192, 168, 1, 1)
+        );
     }
 }

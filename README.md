@@ -147,7 +147,7 @@ burrow gen --endpoint <ip:port>
            [--out ./burrow-configs]
 burrow keygen
 
-burrow-client <wg_ip> tunnel start -R LISTEN:HOST:PORT [-U]
+burrow-client <wg_ip> tunnel start -R [BIND:]LISTEN:HOST:PORT [-U]
 burrow-client <wg_ip> tunnel stop  <tunnel_id>
 burrow-client <wg_ip> tunnel list
 burrow-client <wg_ip> shell                                  # interactive PTY
@@ -156,6 +156,12 @@ burrow-client <wg_ip> shell --output run.log                 # one-shot to file
 burrow-client <wg_ip> shell --detach                         # fire-and-forget (returns pid)
 burrow-client <wg_ip> shell --program <exe> -- <args...>     # custom program + argv
 ```
+
+`BIND` (optional) selects which OS interface on the burrow host the
+tunnel's listener binds on. Omitted = default (currently `0.0.0.0`,
+INADDR_ANY). `0.0.0.0` = explicit INADDR_ANY. Any other IPv4 = bind
+only to that interface (the burrow host must actually own the
+address, same rule as any program calling `bind()`).
 
 ## Examples
 
@@ -185,9 +191,18 @@ burrow-client 10.0.0.2 tunnel start -R 443:127.0.0.1:8080
 # tunnel 1 started (Tcp 443 -> 127.0.0.1:8080). press ctrl-c to stop.
 ```
 
-The tunnel stays up until Ctrl-C. Peer connections to `(10.0.0.2, 443)`
-land on `127.0.0.1:8080` of the client machine. Hostnames work too:
-`-R 443:internal.corp.lan:8080`.
+The tunnel stays up until Ctrl-C. Connections to `burrow_host:443` (on
+any OS interface, since no BIND prefix was given) land on
+`127.0.0.1:8080` of the client machine. Hostnames for the forward-to
+target work too: `-R 443:internal.corp.lan:8080`.
+
+Pin the listener to a single interface:
+
+```sh
+burrow-client 10.0.0.2 tunnel start -R 192.168.1.50:443:127.0.0.1:8080
+# only accepts connections arriving on the burrow host's 192.168.1.50
+# interface
+```
 
 ### UDP tunnel for a DNS forwarder
 
@@ -283,10 +298,12 @@ Useful filters:
    in userspace and tunnels it back - semantically accurate and distinguishable
    from host-unreachable.
 6. For reverse tunnels, `burrow-client tunnel start` holds a control flow
-   open as a yamux client. When a peer hits the listen port, burrow opens an
-   outbound yamux substream to the owning client; the client dials its local
-   `forward_to` and pipes bytes. UDP tunnels use one shared substream carrying
-   length-plus-peer-tagged datagram frames.
+   open as a yamux client. The burrow host binds a real OS `TcpListener`
+   or `UdpSocket` on the requested interface (default `0.0.0.0`). When a
+   peer connects, burrow opens an outbound yamux substream to the owning
+   client; the client dials its local `forward_to` and pipes bytes. UDP
+   tunnels use one shared substream carrying length-plus-peer-tagged
+   datagram frames.
 
 On egress, the source IP and port are restored from the NAT table before the
 packet goes back through boringtun.

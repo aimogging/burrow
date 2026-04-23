@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use burrow::config;
-use burrow::control::{listener_key, spawn_control_handler, UdpTunnelMap};
+use burrow::control::{listener_key, spawn_control_handler};
 use burrow::icmp::{
     build_echo_reply_for_wg_ip, send_dest_unreachable, IcmpForwarder,
     ICMP_CODE_HOST_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE,
@@ -22,13 +22,11 @@ use burrow::icmp::{
 use burrow::nat::{NatKey, NatTable};
 use burrow::probe::{classify_connect_error, ConnectClass};
 use burrow::proxy::{spawn_tcp_proxy_with_stream, ProxyMsg};
-use burrow::reverse_registry::{OpenRequest, ReverseRegistry};
+use burrow::reverse_registry::ReverseRegistry;
 use burrow::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 use burrow::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
 use burrow::tunnel::WgTunnel;
 use burrow::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
-use burrow::wire::Proto;
-use burrow::yamux_bridge::bridge_yamux_to_smoltcp;
 
 
 /// Optional config baked in at build time via the `embedded-config` feature.
@@ -347,14 +345,12 @@ async fn run(
     // back to the peer after the OS-side connect succeeds.
     let (arm_tx, mut arm_rx) = mpsc::unbounded_channel::<(NatKey, TcpStream)>();
 
-    // Reverse-tunnel registry: control handlers insert/remove entries,
-    // the event loop reads them on TcpConnected to dispatch registered
-    // ports to the owning client's yamux connection.
+    // Reverse-tunnel registry: control handlers populate it on tunnel
+    // start and drain on client disconnect. The event loop never reads
+    // from it — reverse tunnels bind real OS listeners on the burrow
+    // host's network interfaces, so peer traffic reaches the tunnel
+    // through the kernel, not through smoltcp.
     let reverse_registry = Arc::new(ReverseRegistry::new());
-    // UDP reverse-tunnel side-table keyed by tunnel_id. control
-    // handlers populate it on tunnel start; ingest consults it to
-    // route incoming datagrams into the owning client's substream.
-    let udp_tunnels: UdpTunnelMap = Arc::new(Mutex::new(HashMap::new()));
     let control_port = cfg.interface.control_port;
 
     // Bootstrap the first control-port listener. Subsequent listeners
@@ -372,8 +368,6 @@ async fn run(
         let smoltcp = smoltcp.clone();
         let nat = Arc::clone(&nat);
         let reverse_registry = Arc::clone(&reverse_registry);
-        let udp_tunnels = Arc::clone(&udp_tunnels);
-        let egress_tx_for_events = egress_tx.clone();
         async move {
             let mut proxies: HashMap<ConnectionId, mpsc::UnboundedSender<ProxyMsg>> =
                 HashMap::new();
@@ -401,36 +395,15 @@ async fn run(
                                 let tx = spawn_control_handler(
                                     id,
                                     smoltcp.clone(),
-                                    wg_ip,
                                     Arc::clone(&reverse_registry),
-                                    Arc::clone(&udp_tunnels),
-                                    egress_tx_for_events.clone(),
                                 );
                                 proxies.insert(id, tx);
                             } else if key.original_dst_ip == wg_ip {
-                                // Reverse-tunnel port? Lookup in registry.
-                                let Some(entry) = reverse_registry
-                                    .lookup(Proto::Tcp, key.original_dst_ip, key.original_dst_port, wg_ip)
-                                else {
-                                    warn!(
-                                        ?key,
-                                        ?id,
-                                        "TCP to unregistered wg_ip port — aborting"
-                                    );
-                                    smoltcp.abort_tcp(id);
-                                    continue;
-                                };
-                                // Re-arm the reverse listener for next peer.
-                                let next_key = listener_key(wg_ip, key.original_dst_port);
-                                let _ = smoltcp
-                                    .ensure_listener(wg_ip, key.original_dst_port, next_key)
-                                    .await;
-                                let tx = spawn_reverse_tcp_yamux_bridge(
-                                    id,
-                                    smoltcp.clone(),
-                                    entry,
-                                );
-                                proxies.insert(id, tx);
+                                // Anything else to wg_ip is unsolicited —
+                                // reverse tunnels bind real OS sockets,
+                                // so smoltcp traffic here has no handler.
+                                warn!(?key, ?id, "TCP to unregistered wg_ip port — aborting");
+                                smoltcp.abort_tcp(id);
                             } else {
                                 // NAT path (existing).
                                 let Some(stream) = armed.remove(&key) else {
@@ -467,36 +440,23 @@ async fn run(
                         }
                         SmoltcpEvent::TcpAborted { key, id } => {
                             debug!(?key, ?id, "tcp aborted before establishment");
-                            // If a bridge or control handler is listening on
-                            // this id, signal Closed so it tears down.
                             if let Some(tx) = proxies.remove(&id) {
                                 let _ = tx.send(ProxyMsg::Closed);
                             }
-                            // Drop any pre-dialed OS stream from the NAT path.
                             armed.remove(&key);
-                            // Well-known listeners (control port, reverse-
-                            // tunnel listen_port) are single-accept sockets:
-                            // the listener IS the connection once a SYN
-                            // lands. If the flow aborts before reaching
-                            // Established, the listener slot is gone and no
-                            // re-arm happened on TcpConnected. Re-arm here
-                            // so the service stays responsive to the next
-                            // peer. No-op for NAT flows (peer_ip != UNSPEC).
+                            // Re-arm the control-port listener if the
+                            // aborting flow was for it (single-accept
+                            // socket semantics mean the listener slot
+                            // is gone and we didn't hit TcpConnected).
                             if key.peer_ip == Ipv4Addr::UNSPECIFIED
                                 && key.original_dst_ip == wg_ip
+                                && key.original_dst_port == control_port
                             {
-                                let port = key.original_dst_port;
-                                let re_arm = port == control_port
-                                    || reverse_registry
-                                        .lookup(Proto::Tcp, wg_ip, port, wg_ip)
-                                        .is_some();
-                                if re_arm {
-                                    let next = listener_key(wg_ip, port);
-                                    let _ = smoltcp
-                                        .ensure_listener(wg_ip, port, next)
-                                        .await;
-                                    debug!(%wg_ip, port, "re-armed well-known listener after abort");
-                                }
+                                let next = listener_key(wg_ip, control_port);
+                                let _ = smoltcp
+                                    .ensure_listener(wg_ip, control_port, next)
+                                    .await;
+                                debug!(%wg_ip, control_port, "re-armed control listener after abort");
                             }
                         }
                     },
@@ -559,8 +519,6 @@ async fn run(
                             &arm_tx,
                             &icmp,
                             wg_ip,
-                            &reverse_registry,
-                            &udp_tunnels,
                             dns_enabled,
                         ).await;
                     }
@@ -590,8 +548,6 @@ async fn ingest_tunnel_packet(
     arm_tx: &mpsc::UnboundedSender<(NatKey, TcpStream)>,
     icmp: &Arc<IcmpForwarder>,
     wg_ip: std::net::Ipv4Addr,
-    reverse_registry: &Arc<ReverseRegistry>,
-    udp_tunnels: &UdpTunnelMap,
     dns_enabled: bool,
 ) {
     let view = match rewrite::parse_5tuple(&packet) {
@@ -627,8 +583,6 @@ async fn ingest_tunnel_packet(
             &packet,
             &view,
             wg_ip,
-            reverse_registry,
-            udp_tunnels,
             egress_tx,
             dns_enabled,
         )
@@ -875,54 +829,4 @@ fn send_rst(egress_tx: &mpsc::UnboundedSender<Vec<u8>>, key: NatKey, peer_seq: u
         peer_seq.wrapping_add(1),
     );
     let _ = egress_tx.send(rst);
-}
-
-/// Spawn a task that bridges one peer-initiated TCP flow (accepted on a
-/// registered reverse-tunnel listen port) through to a fresh yamux
-/// substream on the owning client's connection. The client dials its
-/// local `forward_to` and pumps bytes back across the substream.
-///
-/// Returns the `ProxyMsg` sender that the event loop uses to feed TCP
-/// data/FIN/close notifications. If the substream open fails (client
-/// disconnected mid-dispatch), the smoltcp side is aborted.
-fn spawn_reverse_tcp_yamux_bridge(
-    incoming_id: ConnectionId,
-    smoltcp: SmoltcpHandle,
-    entry: burrow::reverse_registry::RegEntry,
-) -> mpsc::UnboundedSender<ProxyMsg> {
-    let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ProxyMsg>();
-    tokio::spawn(async move {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        if entry.opener.send(OpenRequest { reply: reply_tx }).is_err() {
-            warn!(?incoming_id, "reverse tcp bridge: opener channel closed — aborting peer");
-            smoltcp.abort_tcp(incoming_id);
-            return;
-        }
-        let stream = match reply_rx.await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                warn!(?incoming_id, error = %e, "reverse tcp bridge: open_stream failed — aborting peer");
-                smoltcp.abort_tcp(incoming_id);
-                return;
-            }
-            Err(_) => {
-                warn!(?incoming_id, "reverse tcp bridge: opener dropped reply — aborting peer");
-                smoltcp.abort_tcp(incoming_id);
-                return;
-            }
-        };
-        // Wrap the smoltcp flow as a tokio DuplexStream and pump bytes
-        // symmetrically between it and the yamux substream.
-        let duplex = burrow::yamux_bridge::smoltcp_as_duplex(
-            incoming_id,
-            smoltcp.clone(),
-            Vec::new(),
-            msg_rx,
-        );
-        if let Err(e) = bridge_yamux_to_smoltcp(stream, duplex).await {
-            debug!(?incoming_id, error = %e, "reverse tcp bridge: pump exited");
-        }
-        smoltcp.close_tcp(incoming_id);
-    });
-    msg_tx
 }

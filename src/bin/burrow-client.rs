@@ -145,9 +145,9 @@ async fn connect_control(addr: SocketAddrV4) -> Result<TcpStream> {
 async fn run_tunnel(addr: SocketAddrV4, action: TunnelCmd) -> Result<ExitCode> {
     match action {
         TunnelCmd::Start { spec, udp } => {
-            let (listen_port, forward_to) = parse_r_spec(&spec)?;
+            let (bind, listen_port, forward_to) = parse_r_spec(&spec)?;
             let proto = if udp { Proto::Udp } else { Proto::Tcp };
-            run_tunnel_start(addr, proto, listen_port, forward_to).await
+            run_tunnel_start(addr, proto, bind, listen_port, forward_to).await
         }
         TunnelCmd::Stop { tunnel_id } => {
             let req = ClientReq::StopReverse {
@@ -271,13 +271,14 @@ async fn run_shell(addr: SocketAddrV4, args: ShellArgs) -> Result<ExitCode> {
 
 /// Start a reverse tunnel and hold the control flow open. After the
 /// `Started` response, upgrades the flow to a yamux client. Each time
-/// a peer connects to `wg_ip:listen_port`, the server opens a new
-/// outbound substream — this binary accepts it, dials `forward_to`
-/// locally, and pumps bytes. Exits on Ctrl-C or when the control flow
-/// drops (burrow restarted, network blip, etc).
+/// a peer connects to `<bind>:listen_port` on the burrow host's OS
+/// interfaces, the server opens a new outbound substream — this
+/// binary accepts it, dials `forward_to` locally, and pumps bytes.
+/// Exits on Ctrl-C or when the control flow drops.
 async fn run_tunnel_start(
     addr: SocketAddrV4,
     proto: Proto,
+    bind: BindAddr,
     listen_port: u16,
     forward_to: String,
 ) -> Result<ExitCode> {
@@ -285,7 +286,7 @@ async fn run_tunnel_start(
     let spec = TunnelSpec {
         listen_port,
         forward_to: forward_to.clone(),
-        bind: BindAddr::Default,
+        bind,
     };
     let req = match proto {
         Proto::Tcp => ClientReq::StartTcpTunnel(spec),
@@ -303,10 +304,15 @@ async fn run_tunnel_start(
         }
         other => bail!("unexpected response: {other:?}"),
     };
+    let bind_label = match bind {
+        BindAddr::Default | BindAddr::Any => "0.0.0.0".to_string(),
+        BindAddr::Ipv4(x) => x.to_string(),
+    };
     eprintln!(
-        "tunnel {} started ({:?} {} -> {}). press ctrl-c to stop.",
+        "tunnel {} started ({:?} {}:{} -> {}). press ctrl-c to stop.",
         tunnel_id.0,
         proto,
+        bind_label,
         listen_port,
         forward_to
     );
@@ -764,19 +770,44 @@ async fn run_shell_interactive(
     }))
 }
 
-/// Parse `LISTEN:HOST:PORT`. LISTEN and PORT are u16; HOST is any
-/// string the local machine can resolve (IPv4, IPv6-literal-in-brackets,
-/// hostname). Resolution happens at substream time, not at parse time,
-/// so DNS failures are surfaced per-connection.
-fn parse_r_spec(spec: &str) -> Result<(u16, String)> {
-    // Rightmost colon separates PORT; leftmost separates LISTEN. This
-    // lets HOST contain colons (e.g. an IPv6 literal in brackets).
-    let (rest, port_str) = spec
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("expected LISTEN:HOST:PORT, got `{spec}`"))?;
-    let (listen_str, host) = rest
-        .split_once(':')
-        .ok_or_else(|| anyhow!("expected LISTEN:HOST:PORT, got `{spec}`"))?;
+/// Parse `[BIND:]LISTEN:HOST:PORT`.
+///
+/// * Without a BIND prefix (3 parts): `BindAddr::Default` — burrow
+///   picks a sensible default (currently `0.0.0.0`).
+/// * With a BIND prefix (4 parts): BIND is an IPv4 address. `0.0.0.0`
+///   becomes `BindAddr::Any`; anything else becomes
+///   `BindAddr::Ipv4(x)` and requires the burrow host to own an
+///   interface with that address (the kernel enforces this at bind
+///   time).
+///
+/// LISTEN and PORT are u16. HOST is any string the client's local
+/// machine can resolve (IPv4, hostname, etc.); resolution happens at
+/// substream time.
+fn parse_r_spec(spec: &str) -> Result<(BindAddr, u16, String)> {
+    let parts: Vec<&str> = spec.splitn(4, ':').collect();
+    let (bind, listen_str, host, port_str) = match parts.len() {
+        3 => (
+            BindAddr::Default,
+            parts[0],
+            parts[1].to_string(),
+            parts[2],
+        ),
+        4 => {
+            let bind_ip: Ipv4Addr = parts[0].parse().with_context(|| {
+                format!(
+                    "invalid BIND `{}` — must be an IPv4 address (e.g. 0.0.0.0, 127.0.0.1, 192.168.1.1)",
+                    parts[0]
+                )
+            })?;
+            let bind = if bind_ip == Ipv4Addr::UNSPECIFIED {
+                BindAddr::Any
+            } else {
+                BindAddr::Ipv4(bind_ip)
+            };
+            (bind, parts[1], parts[2].to_string(), parts[3])
+        }
+        _ => bail!("expected [BIND:]LISTEN:HOST:PORT, got `{spec}`"),
+    };
     let listen: u16 = listen_str
         .parse()
         .with_context(|| format!("invalid LISTEN port `{listen_str}`"))?;
@@ -786,7 +817,7 @@ fn parse_r_spec(spec: &str) -> Result<(u16, String)> {
     if host.is_empty() {
         bail!("empty HOST in `{spec}`");
     }
-    Ok((listen, format!("{host}:{port}")))
+    Ok((bind, listen, format!("{host}:{port}")))
 }
 
 #[cfg(test)]
@@ -794,17 +825,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_r_spec_happy_ipv4() {
-        let (listen, fwd) = parse_r_spec("443:127.0.0.1:443").unwrap();
+    fn parse_r_spec_3part_defaults_bind() {
+        let (bind, listen, fwd) = parse_r_spec("443:127.0.0.1:443").unwrap();
+        assert_eq!(bind, BindAddr::Default);
         assert_eq!(listen, 443);
         assert_eq!(fwd, "127.0.0.1:443");
     }
 
     #[test]
     fn parse_r_spec_happy_hostname() {
-        let (listen, fwd) = parse_r_spec("8080:example.com:80").unwrap();
+        let (bind, listen, fwd) = parse_r_spec("8080:example.com:80").unwrap();
+        assert_eq!(bind, BindAddr::Default);
         assert_eq!(listen, 8080);
         assert_eq!(fwd, "example.com:80");
+    }
+
+    #[test]
+    fn parse_r_spec_bind_any() {
+        let (bind, listen, fwd) = parse_r_spec("0.0.0.0:443:127.0.0.1:443").unwrap();
+        assert_eq!(bind, BindAddr::Any);
+        assert_eq!(listen, 443);
+        assert_eq!(fwd, "127.0.0.1:443");
+    }
+
+    #[test]
+    fn parse_r_spec_bind_specific() {
+        let (bind, listen, fwd) = parse_r_spec("10.0.0.2:443:127.0.0.1:443").unwrap();
+        assert_eq!(bind, BindAddr::Ipv4(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_eq!(listen, 443);
+        assert_eq!(fwd, "127.0.0.1:443");
     }
 
     #[test]

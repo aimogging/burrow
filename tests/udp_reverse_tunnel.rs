@@ -1,137 +1,214 @@
-//! Phase 14 integration test: UDP reverse-tunnel ingest dispatch.
+//! End-to-end UDP reverse tunnel test. Under the OS-listener model:
 //!
-//! Under the client-originated tunnel model, burrow does NOT originate
-//! UDP toward `forward_to`. Instead, a peer datagram to a registered
-//! `(wg_ip, listen_port)` gets pushed into the owning client's
-//! `UdpTunnelHandle` via the `UdpTunnelMap` side-table. The owning
-//! client reads the framed datagram off its yamux substream and dials
-//! `forward_to` from its own machine.
+//! 1. Server side (control handler analog) binds a real `UdpSocket`
+//!    on `127.0.0.1:PORT` and runs the UDP accept loop against a
+//!    yamux substream.
+//! 2. Client side runs a yamux client on the other end of the duplex
+//!    control flow; when the server opens the tunnel substream, the
+//!    client pumps framed datagrams back and forth with a simulated
+//!    `forward_to` (here: an in-test echo socket).
+//! 3. Test sends a UDP datagram to `127.0.0.1:PORT`, expects the
+//!    framed datagram to reach the echoer, and the echoed response
+//!    to arrive back on the test's sending socket.
 //!
-//! This test drives `dispatch_udp_to_wg_ip` directly and asserts the
-//! tunnel handle receives the expected `(peer_ip, peer_port, payload)`.
-//! The reply path (substream bytes → outbound UDP packet) lives in
-//! `control::spawn_udp_side` and is exercised by the end-to-end
-//! reverse-tunnel tests.
+//! Exercises the full path: OS `UdpSocket.recv_from` → yamux frame →
+//! client-side UDP originate → response framed → server-side
+//! `UdpSocket.send_to` → test receives.
 
-use std::collections::HashMap;
-use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-use burrow::control::{UdpTunnelHandle, UdpTunnelMap};
-use burrow::reverse_registry::{OpenRequest, ReverseRegistry, SubstreamOpener};
-use burrow::rewrite::{build_udp_packet, parse_5tuple};
-use burrow::udp_reverse::dispatch_udp_to_wg_ip;
-use burrow::wire::{BindAddr, Proto, TunnelId};
+use burrow::reverse_registry::{OpenRequest, SubstreamOpener};
+use burrow::yamux_bridge::{drive_connection, udp_frame};
 
-const WG_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
-const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
-const LISTEN_PORT: u16 = 53;
-const PEER_PORT: u16 = 44000;
+const LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 
-fn dummy_opener() -> SubstreamOpener {
-    let (tx, _rx) = mpsc::unbounded_channel::<OpenRequest>();
-    tx
+async fn bind_local_udp() -> (Arc<UdpSocket>, u16) {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = sock.local_addr().unwrap().port();
+    (Arc::new(sock), port)
 }
 
-fn install_tunnel(
-    registry: &Arc<ReverseRegistry>,
-    udp_tunnels: &UdpTunnelMap,
-    listen_port: u16,
-    forward_to: &str,
-) -> (TunnelId, mpsc::UnboundedReceiver<(Ipv4Addr, u16, Vec<u8>)>) {
-    let tunnel_id = registry
-        .start(
-            Proto::Udp,
-            listen_port,
-            BindAddr::Default,
-            forward_to.to_string(),
-            dummy_opener(),
-        )
-        .unwrap();
-    let (handle, rx): (UdpTunnelHandle, _) = mpsc::unbounded_channel();
-    udp_tunnels.lock().unwrap().insert(tunnel_id, handle);
-    (tunnel_id, rx)
+/// Server-side UDP accept loop: mirrors `control::udp_accept_loop`
+/// without the surrounding control-flow plumbing. Takes ownership of
+/// an already-bound `UdpSocket` and a `SubstreamOpener`.
+async fn server_udp_loop(socket: Arc<UdpSocket>, opener: SubstreamOpener) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    opener.send(OpenRequest { reply: reply_tx }).unwrap();
+    let substream = reply_rx.await.unwrap().unwrap();
+
+    let compat = substream.compat();
+    let (mut y_r, mut y_w) = tokio::io::split(compat);
+
+    let (frame_tx, mut frame_rx) =
+        mpsc::unbounded_channel::<(Ipv4Addr, u16, Vec<u8>)>();
+    tokio::spawn(async move {
+        while let Some((ip, port, payload)) = frame_rx.recv().await {
+            let _ = udp_frame::write(&mut y_w, ip, port, &payload).await;
+        }
+    });
+
+    let sock_r = Arc::clone(&socket);
+    tokio::spawn(async move {
+        loop {
+            let (peer_ip, peer_port, payload) = match udp_frame::read(&mut y_r).await {
+                Ok(x) => x,
+                Err(_) => return,
+            };
+            let addr = SocketAddr::V4(SocketAddrV4::new(peer_ip, peer_port));
+            let _ = sock_r.send_to(&payload, addr).await;
+        }
+    });
+
+    let mut buf = vec![0u8; 65_535];
+    loop {
+        let (n, peer) = match socket.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(_) => return,
+        };
+        let SocketAddr::V4(peer) = peer else { continue };
+        if frame_tx
+            .send((*peer.ip(), peer.port(), buf[..n].to_vec()))
+            .is_err()
+        {
+            return;
+        }
+    }
 }
 
-#[tokio::test]
-async fn udp_reverse_forwards_to_tunnel_handle() {
-    let registry = Arc::new(ReverseRegistry::new());
-    let udp_tunnels: UdpTunnelMap = Arc::new(Mutex::new(HashMap::new()));
-    let (_, mut handle_rx) =
-        install_tunnel(&registry, &udp_tunnels, LISTEN_PORT, "10.0.0.3:5353");
-    let (egress_tx, mut egress_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+/// Client-side forward_to dialer: when a framed datagram arrives,
+/// send to a local UDP echo socket and frame the echo back.
+async fn client_udp_echoer(
+    substream: yamux::Stream,
+    forward_to: SocketAddr,
+) {
+    let compat = substream.compat();
+    let (mut y_r, mut y_w) = tokio::io::split(compat);
 
-    // Peer sends UDP to (wg_ip, LISTEN_PORT).
-    let query = b"DNS-LIKE-QUERY";
-    let inbound = build_udp_packet(PEER_IP, WG_IP, PEER_PORT, LISTEN_PORT, query);
-    let view = parse_5tuple(&inbound).unwrap();
-    dispatch_udp_to_wg_ip(&inbound, &view, WG_IP, &registry, &udp_tunnels, &egress_tx, false)
-        .await;
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<(Ipv4Addr, u16, Vec<u8>)>();
+    tokio::spawn(async move {
+        while let Some((ip, port, data)) = reply_rx.recv().await {
+            let _ = udp_frame::write(&mut y_w, ip, port, &data).await;
+        }
+    });
 
-    // The owning client's handle should receive the framed datagram.
-    let (peer_ip, peer_port, payload) =
-        handle_rx.try_recv().expect("tunnel handle should receive the datagram");
-    assert_eq!(peer_ip, PEER_IP);
-    assert_eq!(peer_port, PEER_PORT);
-    assert_eq!(payload, query);
+    loop {
+        let (peer_ip, peer_port, payload) = match udp_frame::read(&mut y_r).await {
+            Ok(x) => x,
+            Err(_) => return,
+        };
+        // Dial forward_to from a fresh ephemeral socket, send the
+        // payload, receive the echo, frame it back. Real burrow-client
+        // holds one socket per peer; the test is simpler.
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.connect(forward_to).await.unwrap();
+        sock.send(&payload).await.unwrap();
+        let mut buf = vec![0u8; 65_535];
+        let n = sock.recv(&mut buf).await.unwrap();
+        let _ = reply_tx.send((peer_ip, peer_port, buf[..n].to_vec()));
+    }
+}
 
-    // No outbound UDP packet should leave burrow — the client is the
-    // origination point under the new model.
-    assert!(
-        egress_rx.try_recv().is_err(),
-        "burrow must not originate UDP in the client-originated model"
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn udp_reverse_tunnel_roundtrip() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,burrow=info")
+        .with_test_writer()
+        .try_init();
+
+    // Duplex stream stands in for the burrow-client <-> burrow control
+    // flow (the part that is smoltcp-backed in production).
+    let (server_side, client_side) = tokio::io::duplex(64 * 1024);
+
+    // Server opener (produced inside start_tunnel) — we emulate the
+    // essential parts: bind an OS socket and run the UDP accept loop.
+    let (opener_tx, opener_rx) = mpsc::unbounded_channel::<OpenRequest>();
+
+    // Server yamux: drives the connection, serves outbound opens.
+    let server_task = tokio::spawn(async move {
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+        let conn = yamux::Connection::new(
+            server_side.compat(),
+            yamux::Config::default(),
+            yamux::Mode::Server,
+        );
+        drive_connection(conn, opener_rx, None).await;
+    });
+
+    // Echo target for "client's forward_to".
+    let (echo_sock, echo_port) = bind_local_udp().await;
+    let echo_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        loop {
+            let Ok((n, peer)) = echo_sock.recv_from(&mut buf).await else {
+                return;
+            };
+            let _ = echo_sock.send_to(&buf[..n], peer).await;
+        }
+    });
+
+    // Client-side yamux: accepts the single substream the server opens
+    // for the UDP tunnel; runs the client-side frame pump against the
+    // echo target.
+    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<yamux::Stream>();
+    let (_client_opener_tx, client_opener_rx) = mpsc::unbounded_channel::<OpenRequest>();
+    let client_task = tokio::spawn({
+        async move {
+            use tokio_util::compat::TokioAsyncReadCompatExt;
+            let conn = yamux::Connection::new(
+                client_side.compat(),
+                yamux::Config::default(),
+                yamux::Mode::Client,
+            );
+            drive_connection(conn, client_opener_rx, Some(inbound_tx)).await;
+        }
+    });
+
+    let echoer_task = tokio::spawn(async move {
+        let substream = inbound_rx.recv().await.expect("inbound substream");
+        let forward_to = SocketAddr::V4(SocketAddrV4::new(LOOPBACK, echo_port));
+        client_udp_echoer(substream, forward_to).await;
+    });
+
+    // Bind the real OS listener the "server side of the tunnel" owns
+    // (this is what start_tunnel would do for Proto::Udp).
+    let (server_sock, server_port) = bind_local_udp().await;
+    let server_udp_task = tokio::spawn(server_udp_loop(
+        Arc::clone(&server_sock),
+        opener_tx.clone(),
+    ));
+
+    // Now: send a datagram from a fresh client socket to the tunnel's
+    // server-bound port. Expect the bytes to tunnel across, hit the
+    // echo target, come back, and arrive on our sending socket.
+    let tester = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dst = SocketAddr::V4(SocketAddrV4::new(LOOPBACK, server_port));
+    tester.send_to(b"hello tunnel", dst).await.unwrap();
+
+    let mut reply = vec![0u8; 1024];
+    let recv = tokio::time::timeout(
+        Duration::from_secs(3),
+        tester.recv_from(&mut reply),
+    )
+    .await
+    .expect("echo reply timeout")
+    .unwrap();
+    let (n, from) = recv;
+    assert_eq!(&reply[..n], b"hello tunnel", "echo payload mismatch");
+    assert_eq!(
+        from,
+        dst,
+        "reply source should be the tunnel's server port"
     );
 
-    // A second datagram on the same flow goes through the same handle.
-    let q2 = b"Q2";
-    let inbound2 = build_udp_packet(PEER_IP, WG_IP, PEER_PORT, LISTEN_PORT, q2);
-    let view2 = parse_5tuple(&inbound2).unwrap();
-    dispatch_udp_to_wg_ip(&inbound2, &view2, WG_IP, &registry, &udp_tunnels, &egress_tx, false)
-        .await;
-    let (_, _, p2) = handle_rx.try_recv().expect("second datagram delivered");
-    assert_eq!(p2, q2);
-}
-
-#[tokio::test]
-async fn udp_to_unregistered_port_drops_silently() {
-    let registry = Arc::new(ReverseRegistry::new());
-    let udp_tunnels: UdpTunnelMap = Arc::new(Mutex::new(HashMap::new()));
-    let (egress_tx, mut egress_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-    let bogus = build_udp_packet(PEER_IP, WG_IP, PEER_PORT, 9999, b"nope");
-    let view = parse_5tuple(&bogus).unwrap();
-    dispatch_udp_to_wg_ip(&bogus, &view, WG_IP, &registry, &udp_tunnels, &egress_tx, false)
-        .await;
-
-    assert!(
-        egress_rx.try_recv().is_err(),
-        "datagrams to unregistered ports must not generate egress"
-    );
-}
-
-#[tokio::test]
-async fn udp_with_missing_tunnel_handle_drops_silently() {
-    // Registry knows about the tunnel but the side-table handle isn't
-    // installed yet (racy startup window). Ingest must not panic; the
-    // datagram is dropped.
-    let registry = Arc::new(ReverseRegistry::new());
-    let udp_tunnels: UdpTunnelMap = Arc::new(Mutex::new(HashMap::new()));
-    registry
-        .start(
-            Proto::Udp,
-            LISTEN_PORT,
-            BindAddr::Default,
-            "10.0.0.3:5353".to_string(),
-            dummy_opener(),
-        )
-        .unwrap();
-    let (egress_tx, mut egress_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-    let inbound = build_udp_packet(PEER_IP, WG_IP, PEER_PORT, LISTEN_PORT, b"orphan");
-    let view = parse_5tuple(&inbound).unwrap();
-    dispatch_udp_to_wg_ip(&inbound, &view, WG_IP, &registry, &udp_tunnels, &egress_tx, false)
-        .await;
-    assert!(egress_rx.try_recv().is_err());
+    server_udp_task.abort();
+    echoer_task.abort();
+    client_task.abort();
+    echo_task.abort();
+    server_task.abort();
 }

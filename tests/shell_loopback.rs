@@ -7,12 +7,12 @@
 //! response, close. Mirrors the `control_loopback.rs` shape.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use burrow::control::{listener_key, spawn_control_handler, UdpTunnelMap};
+use burrow::control::{listener_key, spawn_control_handler};
 use burrow::nat::NatTable;
 use burrow::proxy::ProxyMsg;
 use burrow::reverse_registry::ReverseRegistry;
@@ -49,8 +49,6 @@ async fn shell_oneshot_returns_captured_output() {
     let nat = Arc::new(NatTable::new());
     let (runtime, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), WG_IP);
     let registry = Arc::new(ReverseRegistry::new());
-    let udp_tunnels: UdpTunnelMap = Arc::new(Mutex::new(HashMap::new()));
-    let (egress_tx, _egress_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let _ = runtime
         .ensure_listener(WG_IP, CONTROL_PORT, listener_key(WG_IP, CONTROL_PORT))
         .await
@@ -59,8 +57,6 @@ async fn shell_oneshot_returns_captured_output() {
     let event_task = tokio::spawn({
         let runtime = runtime.clone();
         let registry = Arc::clone(&registry);
-        let udp_tunnels = Arc::clone(&udp_tunnels);
-        let egress_tx = egress_tx.clone();
         async move {
             let mut proxies: HashMap<ConnectionId, mpsc::UnboundedSender<ProxyMsg>> =
                 HashMap::new();
@@ -73,10 +69,7 @@ async fn shell_oneshot_returns_captured_output() {
                             let tx = spawn_control_handler(
                                 id,
                                 runtime.clone(),
-                                WG_IP,
                                 Arc::clone(&registry),
-                                Arc::clone(&udp_tunnels),
-                                egress_tx.clone(),
                             );
                             proxies.insert(id, tx);
                         } else {
