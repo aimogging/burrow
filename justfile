@@ -92,9 +92,12 @@ embed CONFIG TARGET=target:
     cargo build --bin burrow-client --profile min --features silent @t
 
 # Generate the config trio AND build min-sized binaries in one step.
+# `cargo run` is always host-arch (we need the binary that produces the
+# configs to run here); the embed step honors `target` (set via env var
+# BURROW_TARGET or `just target=X gen-embed ...`).
 gen-embed *GEN_ARGS:
     cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs
-    @just embed ./burrow-configs/burrow.conf
+    @just embed ./burrow-configs/burrow.conf {{target}}
 
 # Passthrough to `burrow-client gen`. Same args as the binary's gen subcommand.
 gen *ARGS:
