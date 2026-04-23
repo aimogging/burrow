@@ -112,13 +112,27 @@ cargo build --release
 
 ### With just (build helpers)
 
+[just](https://github.com/casey/just) is a small cross-platform command
+runner. The `justfile` at the repo root has Windows + Unix recipes for
+the common build paths.
+
 ```sh
-just build            # release build
-just test             # full test suite
-just embed CONFIG     # self-contained binary with CONFIG baked in (min-sized, silent)
+just build                            # debug build
+just release                          # release build
+just release TARGET                   # release build, cross-compiled
+just test                             # full test suite
+just embed CONFIG                     # min-sized silent binary with CONFIG baked in
+just embed CONFIG TARGET              # cross-compiled embedded binary
+just gen-embed --endpoint ... --routes ...
+                                      # generate the config trio AND embed
+                                      # burrow.conf in one step
+just size                             # list sizes of all built burrow binaries
 ```
 
-See the `justfile` for all recipes.
+Cross-compilation requires the target toolchain (`rustup target add
+<triple>`) and a suitable linker. For non-native targets, `cargo
+install cross` and substitute `cross` for `cargo` is the smoothest
+path.
 
 ## Commands
 
