@@ -1,4 +1,3 @@
-pub mod bridge;
 pub mod config;
 pub mod control;
 pub mod dns_service;
@@ -17,3 +16,4 @@ pub mod tunnel;
 pub mod udp_proxy;
 pub mod udp_reverse;
 pub mod wire;
+pub mod yamux_bridge;

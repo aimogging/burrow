@@ -28,7 +28,7 @@
 //! most — 1 MiB is already far more than any realistic request.
 
 use std::io;
-use std::net::SocketAddrV4;
+use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -56,7 +56,8 @@ pub struct ReverseEntry {
     pub tunnel_id: TunnelId,
     pub proto: Proto,
     pub listen_port: u16,
-    pub forward_to: SocketAddrV4,
+    pub forward_to: String,
+    pub bind: BindAddr,
 }
 
 /// Reason codes for `ServerResp::Error`. Kept narrow so clients can match
@@ -88,13 +89,46 @@ pub enum ShellMode {
     Interactive,
 }
 
+/// Where on wgnat's smoltcp interface a reverse tunnel listens. `Default`
+/// uses the WG IP; `Any` binds on 0.0.0.0 (peers can target any dst IP
+/// that the WG server routes to wgnat); `Ipv4` pins a specific address.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BindAddr {
+    Default,
+    Any,
+    Ipv4(Ipv4Addr),
+}
+
+impl Default for BindAddr {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+/// Parameters for a reverse-tunnel start request. `forward_to` is a
+/// free-form string ("host:port") — resolved by the CLIENT when a
+/// substream lands. Lets the target be any hostname the client's
+/// machine can resolve + reach, regardless of what the wgnat host
+/// sees on its network.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TunnelSpec {
+    pub listen_port: u16,
+    pub forward_to: String,
+    #[serde(default)]
+    pub bind: BindAddr,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ClientReq {
-    StartReverse {
-        proto: Proto,
-        listen_port: u16,
-        forward_to: SocketAddrV4,
-    },
+    /// Start a TCP reverse tunnel. Upgrades the control flow to
+    /// yamux — the client must hold the flow open for the tunnel's
+    /// lifetime. Server opens an outbound substream per incoming
+    /// peer connection; client dials `forward_to` locally and pipes.
+    StartTcpTunnel(TunnelSpec),
+    /// Start a UDP reverse tunnel. Same handover pattern as TCP; one
+    /// dedicated substream carries all tunnel datagrams, length- +
+    /// peer-tagged so the client can preserve reply correlation.
+    StartUdpTunnel(TunnelSpec),
     StopReverse {
         tunnel_id: TunnelId,
     },
@@ -179,28 +213,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
     use tokio::io::duplex;
 
     #[tokio::test]
-    async fn roundtrip_start_reverse() {
+    async fn roundtrip_start_tcp_tunnel() {
         let (mut a, mut b) = duplex(4096);
-        let req = ClientReq::StartReverse {
-            proto: Proto::Tcp,
+        let req = ClientReq::StartTcpTunnel(TunnelSpec {
             listen_port: 8080,
-            forward_to: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000),
-        };
+            forward_to: "127.0.0.1:9000".into(),
+            bind: BindAddr::Default,
+        });
         write_frame(&mut a, &req).await.unwrap();
         let got: ClientReq = read_frame(&mut b).await.unwrap();
         match got {
-            ClientReq::StartReverse {
-                proto,
-                listen_port,
-                forward_to,
-            } => {
-                assert_eq!(proto, Proto::Tcp);
-                assert_eq!(listen_port, 8080);
-                assert_eq!(forward_to, SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 9000));
+            ClientReq::StartTcpTunnel(spec) => {
+                assert_eq!(spec.listen_port, 8080);
+                assert_eq!(spec.forward_to, "127.0.0.1:9000");
+                assert_eq!(spec.bind, BindAddr::Default);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_start_tcp_tunnel_with_bind() {
+        let (mut a, mut b) = duplex(4096);
+        let req = ClientReq::StartTcpTunnel(TunnelSpec {
+            listen_port: 443,
+            forward_to: "example.com:443".into(),
+            bind: BindAddr::Any,
+        });
+        write_frame(&mut a, &req).await.unwrap();
+        let got: ClientReq = read_frame(&mut b).await.unwrap();
+        match got {
+            ClientReq::StartTcpTunnel(spec) => {
+                assert_eq!(spec.bind, BindAddr::Any);
+                assert_eq!(spec.forward_to, "example.com:443");
             }
             _ => panic!("unexpected variant"),
         }
@@ -213,7 +261,8 @@ mod tests {
             tunnel_id: TunnelId(42),
             proto: Proto::Udp,
             listen_port: 53,
-            forward_to: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 53),
+            forward_to: "8.8.8.8:53".into(),
+            bind: BindAddr::Default,
         }]);
         write_frame(&mut a, &resp).await.unwrap();
         let got: ServerResp = read_frame(&mut b).await.unwrap();

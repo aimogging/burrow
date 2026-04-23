@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use wgnat::config;
-use wgnat::control::{listener_key, spawn_control_handler};
+use wgnat::control::{listener_key, spawn_control_handler, UdpTunnelMap};
 use wgnat::icmp::{
     build_echo_reply_for_wg_ip, send_dest_unreachable, IcmpForwarder,
     ICMP_CODE_HOST_UNREACHABLE, ICMP_CODE_NET_UNREACHABLE,
@@ -22,13 +22,13 @@ use wgnat::icmp::{
 use wgnat::nat::{NatKey, NatTable};
 use wgnat::probe::{classify_connect_error, ConnectClass};
 use wgnat::proxy::{spawn_tcp_proxy_with_stream, ProxyMsg};
-use wgnat::reverse_registry::ReverseRegistry;
+use wgnat::reverse_registry::{OpenRequest, ReverseRegistry};
 use wgnat::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 use wgnat::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
 use wgnat::tunnel::WgTunnel;
 use wgnat::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
-use wgnat::udp_reverse::UdpReverseState;
 use wgnat::wire::Proto;
+use wgnat::yamux_bridge::bridge_yamux_to_smoltcp;
 
 
 /// Optional config baked in at build time via the `embedded-config` feature.
@@ -234,12 +234,12 @@ async fn run(
 
     // Reverse-tunnel registry: control handlers insert/remove entries,
     // the event loop reads them on TcpConnected to dispatch registered
-    // ports to the bridge handler.
+    // ports to the owning client's yamux connection.
     let reverse_registry = Arc::new(ReverseRegistry::new());
-    // UDP reverse-tunnel per-flow state — populated by the ingest path
-    // (not the event loop) since UDP reverse tunnels don't go through
-    // smoltcp.
-    let udp_reverse = Arc::new(UdpReverseState::new());
+    // UDP reverse-tunnel side-table keyed by tunnel_id. control
+    // handlers populate it on tunnel start; ingest consults it to
+    // route incoming datagrams into the owning client's substream.
+    let udp_tunnels: UdpTunnelMap = Arc::new(Mutex::new(HashMap::new()));
     let control_port = cfg.interface.control_port;
 
     // Bootstrap the first control-port listener. Subsequent listeners
@@ -250,12 +250,6 @@ async fn run(
         .context("initial control listener")?;
     info!(%wg_ip, control_port, "control listener active");
 
-    // Channel bridges use to register their outbound side's ConnectionId
-    // with the event loop's `proxies` map once `open_outbound_tcp`
-    // completes asynchronously.
-    let (bridge_register_tx, mut bridge_register_rx) =
-        mpsc::unbounded_channel::<wgnat::bridge::BridgeRegister>();
-
     // Spawn the smoltcp event consumer: turns runtime events into proxy
     // task lifecycle. The `proxies` and `armed` maps live entirely inside
     // this closure — only one task touches them, so plain HashMaps suffice.
@@ -263,6 +257,8 @@ async fn run(
         let smoltcp = smoltcp.clone();
         let nat = Arc::clone(&nat);
         let reverse_registry = Arc::clone(&reverse_registry);
+        let udp_tunnels = Arc::clone(&udp_tunnels);
+        let egress_tx_for_events = egress_tx.clone();
         async move {
             let mut proxies: HashMap<ConnectionId, mpsc::UnboundedSender<ProxyMsg>> =
                 HashMap::new();
@@ -276,22 +272,9 @@ async fn run(
                             warn!(?key, "armed stream replaced — duplicate probe");
                         }
                     }
-                    Some((outbound_id, outbound_tx)) = bridge_register_rx.recv() => {
-                        proxies.insert(outbound_id, outbound_tx);
-                    }
                     Some(evt) = events.evt_rx.recv() => match evt {
                         SmoltcpEvent::TcpConnected { key, id } => {
                             debug!(?key, ?id, "tcp connected");
-                            // Originated flows (reverse-tunnel bridge outbounds,
-                            // future DNS/shell originations) carry peer_ip =
-                            // real remote in the synthetic key. The bridge task
-                            // already owns this connection — nothing to dispatch.
-                            if key.original_dst_ip == wg_ip
-                                && key.peer_ip != std::net::Ipv4Addr::UNSPECIFIED
-                            {
-                                debug!(?id, "originated TcpConnected — handler already registered");
-                                continue;
-                            }
                             if key.original_dst_ip == wg_ip
                                 && key.original_dst_port == control_port
                             {
@@ -305,12 +288,14 @@ async fn run(
                                     smoltcp.clone(),
                                     wg_ip,
                                     Arc::clone(&reverse_registry),
+                                    Arc::clone(&udp_tunnels),
+                                    egress_tx_for_events.clone(),
                                 );
                                 proxies.insert(id, tx);
                             } else if key.original_dst_ip == wg_ip {
                                 // Reverse-tunnel port? Lookup in registry.
                                 let Some(entry) = reverse_registry
-                                    .lookup(Proto::Tcp, key.original_dst_port)
+                                    .lookup(Proto::Tcp, key.original_dst_ip, key.original_dst_port, wg_ip)
                                 else {
                                     warn!(
                                         ?key,
@@ -325,12 +310,10 @@ async fn run(
                                 let _ = smoltcp
                                     .ensure_listener(wg_ip, key.original_dst_port, next_key)
                                     .await;
-                                let tx = wgnat::bridge::spawn_reverse_bridge(
+                                let tx = spawn_reverse_tcp_yamux_bridge(
                                     id,
                                     smoltcp.clone(),
-                                    wg_ip,
-                                    entry.forward_to,
-                                    bridge_register_tx.clone(),
+                                    entry,
                                 );
                                 proxies.insert(id, tx);
                             } else {
@@ -390,7 +373,7 @@ async fn run(
                                 let port = key.original_dst_port;
                                 let re_arm = port == control_port
                                     || reverse_registry
-                                        .lookup(Proto::Tcp, port)
+                                        .lookup(Proto::Tcp, wg_ip, port, wg_ip)
                                         .is_some();
                                 if re_arm {
                                     let next = listener_key(wg_ip, port);
@@ -413,7 +396,6 @@ async fn run(
     let sweep = tokio::spawn({
         let nat = Arc::clone(&nat);
         let udp_proxies = Arc::clone(&udp_proxies);
-        let udp_reverse = Arc::clone(&udp_reverse);
         async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -430,11 +412,6 @@ async fn run(
                         map.remove(k);
                     }
                     debug!(count = removed_udp.len(), "NAT entries swept (udp idle)");
-                }
-                let removed_rev_udp =
-                    udp_reverse.sweep_idle(now, wgnat::nat::DEFAULT_UDP_IDLE);
-                if removed_rev_udp > 0 {
-                    debug!(count = removed_rev_udp, "UDP reverse flows swept (idle)");
                 }
             }
         }
@@ -468,7 +445,7 @@ async fn run(
                             &icmp,
                             wg_ip,
                             &reverse_registry,
-                            &udp_reverse,
+                            &udp_tunnels,
                             dns_enabled,
                         ).await;
                     }
@@ -499,7 +476,7 @@ async fn ingest_tunnel_packet(
     icmp: &Arc<IcmpForwarder>,
     wg_ip: std::net::Ipv4Addr,
     reverse_registry: &Arc<ReverseRegistry>,
-    udp_reverse: &Arc<UdpReverseState>,
+    udp_tunnels: &UdpTunnelMap,
     dns_enabled: bool,
 ) {
     let view = match rewrite::parse_5tuple(&packet) {
@@ -536,7 +513,7 @@ async fn ingest_tunnel_packet(
             &view,
             wg_ip,
             reverse_registry,
-            udp_reverse,
+            udp_tunnels,
             egress_tx,
             dns_enabled,
         )
@@ -783,4 +760,54 @@ fn send_rst(egress_tx: &mpsc::UnboundedSender<Vec<u8>>, key: NatKey, peer_seq: u
         peer_seq.wrapping_add(1),
     );
     let _ = egress_tx.send(rst);
+}
+
+/// Spawn a task that bridges one peer-initiated TCP flow (accepted on a
+/// registered reverse-tunnel listen port) through to a fresh yamux
+/// substream on the owning client's connection. The client dials its
+/// local `forward_to` and pumps bytes back across the substream.
+///
+/// Returns the `ProxyMsg` sender that the event loop uses to feed TCP
+/// data/FIN/close notifications. If the substream open fails (client
+/// disconnected mid-dispatch), the smoltcp side is aborted.
+fn spawn_reverse_tcp_yamux_bridge(
+    incoming_id: ConnectionId,
+    smoltcp: SmoltcpHandle,
+    entry: wgnat::reverse_registry::RegEntry,
+) -> mpsc::UnboundedSender<ProxyMsg> {
+    let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ProxyMsg>();
+    tokio::spawn(async move {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if entry.opener.send(OpenRequest { reply: reply_tx }).is_err() {
+            warn!(?incoming_id, "reverse tcp bridge: opener channel closed — aborting peer");
+            smoltcp.abort_tcp(incoming_id);
+            return;
+        }
+        let stream = match reply_rx.await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                warn!(?incoming_id, error = %e, "reverse tcp bridge: open_stream failed — aborting peer");
+                smoltcp.abort_tcp(incoming_id);
+                return;
+            }
+            Err(_) => {
+                warn!(?incoming_id, "reverse tcp bridge: opener dropped reply — aborting peer");
+                smoltcp.abort_tcp(incoming_id);
+                return;
+            }
+        };
+        // Wrap the smoltcp flow as a tokio DuplexStream and pump bytes
+        // symmetrically between it and the yamux substream.
+        let duplex = wgnat::yamux_bridge::smoltcp_as_duplex(
+            incoming_id,
+            smoltcp.clone(),
+            Vec::new(),
+            msg_rx,
+        );
+        if let Err(e) = bridge_yamux_to_smoltcp(stream, duplex).await {
+            debug!(?incoming_id, error = %e, "reverse tcp bridge: pump exited");
+        }
+        smoltcp.close_tcp(incoming_id);
+    });
+    msg_tx
 }

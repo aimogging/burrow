@@ -20,6 +20,14 @@ socket2 = { version = "0.6", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
 hickory-proto = { version = "0.24", default-features = false }
+# Multiplexed substreams over the control flow for client-originated
+# reverse tunnels (TCP + UDP). One wgnat-client process holds one
+# yamux connection per tunnel; the server opens an outbound substream
+# per incoming peer flow.
+yamux = "0.13"
+futures = "0.3"
+# Bridge yamux's `futures::io::AsyncRead/Write` to tokio's equivalents.
+tokio-util = { version = "0.7", features = ["compat"] }
 # Phase 17b interactive shell: community fork of portable-pty with the
 # modern Windows ConPTY flags (PSEUDOCONSOLE_RESIZE_QUIRK,
 # WIN32_INPUT_MODE, PASSTHROUGH_MODE) that upstream portable-pty is

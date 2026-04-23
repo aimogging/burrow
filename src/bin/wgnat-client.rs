@@ -12,22 +12,28 @@
 //! tunnel register/unregister/list. Interactive PTY mode lands with
 //! Phase 17b when portable-pty comes in.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::{mpsc, Mutex};
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use wgnat::config::DEFAULT_CONTROL_PORT;
+use wgnat::reverse_registry::OpenRequest;
 use wgnat::shell_protocol as sp;
 use wgnat::wire::{
-    read_frame, write_frame, ClientReq, ErrorKind, Proto, ServerResp, ShellMode, TunnelId,
+    read_frame, write_frame, BindAddr, ClientReq, ErrorKind, Proto, ServerResp, ShellMode,
+    TunnelId, TunnelSpec,
 };
+use wgnat::yamux_bridge::{drive_connection, udp_frame};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "CLI peer for wgnat's control channel")]
@@ -140,23 +146,8 @@ async fn run_tunnel(addr: SocketAddrV4, action: TunnelCmd) -> Result<ExitCode> {
     match action {
         TunnelCmd::Start { spec, udp } => {
             let (listen_port, forward_to) = parse_r_spec(&spec)?;
-            let req = ClientReq::StartReverse {
-                proto: if udp { Proto::Udp } else { Proto::Tcp },
-                listen_port,
-                forward_to,
-            };
-            let resp = one_shot_request(addr, &req).await?;
-            match resp {
-                ServerResp::Started { tunnel_id } => {
-                    println!("{}", tunnel_id.0);
-                    Ok(ExitCode::SUCCESS)
-                }
-                ServerResp::Error { kind, msg } => {
-                    eprintln!("tunnel start failed: {kind:?}: {msg}");
-                    Ok(ExitCode::from(2))
-                }
-                other => bail!("unexpected response: {other:?}"),
-            }
+            let proto = if udp { Proto::Udp } else { Proto::Tcp };
+            run_tunnel_start(addr, proto, listen_port, forward_to).await
         }
         TunnelCmd::Stop { tunnel_id } => {
             let req = ClientReq::StopReverse {
@@ -276,6 +267,241 @@ async fn run_shell(addr: SocketAddrV4, args: ShellArgs) -> Result<ExitCode> {
         }
         other => bail!("unexpected response: {other:?}"),
     }
+}
+
+/// Start a reverse tunnel and hold the control flow open. After the
+/// `Started` response, upgrades the flow to a yamux client. Each time
+/// a peer connects to `wg_ip:listen_port`, the server opens a new
+/// outbound substream — this binary accepts it, dials `forward_to`
+/// locally, and pumps bytes. Exits on Ctrl-C or when the control flow
+/// drops (wgnat restarted, network blip, etc).
+async fn run_tunnel_start(
+    addr: SocketAddrV4,
+    proto: Proto,
+    listen_port: u16,
+    forward_to: String,
+) -> Result<ExitCode> {
+    let mut stream = connect_control(addr).await?;
+    let spec = TunnelSpec {
+        listen_port,
+        forward_to: forward_to.clone(),
+        bind: BindAddr::Default,
+    };
+    let req = match proto {
+        Proto::Tcp => ClientReq::StartTcpTunnel(spec),
+        Proto::Udp => ClientReq::StartUdpTunnel(spec),
+    };
+    write_frame(&mut stream, &req).await?;
+    let resp: ServerResp = read_frame(&mut stream)
+        .await
+        .map_err(|e| anyhow!("reading Started: {e}"))?;
+    let tunnel_id = match resp {
+        ServerResp::Started { tunnel_id } => tunnel_id,
+        ServerResp::Error { kind, msg } => {
+            eprintln!("tunnel start failed: {kind:?}: {msg}");
+            return Ok(ExitCode::from(2));
+        }
+        other => bail!("unexpected response: {other:?}"),
+    };
+    eprintln!(
+        "tunnel {} started ({:?} {} -> {}). press ctrl-c to stop.",
+        tunnel_id.0,
+        proto,
+        listen_port,
+        forward_to
+    );
+
+    // Upgrade the control flow to a yamux client. Server opens outbound
+    // substreams (one per peer for TCP, one shared for UDP); we accept
+    // them and originate local connections for each.
+    let compat = stream.compat();
+    let conn = yamux::Connection::new(compat, yamux::Config::default(), yamux::Mode::Client);
+
+    // Inbound substreams land here.
+    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<yamux::Stream>();
+    // Held alive for drive_connection's lifetime. The client never opens
+    // outbound substreams; drive_connection exits when we drop this.
+    let (_opener_tx, opener_rx) = mpsc::unbounded_channel::<OpenRequest>();
+
+    let driver = tokio::spawn(drive_connection(conn, opener_rx, Some(inbound_tx)));
+
+    match proto {
+        Proto::Tcp => run_tcp_substreams(&mut inbound_rx, forward_to).await,
+        Proto::Udp => run_udp_substream(&mut inbound_rx, forward_to).await,
+    };
+
+    driver.abort();
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Accept inbound yamux substreams. For each, dial `forward_to` locally
+/// and copy bytes in both directions. Exits on ctrl-c or when the
+/// control flow drops (inbound_rx closes).
+async fn run_tcp_substreams(
+    inbound_rx: &mut mpsc::UnboundedReceiver<yamux::Stream>,
+    forward_to: String,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("ctrl-c — stopping tunnel");
+                return;
+            }
+            maybe = inbound_rx.recv() => {
+                let Some(substream) = maybe else {
+                    eprintln!("control flow closed — stopping tunnel");
+                    return;
+                };
+                let forward_to = forward_to.clone();
+                tokio::spawn(async move {
+                    let tcp = match TcpStream::connect(&forward_to).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("dial {forward_to} failed: {e}");
+                            return;
+                        }
+                    };
+                    let _ = tcp.set_nodelay(true);
+                    let y_compat = substream.compat();
+                    let (mut y_r, mut y_w) = tokio::io::split(y_compat);
+                    let (mut t_r, mut t_w) = tcp.into_split();
+                    let a = tokio::io::copy(&mut y_r, &mut t_w);
+                    let b = tokio::io::copy(&mut t_r, &mut y_w);
+                    let _ = tokio::try_join!(a, b);
+                });
+            }
+        }
+    }
+}
+
+/// Accept the single UDP substream the server opens for this tunnel.
+/// Each framed datagram carries `(peer_ip, peer_port, payload)`. For
+/// each distinct peer we maintain a local UdpSocket bound to an
+/// ephemeral port and connected to `forward_to`: outgoing payloads are
+/// `send()`ed, incoming replies are `recv()`ed and framed back over
+/// the substream.
+async fn run_udp_substream(
+    inbound_rx: &mut mpsc::UnboundedReceiver<yamux::Stream>,
+    forward_to: String,
+) {
+    // The server opens exactly one substream for a UDP tunnel; wait for
+    // it here (concurrent with ctrl-c).
+    let substream = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("ctrl-c — stopping tunnel");
+            return;
+        }
+        maybe = inbound_rx.recv() => {
+            match maybe {
+                Some(s) => s,
+                None => {
+                    eprintln!("control flow closed — stopping tunnel");
+                    return;
+                }
+            }
+        }
+    };
+
+    let y_compat = substream.compat();
+    let (mut y_r, y_w) = tokio::io::split(y_compat);
+
+    // Single writer task for the substream — per-peer reply tasks send
+    // frames through this channel so writes are serialized.
+    let (frame_tx, mut frame_rx) =
+        mpsc::unbounded_channel::<(Ipv4Addr, u16, Vec<u8>)>();
+    let writer = tokio::spawn(async move {
+        let mut y_w = y_w;
+        while let Some((ip, port, data)) = frame_rx.recv().await {
+            if udp_frame::write(&mut y_w, ip, port, &data).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Per-peer send channels: incoming frame → push payload into the
+    // peer's UdpSocket writer task.
+    type PeerMap = Arc<Mutex<HashMap<(Ipv4Addr, u16), mpsc::UnboundedSender<Vec<u8>>>>>;
+    let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("ctrl-c — stopping tunnel");
+                break;
+            }
+            res = udp_frame::read(&mut y_r) => {
+                let (peer_ip, peer_port, payload) = match res {
+                    Ok(t) => t,
+                    Err(_) => break,
+                };
+                let key = (peer_ip, peer_port);
+                let tx = {
+                    let mut map = peers.lock().await;
+                    if let Some(tx) = map.get(&key) {
+                        tx.clone()
+                    } else {
+                        let (send_tx, mut send_rx) =
+                            mpsc::unbounded_channel::<Vec<u8>>();
+                        map.insert(key, send_tx.clone());
+                        let forward_to = forward_to.clone();
+                        let frame_tx = frame_tx.clone();
+                        let peers_for_evict = Arc::clone(&peers);
+                        tokio::spawn(async move {
+                            let sock = match UdpSocket::bind("0.0.0.0:0").await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("udp bind failed: {e}");
+                                    return;
+                                }
+                            };
+                            if let Err(e) = sock.connect(&forward_to).await {
+                                eprintln!("udp connect {forward_to}: {e}");
+                                return;
+                            }
+                            let sock = Arc::new(sock);
+                            // Reply reader: recv replies from forward_to,
+                            // frame them back over the substream.
+                            let r_sock = Arc::clone(&sock);
+                            let r_frame_tx = frame_tx.clone();
+                            let reader = tokio::spawn(async move {
+                                let mut buf = vec![0u8; 65_535];
+                                loop {
+                                    match r_sock.recv(&mut buf).await {
+                                        Ok(n) => {
+                                            if r_frame_tx
+                                                .send((peer_ip, peer_port, buf[..n].to_vec()))
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
+                            // Writer: payloads from the yamux frames →
+                            // sock.send. Also terminates the reader on
+                            // exit so the socket gets dropped.
+                            while let Some(payload) = send_rx.recv().await {
+                                if sock.send(&payload).await.is_err() {
+                                    break;
+                                }
+                            }
+                            reader.abort();
+                            // Evict from the peer map so a new frame for
+                            // this peer can start fresh.
+                            peers_for_evict.lock().await.remove(&key);
+                        });
+                        send_tx
+                    }
+                };
+                let _ = tx.send(payload);
+            }
+        }
+    }
+
+    drop(frame_tx);
+    writer.abort();
 }
 
 /// Send one request, read one response, close. Most subcommands follow
@@ -538,23 +764,29 @@ async fn run_shell_interactive(
     }))
 }
 
-/// Parse `LISTEN:HOST:PORT`. LISTEN and PORT are u16; HOST is an
-/// IPv4 address.
-fn parse_r_spec(spec: &str) -> Result<(u16, SocketAddrV4)> {
-    let parts: Vec<&str> = spec.splitn(3, ':').collect();
-    if parts.len() != 3 {
-        bail!("expected LISTEN:HOST:PORT, got `{spec}`");
+/// Parse `LISTEN:HOST:PORT`. LISTEN and PORT are u16; HOST is any
+/// string the local machine can resolve (IPv4, IPv6-literal-in-brackets,
+/// hostname). Resolution happens at substream time, not at parse time,
+/// so DNS failures are surfaced per-connection.
+fn parse_r_spec(spec: &str) -> Result<(u16, String)> {
+    // Rightmost colon separates PORT; leftmost separates LISTEN. This
+    // lets HOST contain colons (e.g. an IPv6 literal in brackets).
+    let (rest, port_str) = spec
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("expected LISTEN:HOST:PORT, got `{spec}`"))?;
+    let (listen_str, host) = rest
+        .split_once(':')
+        .ok_or_else(|| anyhow!("expected LISTEN:HOST:PORT, got `{spec}`"))?;
+    let listen: u16 = listen_str
+        .parse()
+        .with_context(|| format!("invalid LISTEN port `{listen_str}`"))?;
+    let port: u16 = port_str
+        .parse()
+        .with_context(|| format!("invalid PORT `{port_str}`"))?;
+    if host.is_empty() {
+        bail!("empty HOST in `{spec}`");
     }
-    let listen: u16 = parts[0]
-        .parse()
-        .with_context(|| format!("invalid LISTEN port `{}`", parts[0]))?;
-    let host: Ipv4Addr = parts[1]
-        .parse()
-        .with_context(|| format!("invalid HOST `{}` (IPv4 required)", parts[1]))?;
-    let port: u16 = parts[2]
-        .parse()
-        .with_context(|| format!("invalid PORT `{}`", parts[2]))?;
-    Ok((listen, SocketAddrV4::new(host, port)))
+    Ok((listen, format!("{host}:{port}")))
 }
 
 #[cfg(test)]
@@ -562,16 +794,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_r_spec_happy() {
+    fn parse_r_spec_happy_ipv4() {
         let (listen, fwd) = parse_r_spec("443:127.0.0.1:443").unwrap();
         assert_eq!(listen, 443);
-        assert_eq!(fwd, SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 443));
+        assert_eq!(fwd, "127.0.0.1:443");
+    }
+
+    #[test]
+    fn parse_r_spec_happy_hostname() {
+        let (listen, fwd) = parse_r_spec("8080:example.com:80").unwrap();
+        assert_eq!(listen, 8080);
+        assert_eq!(fwd, "example.com:80");
     }
 
     #[test]
     fn parse_r_spec_rejects_bad_input() {
         assert!(parse_r_spec("443:127.0.0.1").is_err()); // missing port
         assert!(parse_r_spec("not-a-port:127.0.0.1:443").is_err());
-        assert!(parse_r_spec("443:not-an-ip:443").is_err());
+        assert!(parse_r_spec("443::443").is_err()); // empty host
     }
 }
