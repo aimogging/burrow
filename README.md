@@ -175,8 +175,28 @@ just embed CONFIG                     # min-sized silent binary with CONFIG bake
 just embed CONFIG TARGET              # cross-compiled embedded binary
 just gen-embed --endpoint ... --routes ...
                                       # generate the config trio AND embed
-                                      # burrow.conf in one step
+                                      # burrow.conf in one step (host target)
 just size                             # list sizes of all built burrow binaries
+```
+
+For recipes that take a variadic (gen, gen-embed) and don't have a
+positional `TARGET` slot, set the cross-compile target via the just
+variable override:
+
+```sh
+just target=x86_64-unknown-linux-musl gen-embed --endpoint ... --routes ...
+```
+
+Or as an env var that sticks for the session:
+
+```sh
+# bash / zsh
+export BURROW_TARGET=x86_64-unknown-linux-musl
+just gen-embed --endpoint ... --routes ...
+
+# pwsh
+$env:BURROW_TARGET = "x86_64-unknown-linux-musl"
+just gen-embed --endpoint ... --routes ...
 ```
 
 Cross-compilation requires the target toolchain (`rustup target add
