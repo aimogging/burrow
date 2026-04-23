@@ -1,9 +1,17 @@
 # burrow
 
-A WireGuard userspace gateway. Runs as a peer behind NAT, acts as a transparent
-MASQUERADE gateway for other peers reaching hosts on the gateway's local
-network, and carries a small control channel for reverse tunnels, a built-in
-DNS resolver, and an optional remote shell.
+A WireGuard userspace gateway. Two directions of traffic, plus a few extras:
+
+- **Forward** (peer → burrow's LAN): peers reach internal services on
+  burrow's local network. burrow MASQUERADEs as the source — internal hosts
+  see burrow's LAN IP, not the peer.
+- **Reverse** (anything → client): a client (peer running `burrow-client`)
+  asks the burrow host to bind a real OS listener on burrow's interface;
+  connections to that listener get tunneled back to the client and
+  originated from the client's machine. SSH `-R` semantics.
+- DNS resolver on `(wg_ip, 53/udp)`, using burrow's host resolver.
+- Remote shell on the burrow host (interactive PTY, one-shot, fire-and-forget).
+- Config generator for the whole three-party setup in one shot.
 
 - No TUN interface. No Wintun, no `wireguard-nt`, no `/dev/net/tun`.
 - No kernel drivers.
@@ -40,17 +48,10 @@ wireguard-tools + iptables -j MASQUERADE + net.ipv4.ip_forward=1
 ```
 
 That requires Linux, root, kernel modules, and OS-level configuration. burrow
-does the same thing as a single unprivileged userspace process and adds:
+does the same thing as a single unprivileged userspace process, plus reverse
+tunnels, DNS, and a remote shell on the same control channel.
 
-- Reverse tunnels. A peer runs `burrow-client tunnel start -R ...` and the
-  burrow host listens on the peer's behalf, SSH-R style. Traffic to the
-  listening port is multiplexed back to the client over yamux and originated
-  from the client's machine.
-- DNS resolver on `(wg_ip, 53/udp)`, using the burrow host's system resolver.
-- Remote shell. `burrow-client shell` gives you interactive PTY, one-shot
-  capture, or fire-and-forget.
-- Config generator. `burrow gen` writes a ready-to-use trio of wg-quick
-  configs in one shot.
+### Forward direction (the NAT gateway)
 
 ```
 [peer]
@@ -60,10 +61,59 @@ does the same thing as a single unprivileged userspace process and adds:
    | routes via AllowedIPs
    v
 [burrow]             behind NAT, no privileges, userspace only
-   | real OS sockets
+   | real OS sockets (MASQUERADE)
    v
 [internal hosts]     see burrow's LAN IP as the source
 ```
+
+### Reverse direction (the tunnel)
+
+The burrow host binds a real OS `TcpListener` / `UdpSocket` on its own
+network interfaces (default `0.0.0.0`, configurable via the BIND prefix in
+`-R BIND:LISTEN:HOST:PORT`). Anything that can route to that interface can
+hit the listener. The connection is multiplexed (yamux) over the WG control
+flow back to the owning client, which dials `forward_to` locally and pipes
+bytes.
+
+```
+[anyone with network access to burrow's listening interface]
+                   |
+                   v
+            [burrow:LISTEN]   (real OS socket on burrow's host network)
+                   |
+                   |  yamux substream over the WG control flow
+                   v
+            [burrow-client]   (process holding the tunnel open)
+                   |
+                   |  fresh local TCP/UDP, originated by the client
+                   v
+            [HOST:PORT]       (client-side forward_to)
+```
+
+Two common shapes:
+
+- **Cloud burrow → home service** (ngrok-style): burrow runs on a VPS with
+  a public IP. Anyone on the internet hits `vps_public_ip:LISTEN`, traffic
+  tunnels to the home machine running `burrow-client`, originates locally.
+- **Office burrow → laptop service**: burrow runs on a corp LAN host.
+  Anyone on the LAN hits `office_lan_ip:LISTEN`; tunnels to a laptop
+  running `burrow-client` over WG, originates from the laptop.
+
+Reverse tunnels do *not* listen on `wg_ip` and are not reachable through
+the WG tunnel itself (the burrow host is userspace and has no TUN
+interface; there is nothing on the WG side for the OS kernel to deliver to).
+The control channel rides on `wg_ip`; the listeners do not.
+
+### Extras
+
+- DNS resolver on `(wg_ip, 53/udp)` answering A queries via the burrow
+  host's system resolver. Opt-in for clients via `--dns 10.0.0.2` to
+  `burrow gen`, or by setting `DNS = 10.0.0.2` in the client's
+  `[Interface]` section.
+- Remote shell. `burrow-client shell` gives you an interactive PTY, a
+  one-shot capture, or fire-and-forget.
+- Config generator. `burrow gen` writes a ready-to-use trio of wg-quick
+  configs in one shot.
 
 ## Quick start
 
@@ -180,31 +230,48 @@ Produces `server.conf`, `burrow.conf`, and `client1.conf` through
 `client3.conf`. Clients get both burrow's built-in resolver and Cloudflare
 as a fallback.
 
-### Expose a local service through the VPN
+### Expose a laptop service to the office LAN
 
-The client machine runs a service on `localhost:8080` and wants VPN peers to
-reach it at `<burrow_wg_ip>:443`.
+Laptop runs a dev server on `localhost:8080`. burrow runs on a desktop
+sitting at `192.168.1.50` on the office LAN. Goal: anyone on the office
+LAN can hit `192.168.1.50:443` and reach the laptop's dev server.
 
 ```sh
-# on the client (or anywhere that can route to burrow over WG):
+# on the laptop:
 burrow-client 10.0.0.2 tunnel start -R 443:127.0.0.1:8080
-# tunnel 1 started (Tcp 443 -> 127.0.0.1:8080). press ctrl-c to stop.
+# tunnel 1 started (Tcp 0.0.0.0:443 -> 127.0.0.1:8080). press ctrl-c to stop.
 ```
 
-The tunnel stays up until Ctrl-C. Connections to `burrow_host:443` (on
-any OS interface, since no BIND prefix was given) land on
-`127.0.0.1:8080` of the client machine. Hostnames for the forward-to
-target work too: `-R 443:internal.corp.lan:8080`.
+The burrow host now binds `0.0.0.0:443` on all of its OS interfaces.
+Anyone on the office LAN that can reach `192.168.1.50:443` lands on the
+laptop's `127.0.0.1:8080`. The tunnel stays up until Ctrl-C; close the
+laptop and the tunnel goes with it.
 
-Pin the listener to a single interface:
+Hostnames for the forward target work: `-R 443:internal.corp.lan:8080`.
+
+### Pin the listener to a single interface
 
 ```sh
 burrow-client 10.0.0.2 tunnel start -R 192.168.1.50:443:127.0.0.1:8080
-# only accepts connections arriving on the burrow host's 192.168.1.50
-# interface
+# binds only on the burrow host's 192.168.1.50 interface; loopback /
+# other LAN segments / etc are not exposed
+```
+
+### Cloud burrow as an ngrok-style ingress
+
+burrow on a VPS with public IP `203.0.113.7`. Home service on
+`localhost:8000`. Goal: expose the home service to the public internet.
+
+```sh
+# on the home machine:
+burrow-client 10.0.0.2 tunnel start -R 0.0.0.0:443:127.0.0.1:8000
+# anyone hitting 203.0.113.7:443 reaches the home machine's :8000
 ```
 
 ### UDP tunnel for a DNS forwarder
+
+burrow exposes `0.0.0.0:5353/udp` on its host network; client machine
+forwards each datagram to Cloudflare's `1.1.1.1:53`.
 
 ```sh
 burrow-client 10.0.0.2 tunnel start -U -R 5353:1.1.1.1:53
@@ -324,7 +391,7 @@ packet goes back through boringtun.
 ## Development
 
 ```sh
-cargo test                              # 96 lib + 36 integration tests
+cargo test                              # 101 lib + 32 integration tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
