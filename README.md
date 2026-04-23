@@ -267,10 +267,17 @@ custom daemon.
 ## Limitations
 
 - IPv4 only. No IPv6.
-- Single upstream peer. One WG server per burrow.
+- One WG server endpoint per burrow instance (the parser hard-rejects
+  a second `[Peer]`, and the runtime only drives one). Run multiple
+  instances for multiple upstreams — distinct config, wg_ip, and
+  control port per instance.
 - ICMP without raw sockets returns admin-prohibited rather than
   forwarding; raw sockets need `CAP_NET_RAW` / Administrator.
-- Layer-3/4 only. FTP active mode, SIP etc. need an ALG (not provided).
+- Pure layer-3/4 NAT — no ALG (Application Layer Gateway). Protocols
+  that embed addresses in their payload (FTP active/PASV, SIP, H.323,
+  ...) break without a helper that parses and rewrites those embedded
+  addresses. Linux's `nf_conntrack_ftp` / `nf_nat_ftp` etc. are the
+  kernel equivalents; burrow has no analog.
 
 ## Development
 
