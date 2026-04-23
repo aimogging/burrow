@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Shared helpers for scripts/deploy-{server,client}.sh.
+# Shared helpers for scripts/deploy-{server,client}.sh and netns-shell.sh.
 #
 # `_target` is whatever ssh accepts: an SSH-config alias, `user@host`,
 # or a bare hostname / IP. Auth is whichever of agent / password / key
-# the caller picked. We never parse `_target` ourselves — ssh does.
+# the caller picked. Empty $TARGET means LOCAL mode — operations run
+# directly with sudo, no ssh / no scp.
 
-# Globals the caller fills in via parse_common_args:
+# Globals the caller fills in via parse_common_arg:
 TARGET=""
 SSH_PASSWORD=""
 SSH_KEY=""
@@ -14,27 +15,31 @@ NAMESPACE="burrow"
 CONFIG=""
 TEARDOWN=0
 
-# Print usage and exit. Called by trap or explicit error path.
 common_usage_footer() {
     cat <<'EOF'
 
-Auth (omit to defer to ssh's normal resolution: SSH config alias,
-agent, default key):
+Target (omit for LOCAL mode — runs commands here with sudo):
+  --target TARGET   Anything ssh accepts:
+                      myhost              (SSH config alias)
+                      root@1.2.3.4
+                      1.2.3.4
+
+Auth (only meaningful with --target; ssh's normal resolution is used
+otherwise — agent, default key, ~/.ssh/config):
   --password PASS   SSH password (requires sshpass on this machine).
   --key PATH        SSH private key (-i).
 
 Optional:
   --port PORT       SSH port (default: 22 / whatever SSH config says).
-  --namespace NAME  netns name on the remote (default: burrow). Also
-                    used as the wg interface name inside the netns.
+  --namespace NAME  netns name (default: burrow). Also the wg interface
+                    name inside the namespace.
   --teardown        Remove the namespace + interface + on-disk config
-                    on the target and exit.
+                    and exit.
 EOF
 }
 
-# Eat one common arg (--target/--password/--key/--port/--namespace/
-# --config/--teardown). Returns 0 if consumed, 1 otherwise. Pass the
-# rest of "$@" so we can shift inside.
+# Eat one common arg. Returns 0 if consumed (caller shifts by
+# arg_width), 1 otherwise.
 parse_common_arg() {
     case "$1" in
         --target)    TARGET="$2"; return 0;;
@@ -48,8 +53,6 @@ parse_common_arg() {
     esac
 }
 
-# How many args parse_common_arg consumed (1 for --teardown, 2 for the
-# rest). Matches one of the arg names in $1.
 arg_width() {
     case "$1" in
         --teardown) echo 1;;
@@ -57,9 +60,10 @@ arg_width() {
     esac
 }
 
-# Build $SSH and $SCP arrays after args are parsed. Both arrays are
-# safe to expand with `"${SSH[@]}" target ...` — no eval, no quoting
-# nightmare for paths-with-spaces.
+# True iff we're in LOCAL mode (no --target).
+is_local() { [ -z "$TARGET" ]; }
+
+# Build $SSH and $SCP command arrays. Only needed in remote mode.
 build_ssh_cmds() {
     local opts=(-o "StrictHostKeyChecking=accept-new" -o "UserKnownHostsFile=/dev/null")
     [ -n "$SSH_PORT" ] && opts+=(-p "$SSH_PORT")
@@ -76,46 +80,71 @@ build_ssh_cmds() {
     fi
 
     SSH=("${prefix[@]}" ssh "${opts[@]}")
-    # scp uses -P (uppercase) for port; rebuild without -p.
     local scp_opts=(-o "StrictHostKeyChecking=accept-new" -o "UserKnownHostsFile=/dev/null")
     [ -n "$SSH_PORT" ] && scp_opts+=(-P "$SSH_PORT")
     [ -n "$SSH_KEY" ] && scp_opts+=(-i "$SSH_KEY")
     SCP=("${prefix[@]}" scp "${scp_opts[@]}")
 }
 
-# Run a command on the remote (any number of args).
-run_remote() {
-    "${SSH[@]}" "$TARGET" "$@"
-}
-
-# Pipe stdin into `bash -s` on the remote — used to run a local
-# heredoc-built script.
-run_remote_script() {
-    "${SSH[@]}" "$TARGET" "bash -s"
-}
-
-# scp a local file to a remote path.
-scp_to_remote() {
-    "${SCP[@]}" "$1" "${TARGET}:$2"
-}
-
-# Validate that --target was given.
-require_target() {
-    if [ -z "$TARGET" ]; then
-        echo "deploy: --target required (ssh alias, user@host, or hostname)" >&2
-        exit 1
+# Pipe stdin into a root shell on the target (local: sudo bash; remote:
+# ssh ... bash -s). Used to run a heredoc-built script.
+exec_as_root_script() {
+    if is_local; then
+        sudo bash -s
+    else
+        "${SSH[@]}" "$TARGET" "bash -s"
     fi
 }
 
-# Validate config path exists, unless we're tearing down.
-require_config() {
+# Stage the config so the remote script can find it. Local: emit the
+# absolute path of $CONFIG. Remote: scp to /tmp/burrow-<ns>.conf and
+# emit that. Either way, stdout is the path the remote script should
+# read from.
+stage_config() {
+    if is_local; then
+        # realpath isn't on every host (BSD); fall back to readlink -f.
+        if command -v realpath >/dev/null 2>&1; then
+            realpath "$CONFIG"
+        else
+            readlink -f "$CONFIG"
+        fi
+    else
+        local remote="/tmp/burrow-${NAMESPACE}.conf"
+        "${SCP[@]}" "$CONFIG" "${TARGET}:${remote}" >/dev/null
+        echo "$remote"
+    fi
+}
+
+# Run a one-line teardown command (drop link, drop netns, rm config) in
+# whichever mode we're in.
+exec_teardown() {
+    local conf_path
+    if is_local; then
+        conf_path="/tmp/burrow-${NAMESPACE}.conf"
+    else
+        conf_path="/tmp/burrow-${NAMESPACE}.conf"
+    fi
+    local cmd="ip link del ${NAMESPACE} 2>/dev/null || true; \
+               ip netns del ${NAMESPACE} 2>/dev/null || true; \
+               rm -f ${conf_path}"
+    if is_local; then
+        sudo bash -c "$cmd"
+    else
+        "${SSH[@]}" "$TARGET" "sudo bash -c '$cmd'"
+    fi
+}
+
+require_config_or_default() {
     if [ "$TEARDOWN" = 1 ]; then return; fi
-    if [ -z "$CONFIG" ]; then
-        echo "deploy: --config required (path to a .conf file)" >&2
-        exit 1
-    fi
+    if [ -z "$CONFIG" ]; then CONFIG="$1"; fi
     if [ ! -f "$CONFIG" ]; then
         echo "deploy: config file not found: $CONFIG" >&2
+        echo "        (omit --config to use the default at burrow-configs/)" >&2
         exit 1
     fi
+}
+
+# Pretty-print where we ran (local vs <target>). For status banner.
+target_label() {
+    if is_local; then echo "local"; else echo "$TARGET"; fi
 }

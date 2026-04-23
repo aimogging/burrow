@@ -128,13 +128,17 @@ fmt:
 clean:
     cargo clean
 
-# Bring a WG server up on a remote Linux host inside a netns.
+# Bring a WG server up inside a netns. Local by default; --target for remote.
 deploy-server *ARGS:
     bash scripts/deploy-server.sh {{ARGS}}
 
-# Bring a WG client up on a remote Linux host inside a netns.
+# Bring a WG client up inside a netns. Local by default; --target for remote.
 deploy-client *ARGS:
     bash scripts/deploy-client.sh {{ARGS}}
+
+# Drop into an interactive shell inside the burrow netns. Local by default.
+netns-shell *ARGS:
+    bash scripts/netns-shell.sh {{ARGS}}
 
 # List sizes of built burrow / burrow-client binaries across profiles.
 [unix]

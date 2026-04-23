@@ -362,47 +362,76 @@ this binary to anyone you would not trust with the `.conf` itself.
 
 ## Remote deploy helpers
 
-For scratch deploys (a fresh test peer, a one-off staging server, etc.)
-the scripts in `scripts/` push a config to a remote Linux host and
-bring up WireGuard inside a network namespace. State lives in the
-namespace plus a `/tmp/burrow-<ns>.conf`; no systemd unit, no
-`/etc/wireguard` file. Teardown or reboot wipes everything.
+The scripts in `scripts/` (and matching `just` recipes) bring up
+WireGuard inside a Linux network namespace, with no systemd unit and
+no `/etc/wireguard` file. State lives in the namespace plus a
+`/tmp/burrow-<ns>.conf`; teardown or reboot wipes everything.
+
+### The 99% workflow
 
 ```sh
-# Server side. Three target shapes — anything `ssh` accepts:
-just deploy-server --target myhost --config burrow-configs/server.conf
-just deploy-server --target root@1.2.3.4 --config burrow-configs/server.conf --key ~/.ssh/id_ed25519
-just deploy-server --target root@1.2.3.4 --config burrow-configs/server.conf --password hunter2
+# 1. generate configs + build min-sized binaries (gateway gets the
+#    config baked in; burrow-client gets built alongside)
+just gen-embed --endpoint vpn.example.com:51820 --routes 192.168.1.0/24
 
-# Client side. Same shape; routes for [Peer] AllowedIPs are auto-added
-# inside the namespace.
-just deploy-client --target peer1 --config burrow-configs/client1.conf
+# 2. bring up the WG server on the remote VPS
+just deploy-server --target root@vpn.example.com --key ~/.ssh/id_ed25519
 
-# Tear down.
+# 3. bring up the WG client on this box (no --target = local)
+just deploy-client
+
+# 4. drop into the netns and use the tunnel
+just netns-shell
+# (root @ host inside burrow netns)
+# burrow-client tunnel 10.0.0.2 start -R 443:127.0.0.1:8080
+# curl 10.0.0.2 ...
+```
+
+Each step picks up sensible defaults: `deploy-server` looks for
+`burrow-configs/server.conf`, `deploy-client` for `client1.conf`,
+`netns-shell` enters the `burrow` namespace.
+
+### Targets
+
+`--target` is whatever ssh accepts. Omit it for local execution
+(`sudo` on this box) — typical for `deploy-client` and `netns-shell`.
+
+```sh
+# SSH config alias (~/.ssh/config takes care of user / port / key):
+just deploy-server --target myhost
+
+# Explicit user@host with a key:
+just deploy-server --target root@1.2.3.4 --key ~/.ssh/id_ed25519
+
+# Or with a password (sshpass on local, key auth strongly preferred):
+just deploy-server --target root@1.2.3.4 --password hunter2
+
+# Local — runs sudo here, no SSH:
+just deploy-client
+just netns-shell
+```
+
+### Teardown
+
+```sh
 just deploy-server --target root@1.2.3.4 --teardown
-just deploy-client --target peer1 --teardown
+just deploy-client --teardown
 ```
 
-The WG UDP socket runs in the host network namespace (so the server is
-publicly reachable / the client can dial the server's public IP); the
-`wg` interface lives in the target namespace. This is the standard
-pattern from <https://www.wireguard.com/netns/>.
+### Notes
 
-After deploy, operate on the remote inside the namespace:
-
-```sh
-ssh root@1.2.3.4 sudo ip netns exec burrow wg show
-ssh root@1.2.3.4 sudo ip netns exec burrow bash      # interactive shell in the netns
-```
-
-Requirements on the remote: `wireguard-tools` + `iproute2` (script
-auto-installs via `apt-get` / `yum` if missing); a sudoer SSH user (or
-log in as root). Requirement on the local side: `ssh` + `scp`, plus
-`sshpass` if you use `--password`.
-
-`--namespace NAME` (default `burrow`) lets you name the netns / wg
-interface. Run multiple isolated instances on the same host by giving
-each a distinct namespace.
+- Linux only. The host running the deploy needs `ip` / `iproute2` /
+  `sudo`; the remote target also needs `wireguard-tools` (auto-installed
+  via `apt-get` / `yum` if missing).
+- WG UDP socket lives in the **host** namespace so the server is
+  publicly reachable / the client can dial the server's public IP; the
+  `wg` interface lives in the target namespace. Standard pattern from
+  <https://www.wireguard.com/netns/>.
+- `--namespace NAME` (default `burrow`) names the netns + the wg
+  interface. Pass distinct namespaces to run multiple isolated
+  instances on the same host.
+- For password auth, install `sshpass` locally (`apt: sshpass`,
+  `brew: hudochenkov/sshpass/sshpass`).
 
 ## Logging
 
