@@ -2,6 +2,15 @@
 
 Userspace WireGuard gateway. No TUN, no kernel drivers, no admin.
 
+- [TL;DR](#tldr)
+- [Quick start](#quick-start)
+- [Reverse tunnels](#reverse-tunnels)
+- [Commands](#commands)
+- [How it works](#how-it-works)
+- [Limitations](#limitations)
+- [Development](#development)
+- [License](#license)
+
 ## TL;DR
 
 burrow is a WireGuard peer you drop inside a private network. It acts
@@ -37,8 +46,16 @@ just gen-embed --endpoint vpn.example.com:51820 --routes 192.168.1.0/24
 
 # 2. Transfer the gateway binary to the host that will sit inside your
 #    private network. It has the config baked in; no args needed.
+#    Linux gateway:
 scp target/min/burrow gateway-host:
 ssh gateway-host ./burrow
+#    Windows gateway, over SMB using the built-in C$ admin share
+#    (from PowerShell on this box; works if you have admin creds on
+#    the target — `net use` prompts if not cached):
+Copy-Item target\min\burrow.exe \\gateway-host\c$\Users\Administrator\
+# then RDP / `Enter-PSSession gateway-host` and run `.\burrow.exe`.
+# (Or enable the optional OpenSSH Server on the Windows host and
+# use `scp target/min/burrow.exe gateway-host:` like Linux.)
 
 # 3. Bring up the WG server on the public VPS (uses server.conf).
 just deploy-server --target root@vpn.example.com --key ~/.ssh/id_ed25519
