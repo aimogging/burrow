@@ -267,10 +267,13 @@ custom daemon.
 ## Limitations
 
 - IPv4 only. No IPv6.
-- One WG server endpoint per burrow instance (the parser hard-rejects
-  a second `[Peer]`, and the runtime only drives one). Run multiple
-  instances for multiple upstreams — distinct config, wg_ip, and
-  control port per instance.
+- A burrow instance holds a single WG identity and talks to one
+  server endpoint — the parser rejects a second `[Peer]` and the
+  runtime only drives one. If you need more, run multiple burrow
+  instances with distinct configs (their own keys, wg_ips, control
+  ports). They can all peer with the same WG server (it's just more
+  `[Peer]` entries server-side) or with different ones — burrow
+  doesn't care.
 - ICMP without raw sockets returns admin-prohibited rather than
   forwarding; raw sockets need `CAP_NET_RAW` / Administrator.
 - Pure layer-3/4 NAT — no ALG (Application Layer Gateway). Protocols
