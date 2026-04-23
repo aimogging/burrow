@@ -1,18 +1,26 @@
-//! Phase 17a integration test for the `wgnat-client` binary. Spins up
+//! Phase 17 integration test for the `wgnat-client` binary. Spins up
 //! a mock control server on 127.0.0.1, invokes wgnat-client as a
 //! subprocess, asserts the request on the wire and exit semantics.
 //!
 //! The mock server reads one CBOR `ClientReq`, validates it, writes a
 //! canned `ServerResp`, closes. Mirrors what wgnat's real control
 //! handler does for `one_shot_request` flows.
+//!
+//! The `tunnel start` subcommand HOLDS THE FLOW OPEN under the
+//! client-originated model (it's the yamux client for the duration of
+//! the tunnel). The tunnel tests here send the CBOR handshake and
+//! then close the TCP flow; the child sees its yamux session ends and
+//! exits cleanly.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddrV4;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::process::Command as TokioCommand;
 
-use wgnat::wire::{ClientReq, Proto, ServerResp, TunnelId};
+use wgnat::wire::{ClientReq, Proto, ServerResp, TunnelId, TunnelSpec};
 
 fn wgnat_client_path() -> &'static str {
     env!("CARGO_BIN_EXE_wgnat-client")
@@ -50,26 +58,27 @@ where
     sock.shutdown().await.ok();
 }
 
+/// In the client-originated model, `tunnel start` holds the control
+/// flow open as the yamux client for the tunnel's lifetime. The mock
+/// server replies `Started { tunnel_id: 42 }` and then drops the TCP
+/// socket, which ends the child's yamux session and lets the binary
+/// exit cleanly.
 #[tokio::test]
-async fn tunnel_register_prints_tunnel_id_and_exits_zero() {
+async fn tunnel_start_tcp_writes_correct_request() {
     let (listener, addr) = bind_mock_server().await;
 
     let server = tokio::spawn(async move {
         handle_one(&listener, |req| {
             match req {
-                ClientReq::StartReverse {
-                    proto,
+                ClientReq::StartTcpTunnel(TunnelSpec {
                     listen_port,
                     forward_to,
-                } => {
-                    assert_eq!(proto, Proto::Tcp);
+                    ..
+                }) => {
                     assert_eq!(listen_port, 8080);
-                    assert_eq!(
-                        forward_to,
-                        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 9000)
-                    );
+                    assert_eq!(forward_to, "127.0.0.1:9000");
                 }
-                other => panic!("expected StartReverse, got {other:?}"),
+                other => panic!("expected StartTcpTunnel, got {other:?}"),
             }
             ServerResp::Started {
                 tunnel_id: TunnelId(42),
@@ -78,83 +87,85 @@ async fn tunnel_register_prints_tunnel_id_and_exits_zero() {
         .await;
     });
 
-    let out = tokio::task::spawn_blocking({
-        let client_path = wgnat_client_path().to_string();
-        let ip = addr.ip().to_string();
-        let port = addr.port().to_string();
-        move || {
-            Command::new(&client_path)
-                .args([
-                    &ip,
-                    "--control-port",
-                    &port,
-                    "tunnel",
-                    "start",
-                    "-R",
-                    "8080:127.0.0.1:9000",
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .unwrap()
-        }
-    })
-    .await
-    .unwrap();
+    let mut child = TokioCommand::new(wgnat_client_path())
+        .args([
+            &addr.ip().to_string(),
+            "--control-port",
+            &addr.port().to_string(),
+            "tunnel",
+            "start",
+            "-R",
+            "8080:127.0.0.1:9000",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
 
     server.await.unwrap();
+    // Server closed its socket — child's yamux session should end and
+    // the process should exit within a couple of seconds.
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("child did not exit after mock server closed")
+        .unwrap();
+    assert!(status.success(), "exit status: {status:?}");
+    // Startup banner goes to stderr; no stdout for this subcommand.
+    let mut stderr = Vec::new();
+    child.stderr.as_mut().unwrap().read_to_end(&mut stderr).await.ok();
+    let stderr = String::from_utf8_lossy(&stderr);
     assert!(
-        out.status.success(),
-        "wgnat-client failed: status={:?} stderr={}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+        stderr.contains("tunnel 42 started"),
+        "expected startup banner, stderr: {stderr:?}"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(stdout.trim(), "42");
 }
 
 #[tokio::test]
-async fn tunnel_register_udp_flag_sets_proto() {
+async fn tunnel_start_udp_flag_sets_proto() {
     let (listener, addr) = bind_mock_server().await;
 
     let server = tokio::spawn(async move {
         handle_one(&listener, |req| match req {
-            ClientReq::StartReverse { proto, .. } => {
-                assert_eq!(proto, Proto::Udp);
+            ClientReq::StartUdpTunnel(TunnelSpec { listen_port, .. }) => {
+                assert_eq!(listen_port, 53);
                 ServerResp::Started {
                     tunnel_id: TunnelId(7),
                 }
             }
-            other => panic!("expected StartReverse, got {other:?}"),
+            other => panic!("expected StartUdpTunnel, got {other:?}"),
         })
         .await;
     });
 
-    let out = tokio::task::spawn_blocking({
-        let client_path = wgnat_client_path().to_string();
-        let ip = addr.ip().to_string();
-        let port = addr.port().to_string();
-        move || {
-            Command::new(&client_path)
-                .args([
-                    &ip,
-                    "--control-port",
-                    &port,
-                    "tunnel",
-                    "start",
-                    "-U",
-                    "-R",
-                    "53:127.0.0.1:53",
-                ])
-                .output()
-                .unwrap()
-        }
-    })
-    .await
-    .unwrap();
+    let mut child = TokioCommand::new(wgnat_client_path())
+        .args([
+            &addr.ip().to_string(),
+            "--control-port",
+            &addr.port().to_string(),
+            "tunnel",
+            "start",
+            "-U",
+            "-R",
+            "53:127.0.0.1:53",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
 
     server.await.unwrap();
-    assert!(out.status.success());
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("child did not exit after mock server closed")
+        .unwrap();
+    assert!(status.success(), "exit status: {status:?}");
+}
+
+/// `Proto` imported for symmetry with the old test — keep it around
+/// as a compile-time reference to avoid import-drift.
+#[allow(dead_code)]
+fn _proto_still_exported() -> Proto {
+    Proto::Tcp
 }
 
 #[tokio::test]

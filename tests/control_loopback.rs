@@ -9,19 +9,19 @@
 //! reverse-tunnel bridge gets its own integration test next.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::Arc;
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use wgnat::control::{listener_key, spawn_control_handler};
+use wgnat::control::{listener_key, spawn_control_handler, UdpTunnelMap};
 use wgnat::nat::NatTable;
 use wgnat::proxy::ProxyMsg;
 use wgnat::reverse_registry::ReverseRegistry;
 use wgnat::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent};
 use wgnat::test_helpers::{build_tcp, ACK, FIN, PSH, SYN};
-use wgnat::wire::{ClientReq, Proto, ServerResp};
+use wgnat::wire::{BindAddr, ClientReq, Proto, ServerResp, TunnelSpec};
 
 const WG_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -139,6 +139,8 @@ async fn control_register_roundtrip() {
     let nat = Arc::new(NatTable::new());
     let (runtime, mut events, mut tx_rx) = spawn_smoltcp(Arc::clone(&nat), WG_IP);
     let registry = Arc::new(ReverseRegistry::new());
+    let udp_tunnels: UdpTunnelMap = Arc::new(Mutex::new(HashMap::new()));
+    let (egress_tx, _egress_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     // Bootstrap the initial control listener — same as main.rs startup.
     let _ = runtime
@@ -150,6 +152,8 @@ async fn control_register_roundtrip() {
     let event_task = tokio::spawn({
         let runtime = runtime.clone();
         let registry = Arc::clone(&registry);
+        let udp_tunnels = Arc::clone(&udp_tunnels);
+        let egress_tx = egress_tx.clone();
         async move {
             let mut proxies: HashMap<ConnectionId, mpsc::UnboundedSender<ProxyMsg>> =
                 HashMap::new();
@@ -168,6 +172,8 @@ async fn control_register_roundtrip() {
                                 runtime.clone(),
                                 WG_IP,
                                 Arc::clone(&registry),
+                                Arc::clone(&udp_tunnels),
+                                egress_tx.clone(),
                             );
                             proxies.insert(id, tx);
                         } else {
@@ -223,12 +229,12 @@ async fn control_register_roundtrip() {
     // 3. Complete handshake with a pure ACK.
     runtime.enqueue_inbound(peer.ack_only());
 
-    // 4. Send the CBOR StartReverse frame.
-    let req = ClientReq::StartReverse {
-        proto: Proto::Tcp,
+    // 4. Send the CBOR StartTcpTunnel frame.
+    let req = ClientReq::StartTcpTunnel(TunnelSpec {
         listen_port: 8080,
-        forward_to: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 9000),
-    };
+        forward_to: "10.0.0.3:9000".to_string(),
+        bind: BindAddr::Default,
+    });
     let frame = encode_frame(&req);
     runtime.enqueue_inbound(peer.psh_ack(&frame));
 
@@ -280,13 +286,10 @@ async fn control_register_roundtrip() {
 
     // 7. Verify the registry state.
     let entry = registry
-        .lookup(Proto::Tcp, 8080)
+        .lookup(Proto::Tcp, WG_IP, 8080, WG_IP)
         .expect("registry should contain the new tunnel");
     assert_eq!(entry.tunnel_id, tunnel_id);
-    assert_eq!(
-        entry.forward_to,
-        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 3), 9000)
-    );
+    assert_eq!(entry.forward_to, "10.0.0.3:9000");
 
     // 8. FIN-ACK from peer; server also closes after writing the response.
     runtime.enqueue_inbound(peer.fin_ack());
