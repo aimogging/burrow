@@ -288,31 +288,26 @@ fn send_admin_prohibited(sink: &PacketSink, original: &[u8]) {
 /// address Windows doesn't own. Pings to LAN hosts still go through
 /// `IcmpForwarder::handle_inbound`.
 pub fn build_echo_reply_for_wg_ip(packet: &[u8], wg_ip: Ipv4Addr) -> Option<Vec<u8>> {
-    let view = parse_5tuple(packet).ok()?;
-    if view.proto != PROTO_ICMP || view.dst_ip != wg_ip {
-        return None;
-    }
-    let ihl = ((packet[0] & 0x0F) as usize) * 4;
-    if packet.len() < ihl + 8 {
-        return None;
-    }
-    let icmp = &packet[ihl..];
-    if icmp[0] != ICMP_ECHO_REQUEST {
-        // Other ICMP types to wg_ip (unreachable, time-exceeded) aren't
-        // something we're meant to answer. Caller drops.
-        return None;
-    }
-    // Rebuild the ICMP body with type=0 (echo reply). ident/seq/data
-    // come from bytes [4..] of the original ICMP header+body.
-    let mut reply = Vec::with_capacity(icmp.len());
-    reply.push(ICMP_ECHO_REPLY);
-    reply.push(icmp[1]); // code (always 0 for echo request, echoed)
-    reply.extend_from_slice(&[0, 0]); // checksum placeholder
-    reply.extend_from_slice(&icmp[4..]); // ident + seq + payload
-    let csum = icmp_checksum(&reply);
-    reply[2..4].copy_from_slice(&csum.to_be_bytes());
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, Ipv4Packet};
 
-    Some(build_icmp_packet(wg_ip, view.src_ip, &reply))
+    let ip = Ipv4Packet::new_checked(packet).ok()?;
+    if u8::from(ip.next_header()) != PROTO_ICMP || ip.dst_addr() != wg_ip {
+        return None;
+    }
+    let checksum = ChecksumCapabilities::default();
+    let icmp = Icmpv4Packet::new_checked(ip.payload()).ok()?;
+    let (ident, seq_no, data) = match Icmpv4Repr::parse(&icmp, &checksum).ok()? {
+        Icmpv4Repr::EchoRequest { ident, seq_no, data } => (ident, seq_no, data),
+        _ => return None,
+    };
+    let reply = Icmpv4Repr::EchoReply { ident, seq_no, data };
+    let mut icmp_bytes = vec![0u8; reply.buffer_len()];
+    reply.emit(
+        &mut Icmpv4Packet::new_unchecked(&mut icmp_bytes),
+        &checksum,
+    );
+    Some(build_icmp_packet(wg_ip, ip.src_addr().into(), &icmp_bytes))
 }
 
 /// Build an IPv4 header around `icmp_payload` and return a complete packet.
