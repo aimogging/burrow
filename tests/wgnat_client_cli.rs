@@ -187,6 +187,8 @@ async fn shell_oneshot_prints_captured_stdout_and_exit_code() {
                     "--control-port",
                     &port,
                     "shell",
+                    "--output",
+                    "-",
                     "--program",
                     "anything",
                     "--",
@@ -228,7 +230,7 @@ async fn shell_nonzero_exit_propagates() {
         let port = addr.port().to_string();
         move || {
             Command::new(&client_path)
-                .args([&ip, "--control-port", &port, "shell"])
+                .args([&ip, "--control-port", &port, "shell", "--output", "-"])
                 .output()
                 .unwrap()
         }

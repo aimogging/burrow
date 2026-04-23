@@ -74,18 +74,21 @@ enum TunnelCmd {
 
 #[derive(clap::Args, Debug)]
 struct ShellArgs {
-    /// Run the command, capture stdout+stderr, print to local terminal
-    /// (with `--output -`, the default) or write to a file.
+    /// Run the command non-interactively, capture stdout+stderr.
+    /// `--output -` prints to local stdout/stderr; `--output PATH`
+    /// writes stdout to the file and stderr still to the terminal.
+    /// Mutually exclusive with `--detach`; implies no PTY.
     #[arg(long, value_name = "PATH")]
     output: Option<String>,
 
     /// Spawn detached; return immediately with the pid. No output
-    /// captured.
+    /// captured. Mutually exclusive with `--output`.
     #[arg(long, conflicts_with = "output")]
     detach: bool,
 
-    /// Request an interactive PTY session (Phase 17b — not yet wired).
-    /// Exposed now so the CLI surface is stable.
+    /// Request an interactive PTY session. This is the default; the
+    /// flag is kept for explicitness and scripts that want to assert
+    /// the mode. Mutually exclusive with `--output` and `--detach`.
     #[arg(long, conflicts_with_all = ["output", "detach"])]
     interactive: bool,
 
@@ -204,12 +207,17 @@ async fn run_tunnel(addr: SocketAddrV4, action: TunnelCmd) -> Result<ExitCode> {
 }
 
 async fn run_shell(addr: SocketAddrV4, args: ShellArgs) -> Result<ExitCode> {
-    let mode = if args.interactive {
-        ShellMode::Interactive
-    } else if args.detach {
+    // Default is Interactive (matches the plan: an `ssh`-like UX
+    // where bare `shell` drops you into a prompt). `--output` opts
+    // into one-shot capture; `--detach` opts into fire-and-forget.
+    // Fire-and-forget is NEVER the default — silently swallowing
+    // output is a footgun.
+    let mode = if args.detach {
         ShellMode::FireAndForget
-    } else {
+    } else if args.output.is_some() {
         ShellMode::Oneshot
+    } else {
+        ShellMode::Interactive
     };
     // Interactive takes over the flow after ShellReady. Hand off to a
     // dedicated handler rather than using the one-shot request helper.
