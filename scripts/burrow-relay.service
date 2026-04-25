@@ -15,10 +15,13 @@ ExecStart=/usr/local/bin/burrow-relay \
     --key  /etc/burrow-relay/privkey.pem \
     --forward-to 127.0.0.1:51820
 
-# Capability so we can bind 443 without running as root.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-DynamicUser=yes
+# Service runs as root by default. That's so the process can read the
+# Let's Encrypt private key (which lives root:root 0600 by convention)
+# without operator gymnastics. The relay still gets sandboxed with the
+# guards below; the only privileged capability it actually uses is
+# binding port 443. To run as a non-root user instead, drop a deploy
+# hook that copies fullchain.pem + privkey.pem into a directory owned
+# by your service user, then set User= here.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
