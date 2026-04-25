@@ -103,22 +103,28 @@ ssh root@vpn.example.com 'wg-quick up wg0'
 # WSS only — also ship burrow-relay and run it (foreground; nohup or tmux to detach):
 scp target/min/burrow-relay root@vpn.example.com: && ssh root@vpn.example.com ./burrow-relay
 
-# burrow gateway (the host inside the private network)
+# burrow gateway, Linux host
 scp target/min/burrow gateway-host: && ssh gateway-host ./burrow
+# burrow gateway, Windows host: SMB via the built-in C$ admin share
+# (or enable OpenSSH Server on the host and `scp` like Linux).
+Copy-Item target\min\burrow.exe \\gateway-host\c$\Users\Administrator\
+# then RDP / Enter-PSSession gateway-host and run .\burrow.exe
 
-# each client peer
+# connect peer client
 sudo wg-quick up ./burrow-configs/client1.conf
 ```
 
-For Windows gateway hosts, use SMB (`Copy-Item target\min\burrow.exe
-\\gateway-host\c$\Users\Administrator\`) or enable OpenSSH Server +
-`scp` like Linux.
+### Easy deployment
 
-### Try it locally without leaving your laptop
+`just deploy-server` automates the WG server bring-up: SSHes to the
+remote, drops `server.conf` in place, runs `wg-quick up` inside an
+ephemeral netns. If `burrow-configs/relay-bundle/` is present (i.e.
+you used `gen-embed-wss`), it also ships `target/min/burrow-relay`
+and starts it — one command stands the whole server side up.
 
-`just deploy-server` / `deploy-client` stand the WG server up in a
-netns on a remote box and pull the client into a local netns —
-useful for trying burrow out without involving real infrastructure:
+The client side is local: `deploy-client` puts a kernel WG client
+into a netns on this box; `netns-shell` drops you into it so any
+traffic you generate (curl, dig, ssh) rides the tunnel.
 
 ```sh
 just deploy-server --target root@vpn.example.com --key ~/.ssh/id_ed25519
@@ -128,7 +134,7 @@ just netns-shell
 #  subnets reaches through burrow.)
 ```
 
-Teardown mirrors:
+Teardown:
 
 ```sh
 just deploy-server --target root@vpn.example.com --teardown
