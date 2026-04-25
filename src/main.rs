@@ -24,6 +24,7 @@ use burrow::proxy::{spawn_tcp_proxy_with_stream, ProxyMsg};
 use burrow::reverse_registry::ReverseRegistry;
 use burrow::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 use burrow::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
+use burrow::transport::UdpTransport;
 use burrow::tunnel::WgTunnel;
 use burrow::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
 
@@ -158,8 +159,15 @@ async fn run(
     info!("interface Address is informational under Phase 11 (smoltcp side uses 198.18.0.0/15 internally)");
 
     let nat = Arc::new(NatTable::new());
-    let tunnel = Arc::new(WgTunnel::new(&cfg).await.context("WireGuard tunnel")?);
-    info!(local = %tunnel.local_addr()?, peer = %tunnel.endpoint(), "WG socket bound");
+    let udp_transport = UdpTransport::bind(&cfg.peer.endpoint)
+        .await
+        .context("WireGuard UDP transport")?;
+    info!(
+        local = %udp_transport.local_addr()?,
+        peer = %udp_transport.endpoint(),
+        "WG socket bound"
+    );
+    let tunnel = Arc::new(WgTunnel::with_transport(&cfg, udp_transport));
 
     let wg_ip = cfg.interface.address.address();
     let dns_enabled = cfg.interface.dns_enabled;

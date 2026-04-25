@@ -38,6 +38,22 @@ tokio-util = { version = "0.7", features = ["compat"] }
 portable-pty = { package = "portable-pty-psmux", version = "0.9" }
 # Client-side raw terminal + window-resize events.
 crossterm = "0.28"
+# Transport abstraction (UDP today, WSS for the server↔burrow leg). The
+# trait lives in `src/transport.rs`; needs `async fn` in trait objects.
+async-trait = "0.1"
+# WSS transport: WebSocket client/server + TLS. `tokio-tungstenite`
+# bundles `tungstenite` and an async-stream wrapper; the rustls feature
+# pulls in `tokio-rustls` transitively but we depend on it directly so
+# the relay binary can build a TLS server config without going through
+# tungstenite's connector glue.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
+# HTTP/1 server for the relay's WS upgrade handshake. Hyper 1.x is
+# enough — we only have one route and don't want to pull in axum.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [[bin]]
 name = "burrow"
@@ -46,6 +62,10 @@ path = "src/main.rs"
 [[bin]]
 name = "burrow-client"
 path = "src/bin/burrow-client.rs"
+
+[[bin]]
+name = "burrow-relay"
+path = "src/bin/burrow-relay.rs"
 
 [features]
 # Bake the wg-quick config at $BURROW_EMBEDDED_CONFIG into the binary as a

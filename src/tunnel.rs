@@ -1,12 +1,12 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use boringtun::noise::errors::WireGuardError;
 use boringtun::noise::{Tunn, TunnResult};
-use tokio::net::{lookup_host, UdpSocket};
 
 use crate::config::Config;
+use crate::transport::{UdpTransport, WgTransport};
 
 /// Maximum size of a UDP datagram we will receive or send. Generous: covers
 /// 1500-byte MTU plus WireGuard overhead.
@@ -170,36 +170,33 @@ impl WgCore {
     }
 }
 
-/// Async I/O wrapper that owns the UDP socket and the protocol core.
+/// Async I/O wrapper that owns the protocol core and a transport.
+///
+/// The transport is type-erased (`Arc<dyn WgTransport>`) so the runtime can
+/// pick UDP vs WSS at startup without threading a generic through every
+/// `Arc<WgTunnel>` clone in the runtime.
 pub struct WgTunnel {
     core: WgCore,
-    socket: UdpSocket,
-    endpoint: SocketAddr,
+    transport: Arc<dyn WgTransport>,
 }
 
 impl WgTunnel {
+    /// Convenience constructor for the default UDP path. Resolves
+    /// `config.peer.endpoint`, binds an ephemeral UDP socket, and wraps it.
+    /// Tests and the back-compat code path use this; the WSS path
+    /// constructs the transport explicitly and calls `with_transport`.
     pub async fn new(config: &Config) -> Result<Self> {
-        let endpoint = resolve_endpoint(&config.peer.endpoint).await?;
-        let bind_addr = match endpoint {
-            SocketAddr::V4(_) => "0.0.0.0:0",
-            SocketAddr::V6(_) => "[::]:0",
-        };
-        let socket = UdpSocket::bind(bind_addr).await?;
-        disable_udp_connreset(&socket)?;
-        let core = WgCore::new(config);
-        Ok(Self {
-            core,
-            socket,
-            endpoint,
-        })
+        let transport = UdpTransport::bind(&config.peer.endpoint).await?;
+        Ok(Self::with_transport(config, transport))
     }
 
-    pub fn endpoint(&self) -> SocketAddr {
-        self.endpoint
-    }
-
-    pub fn local_addr(&self) -> Result<SocketAddr> {
-        Ok(self.socket.local_addr()?)
+    /// Build a tunnel around an arbitrary transport. The transport is
+    /// expected to be already connected/bound and ready to send.
+    pub fn with_transport(config: &Config, transport: Arc<dyn WgTransport>) -> Self {
+        Self {
+            core: WgCore::new(config),
+            transport,
+        }
     }
 
     /// Send the initial handshake to bring the tunnel up.
@@ -208,12 +205,16 @@ impl WgTunnel {
         self.flush_to_network(&step).await
     }
 
-    /// Receive one UDP datagram and process it. Returns the decrypted IPv4
-    /// packet if any, or None for control traffic (handshake responses, cookies).
+    /// Receive one transport datagram and process it. Returns the decrypted
+    /// IPv4 packet if any, or None for control traffic (handshake responses,
+    /// cookies).
     pub async fn recv_step(&self) -> Result<Option<TunnelPacket>> {
-        let mut buf = vec![0u8; MAX_UDP_SIZE];
-        let (n, src_addr) = self.socket.recv_from(&mut buf).await?;
-        let step = self.core.decapsulate(Some(src_addr.ip()), &buf[..n])?;
+        let datagram = self.transport.recv().await?;
+        // Pre-refactor we passed the UDP src IP to `decapsulate` as an
+        // endpoint hint. boringtun treats that purely as informational —
+        // it never relies on it for crypto — and the WSS transport has no
+        // notion of a per-datagram source. None is uniformly correct.
+        let step = self.core.decapsulate(None, &datagram)?;
         self.flush_to_network(&step).await?;
         if step.expired {
             tracing::warn!("WireGuard session expired; will re-handshake on next packet");
@@ -240,60 +241,17 @@ impl WgTunnel {
 
     async fn flush_to_network(&self, step: &CoreStep) -> Result<()> {
         for pkt in &step.to_network {
-            self.socket.send_to(pkt, self.endpoint).await?;
+            self.transport.send(pkt).await?;
         }
         Ok(())
     }
-}
-
-async fn resolve_endpoint(addr: &str) -> Result<SocketAddr> {
-    let mut iter = lookup_host(addr).await?;
-    iter.find(|a| a.is_ipv4())
-        .ok_or_else(|| anyhow!("no IPv4 address resolved for endpoint {addr}"))
-}
-
-/// On Windows, a UDP `recv()` returns `WSAECONNRESET` (10054) after a previous
-/// `send_to()` provoked an ICMP port-unreachable. That permanently breaks the
-/// recv loop here even though the WG socket is supposed to be connectionless —
-/// any single misrouted packet would kill the tunnel. The `SIO_UDP_CONNRESET`
-/// ioctl with FALSE suppresses this behavior. No-op everywhere else.
-#[cfg(windows)]
-fn disable_udp_connreset(socket: &UdpSocket) -> Result<()> {
-    use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, WSAIoctl, SIO_UDP_CONNRESET};
-
-    let raw = socket.as_raw_socket() as windows_sys::Win32::Networking::WinSock::SOCKET;
-    let value: u32 = 0; // FALSE
-    let mut bytes_returned: u32 = 0;
-    let rc = unsafe {
-        WSAIoctl(
-            raw,
-            SIO_UDP_CONNRESET,
-            &value as *const _ as *const _,
-            std::mem::size_of::<u32>() as u32,
-            std::ptr::null_mut(),
-            0,
-            &mut bytes_returned,
-            std::ptr::null_mut(),
-            None,
-        )
-    };
-    if rc != 0 {
-        let err = unsafe { WSAGetLastError() };
-        bail!("WSAIoctl(SIO_UDP_CONNRESET) failed: WSAError {err}");
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn disable_udp_connreset(_socket: &UdpSocket) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{InterfaceConfig, PeerConfig};
+    use tokio::net::UdpSocket;
     use x25519_dalek::{PublicKey, StaticSecret};
 
     fn make_config() -> Config {
