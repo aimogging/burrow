@@ -127,12 +127,9 @@ async fn supervise(
             }
             Err(e) => {
                 tracing::warn!(error = %e, ?delay, "wss connect failed; backing off");
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = out_rx.recv() => {
-                        // sender side dropped during backoff → exit
-                        return;
-                    }
+                tokio::time::sleep(delay).await;
+                if out_rx.is_closed() {
+                    return;
                 }
                 delay = (delay * 2).min(MAX_BACKOFF);
                 continue;
@@ -150,9 +147,9 @@ async fn supervise(
             }
         }
 
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            _ = out_rx.recv() => return,
+        tokio::time::sleep(delay).await;
+        if out_rx.is_closed() {
+            return;
         }
         delay = (delay * 2).min(MAX_BACKOFF);
     }

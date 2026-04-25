@@ -6,6 +6,7 @@ pub mod icmp;
 pub mod nat;
 pub mod probe;
 pub mod proxy;
+pub mod relay;
 pub mod reverse_registry;
 pub mod rewrite;
 pub mod runtime;

@@ -13,10 +13,9 @@
 //!   3. Bind a fresh ephemeral UDP socket on 127.0.0.1.
 //!   4. Bridge: WS binary frames → UDP send (to `--forward-to`); UDP
 //!      recv → WS binary frames.
-//!   5. The kernel auto-learns the burrow peer's "endpoint" as
-//!      `127.0.0.1:<ephemeral_port>` from the first inbound packet —
-//!      same path it would take if a NAT rebinding moved the peer's
-//!      apparent source. The relay never has to call `wg set ... endpoint`.
+//!
+//! The actual bridge logic lives in `burrow::relay::serve_ws_connection`
+//! so that integration tests can drive it on a plain (non-TLS) socket.
 
 use std::io::BufReader;
 use std::net::SocketAddr;
@@ -25,20 +24,14 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use futures::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::TcpListener;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::tungstenite::handshake::server::{
-    ErrorResponse, Request as WsRequest, Response as WsResponse,
-};
-use tokio_tungstenite::tungstenite::http::StatusCode;
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const WG_ENDPOINT_PATH: &str = "/v1/wg";
+use burrow::relay::serve_ws_connection;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "WSS-to-UDP relay for the burrow WireGuard transport")]
@@ -71,7 +64,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,burrow_relay=debug")),
+                .unwrap_or_else(|_| EnvFilter::new("info,burrow_relay=debug,burrow::relay=debug")),
         )
         .init();
 
@@ -113,8 +106,18 @@ async fn main() -> Result<()> {
         let token = Arc::clone(&token);
         let forward_to = cli.forward_to;
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(tcp, peer, acceptor, token, forward_to).await {
-                debug!(%peer, error = %e, "connection ended");
+            let _ = tcp.set_nodelay(true);
+            let tls = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(%peer, error = %e, "TLS handshake failed");
+                    return;
+                }
+            };
+            debug!(%peer, "TLS handshake complete");
+            match serve_ws_connection(tls, &token, forward_to).await {
+                Ok(end) => info!(%peer, ?end, "WS connection closed"),
+                Err(e) => debug!(%peer, error = %e, "connection ended early"),
             }
         });
     }
@@ -143,129 +146,4 @@ fn build_tls_config(cert_path: &PathBuf, key_path: &PathBuf) -> Result<ServerCon
         .with_single_cert(cert_chain, private_key)
         .context("building TLS server config")?;
     Ok(config)
-}
-
-async fn handle_connection(
-    tcp: TcpStream,
-    peer: SocketAddr,
-    acceptor: TlsAcceptor,
-    token: Arc<String>,
-    forward_to: SocketAddr,
-) -> Result<()> {
-    let _ = tcp.set_nodelay(true);
-    let tls = acceptor.accept(tcp).await.context("TLS accept")?;
-    debug!(%peer, "TLS handshake complete");
-
-    let expected = format!("Bearer {}", token);
-    let callback = move |req: &WsRequest, resp: WsResponse| -> Result<WsResponse, ErrorResponse> {
-        if req.uri().path() != WG_ENDPOINT_PATH {
-            let body = WsResponse::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(None)
-                .unwrap();
-            return Err(body);
-        }
-        let auth = req.headers().get("Authorization").and_then(|h| h.to_str().ok());
-        if auth != Some(expected.as_str()) {
-            let body = WsResponse::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(None)
-                .unwrap();
-            return Err(body);
-        }
-        Ok(resp)
-    };
-
-    let ws = tokio_tungstenite::accept_hdr_async(tls, callback)
-        .await
-        .context("WebSocket upgrade")?;
-    info!(%peer, "WS connection established");
-
-    let udp = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .context("binding ephemeral UDP socket")?;
-    let local = udp.local_addr().context("ephemeral UDP local_addr")?;
-    debug!(%peer, %local, "UDP socket bound");
-    let udp = Arc::new(udp);
-
-    let result = bridge(ws, udp, forward_to).await;
-    info!(%peer, "WS connection closed: {:?}", result);
-    Ok(())
-}
-
-// String fields are surfaced via the Debug formatter in the info! log
-// when a session ends; the compiler's dead-code pass doesn't follow
-// derived Debug into format args, hence the allow.
-#[derive(Debug)]
-#[allow(dead_code)]
-enum BridgeEnd {
-    WsClosed,
-    WsError(String),
-    UdpError(String),
-}
-
-async fn bridge(
-    ws: tokio_tungstenite::WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>,
-    udp: Arc<UdpSocket>,
-    forward_to: SocketAddr,
-) -> BridgeEnd {
-    let (mut sink, mut stream) = ws.split();
-    let udp_recv = Arc::clone(&udp);
-
-    // UDP → WS pump: read datagrams off the ephemeral socket, frame as
-    // WS Binary. Runs as a separate task so neither direction blocks the
-    // other. Communication back to the main task is via a oneshot
-    // channel that signals which side ended the session.
-    let (end_tx, mut end_rx) = tokio::sync::mpsc::channel::<BridgeEnd>(2);
-    let end_tx_udp = end_tx.clone();
-    let udp_to_ws = tokio::spawn(async move {
-        let mut buf = vec![0u8; 1700];
-        loop {
-            let (n, _from) = match udp_recv.recv_from(&mut buf).await {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = end_tx_udp.send(BridgeEnd::UdpError(format!("recv_from: {e}"))).await;
-                    return;
-                }
-            };
-            let frame = Message::Binary(buf[..n].to_vec());
-            if let Err(e) = sink.send(frame).await {
-                let _ = end_tx_udp.send(BridgeEnd::WsError(format!("send: {e}"))).await;
-                return;
-            }
-        }
-    });
-
-    let end_tx_ws = end_tx.clone();
-    let udp_send = Arc::clone(&udp);
-    let ws_to_udp = tokio::spawn(async move {
-        while let Some(msg) = stream.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(e) => {
-                    let _ = end_tx_ws.send(BridgeEnd::WsError(format!("recv: {e}"))).await;
-                    return;
-                }
-            };
-            match msg {
-                Message::Binary(data) => {
-                    if let Err(e) = udp_send.send_to(&data, forward_to).await {
-                        let _ = end_tx_ws.send(BridgeEnd::UdpError(format!("send_to: {e}"))).await;
-                        return;
-                    }
-                }
-                Message::Close(_) => {
-                    let _ = end_tx_ws.send(BridgeEnd::WsClosed).await;
-                    return;
-                }
-                _ => { /* ignore text/ping/pong; tungstenite auto-responds to ping */ }
-            }
-        }
-        let _ = end_tx_ws.send(BridgeEnd::WsClosed).await;
-    });
-
-    let end = end_rx.recv().await.unwrap_or(BridgeEnd::WsClosed);
-    udp_to_ws.abort();
-    ws_to_udp.abort();
-    end
 }
