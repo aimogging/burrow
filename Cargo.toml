@@ -49,6 +49,11 @@ async-trait = "0.1"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
+# Self-signed cert generation for `gen --relay`. `ring` backend keeps
+# the build pure-Rust + matches what tokio-rustls uses; `pem` enables
+# Certificate::pem()/KeyPair::serialize_pem() which is what the
+# generated relay-bundle files contain.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
 
 [[bin]]
 name = "burrow"
@@ -80,6 +85,21 @@ embedded-config = []
 # binary that emits nothing on stdout/stderr. Debug builds still log
 # normally so `cargo test` output stays useful.
 silent = ["tracing/release_max_level_off"]
+
+# Bake the relay's TLS cert + key + bearer token (and optionally
+# listen/forward addresses) into the burrow-relay binary. Mirror of
+# `embedded-config` but on the relay side. The build.rs reads from:
+#
+#   BURROW_RELAY_EMBED_TOKEN        bearer token clients must present
+#   BURROW_RELAY_EMBED_CERT_FILE    path to TLS cert chain (PEM)
+#   BURROW_RELAY_EMBED_KEY_FILE     path to TLS private key (PEM)
+#   BURROW_RELAY_EMBED_LISTEN       optional, default 0.0.0.0:443
+#   BURROW_RELAY_EMBED_FORWARD      optional, default 127.0.0.1:51820
+#
+# Pairs with `gen --relay` on the burrow-client side and the
+# `gen-embed-wss` justfile recipe — together they produce a paired
+# (burrow, burrow-relay) binary set that runs with no CLI args.
+embedded-relay-bundle = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_Console"] }

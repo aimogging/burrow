@@ -31,6 +31,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::Connector;
 
 use crate::transport::WgTransport;
 
@@ -59,15 +60,33 @@ impl WssTransport {
     /// the caller on a network round-trip. recv() will simply return
     /// nothing until the supervisor establishes the first session.
     pub async fn connect(url: &str, token: &str) -> Result<Arc<Self>> {
+        Self::connect_with(url, token, false).await
+    }
+
+    /// Like `connect` but with the option to skip TLS certificate
+    /// verification. Required when the relay is using a self-signed
+    /// cert (the typical embed-mode deployment) — pairs with the
+    /// `gen --relay` workflow that produces matching binaries with
+    /// the cert baked into burrow-relay and `TlsSkipVerify=true` baked
+    /// into burrow.
+    pub async fn connect_with(url: &str, token: &str, tls_skip_verify: bool) -> Result<Arc<Self>> {
         if !url.starts_with("wss://") && !url.starts_with("ws://") {
             bail!("WSS transport URL must start with wss:// or ws:// (got `{url}`)");
+        }
+        if tls_skip_verify && url.starts_with("ws://") {
+            tracing::warn!("--tls-skip-verify with ws:// URL has no effect (no TLS to skip)");
         }
         let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(SEND_QUEUE_DEPTH);
         let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(RECV_QUEUE_DEPTH);
         let url = url.to_string();
         let token = token.to_string();
+        let connector = if tls_skip_verify {
+            Some(no_verify_connector()?)
+        } else {
+            None
+        };
         tokio::spawn(async move {
-            supervise(url, token, out_rx, in_tx).await;
+            supervise(url, token, connector, out_rx, in_tx).await;
         });
         Ok(Arc::new(Self {
             out_tx,
@@ -114,12 +133,13 @@ impl WgTransport for WssTransport {
 async fn supervise(
     url: String,
     token: String,
+    connector: Option<Connector>,
     mut out_rx: mpsc::Receiver<Vec<u8>>,
     in_tx: mpsc::Sender<Vec<u8>>,
 ) {
     let mut delay = INITIAL_BACKOFF;
     loop {
-        let ws = match connect_with_token(&url, &token).await {
+        let ws = match connect_with_token(&url, &token, connector.clone()).await {
             Ok(ws) => {
                 tracing::info!(url = %url, "wss connected");
                 delay = INITIAL_BACKOFF;
@@ -213,17 +233,99 @@ type WebSocket = tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 >;
 
-async fn connect_with_token(url: &str, token: &str) -> Result<WebSocket> {
+async fn connect_with_token(
+    url: &str,
+    token: &str,
+    connector: Option<Connector>,
+) -> Result<WebSocket> {
     let mut request = url
         .into_client_request()
         .with_context(|| format!("invalid WS URL: {url}"))?;
     let header_value = HeaderValue::from_str(&format!("Bearer {token}"))
         .map_err(|e| anyhow!("invalid bearer token (must be ASCII): {e}"))?;
     request.headers_mut().insert("Authorization", header_value);
-    let (ws, _resp) = tokio_tungstenite::connect_async(request)
-        .await
-        .with_context(|| format!("connecting to {url}"))?;
+    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
+        request, None, false, connector,
+    )
+    .await
+    .with_context(|| format!("connecting to {url}"))?;
     Ok(ws)
+}
+
+/// Build a tokio-tungstenite `Connector::Rustls` whose verifier accepts any
+/// server certificate. Used by `--tls-skip-verify` so a relay running with a
+/// freshly-generated self-signed cert is reachable without operator-side
+/// trust glue. This degrades the TLS layer to obfuscation only — anyone
+/// who can MITM the wire can impersonate the relay. The bearer token
+/// remains the only meaningful auth.
+fn no_verify_connector() -> Result<Connector> {
+    use tokio_rustls::rustls;
+    // rustls 0.23 requires a default crypto provider before any
+    // ClientConfig::builder() call. Idempotent — we don't care if it's
+    // already installed elsewhere in the process.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+        .with_no_client_auth();
+    Ok(Connector::Rustls(Arc::new(config)))
+}
+
+#[derive(Debug)]
+struct NoCertVerifier;
+
+impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+        _server_name: &tokio_rustls::rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: tokio_rustls::rustls::pki_types::UnixTime,
+    ) -> std::result::Result<
+        tokio_rustls::rustls::client::danger::ServerCertVerified,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> std::result::Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> std::result::Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+        use tokio_rustls::rustls::SignatureScheme as S;
+        vec![
+            S::ECDSA_NISTP256_SHA256,
+            S::ECDSA_NISTP384_SHA384,
+            S::ED25519,
+            S::RSA_PKCS1_SHA256,
+            S::RSA_PKCS1_SHA384,
+            S::RSA_PSS_SHA256,
+            S::RSA_PSS_SHA384,
+        ]
+    }
 }
 
 #[cfg(test)]

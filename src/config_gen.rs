@@ -26,7 +26,7 @@
 
 use std::net::Ipv4Addr;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -59,6 +59,22 @@ pub struct GenParams {
     pub listen_port: u16,
     /// burrow control port (goes into `burrow.conf`).
     pub control_port: u16,
+    /// When set, generates a paired (burrow, burrow-relay) deployment.
+    /// The host[:port] is what burrow will dial via WSS; a self-signed
+    /// cert covering the host is produced and burrow.conf gets
+    /// `Transport=`, `RelayToken=`, `TlsSkipVerify=true` added.
+    pub relay: Option<RelayParams>,
+}
+
+/// Parameters that turn `gen` into a paired-deployment generator. When
+/// `Some`, the output set grows to include `relay-bundle/{cert.pem,
+/// key.pem,token.txt,listen.txt,forward.txt}` and `burrow.conf` gets
+/// the WSS-side keys baked in.
+pub struct RelayParams {
+    /// Host[:port] burrow will dial. The host part populates the cert's
+    /// SAN (DNS for hostnames, IP for literals); both halves are
+    /// embedded into `burrow.conf`'s `Transport=` URL.
+    pub host_port: String,
 }
 
 impl Default for GenParams {
@@ -71,6 +87,7 @@ impl Default for GenParams {
             clients: 1,
             listen_port: 51820,
             control_port: DEFAULT_CONTROL_PORT,
+            relay: None,
         }
     }
 }
@@ -82,7 +99,10 @@ pub struct GeneratedConfig {
 
 /// Generate the full trio (+ N-1 extra client configs). Order of the
 /// returned vec: `server.conf`, `burrow.conf`, `client1.conf`, ...,
-/// `clientN.conf`.
+/// `clientN.conf`. When `params.relay` is set, the WSS-side artifacts
+/// `relay-bundle/cert.pem`, `relay-bundle/key.pem`, `relay-bundle/token.txt`,
+/// `relay-bundle/listen.txt`, and `relay-bundle/forward.txt` are
+/// appended.
 pub fn generate(params: &GenParams) -> Result<Vec<GeneratedConfig>> {
     if params.clients == 0 {
         bail!("--clients must be >= 1");
@@ -104,7 +124,14 @@ pub fn generate(params: &GenParams) -> Result<Vec<GeneratedConfig>> {
         format!(", {}", params.routes.join(", "))
     };
 
-    let mut out = Vec::with_capacity(2 + clients.len());
+    // Generate relay artifacts up front so we can fold the token + URL
+    // into `burrow.conf`'s `Transport=` / `RelayToken=` lines.
+    let relay_artifacts = match &params.relay {
+        Some(rp) => Some(build_relay_artifacts(rp, params.listen_port)?),
+        None => None,
+    };
+
+    let mut out = Vec::with_capacity(2 + clients.len() + 5);
     out.push(GeneratedConfig {
         filename: "server.conf".into(),
         contents: build_server_conf(
@@ -121,13 +148,23 @@ pub fn generate(params: &GenParams) -> Result<Vec<GeneratedConfig>> {
     });
     out.push(GeneratedConfig {
         filename: "burrow.conf".into(),
-        contents: build_burrow_conf(params, &gateway, gateway_ip, &server, prefix),
+        contents: build_burrow_conf(
+            params,
+            &gateway,
+            gateway_ip,
+            &server,
+            prefix,
+            relay_artifacts.as_ref(),
+        ),
     });
     for (i, c) in clients.iter().enumerate() {
         out.push(GeneratedConfig {
             filename: format!("client{}.conf", i + 1),
             contents: build_client_conf(params, c, client_ips[i], &server, &routes_suffix, prefix),
         });
+    }
+    if let Some(r) = relay_artifacts {
+        out.extend(r.into_files());
     }
     Ok(out)
 }
@@ -169,13 +206,25 @@ fn build_burrow_conf(
     gateway_ip: Ipv4Addr,
     server: &Keypair,
     prefix: u8,
+    relay: Option<&RelayArtifacts>,
 ) -> String {
+    let relay_lines = match relay {
+        Some(r) => format!(
+            "Transport = wss://{host}/v1/wg\n\
+             RelayToken = {token}\n\
+             TlsSkipVerify = true\n",
+            host = r.host_port,
+            token = r.token,
+        ),
+        None => String::new(),
+    };
     format!(
         "[Interface]\n\
          PrivateKey = {}\n\
          Address = {}/{}\n\
          ControlPort = {}\n\
          DnsEnabled = true\n\
+         {}\
          \n\
          [Peer]\n\
          PublicKey = {}\n\
@@ -186,6 +235,7 @@ fn build_burrow_conf(
         gateway_ip,
         prefix,
         params.control_port,
+        relay_lines,
         server.public,
         params.endpoint,
         params.subnet.network().address(),
@@ -248,6 +298,88 @@ impl Keypair {
             public: b64.encode(public.as_bytes()),
         }
     }
+}
+
+/// Output of cert/token generation when `gen --relay` is in play.
+/// Owns the host, token, and PEMs so `build_burrow_conf` can fold the
+/// token + URL into the burrow side and the trailing files can be
+/// emitted as part of the output set.
+struct RelayArtifacts {
+    host_port: String,
+    token: String,
+    cert_pem: String,
+    key_pem: String,
+    forward_to: String,
+    listen: String,
+}
+
+impl RelayArtifacts {
+    fn into_files(self) -> Vec<GeneratedConfig> {
+        vec![
+            GeneratedConfig {
+                filename: "relay-bundle/cert.pem".into(),
+                contents: self.cert_pem,
+            },
+            GeneratedConfig {
+                filename: "relay-bundle/key.pem".into(),
+                contents: self.key_pem,
+            },
+            GeneratedConfig {
+                filename: "relay-bundle/token.txt".into(),
+                contents: format!("{}\n", self.token),
+            },
+            GeneratedConfig {
+                filename: "relay-bundle/listen.txt".into(),
+                contents: format!("{}\n", self.listen),
+            },
+            GeneratedConfig {
+                filename: "relay-bundle/forward.txt".into(),
+                contents: format!("{}\n", self.forward_to),
+            },
+        ]
+    }
+}
+
+fn build_relay_artifacts(rp: &RelayParams, wg_listen_port: u16) -> Result<RelayArtifacts> {
+    use rcgen::generate_simple_self_signed;
+
+    if rp.host_port.is_empty() {
+        bail!("--relay host[:port] must not be empty");
+    }
+    let (host_only, port) = match rp.host_port.rsplit_once(':') {
+        Some((h, p)) => {
+            let port: u16 = p
+                .parse()
+                .with_context(|| format!("invalid relay port `{p}`"))?;
+            (h.to_string(), port)
+        }
+        None => (rp.host_port.clone(), 443),
+    };
+    let host_port = format!("{host_only}:{port}");
+
+    // Single-SAN self-signed cert. We let rcgen pick a default validity
+    // window and a fresh ECDSA P-256 key. With `TlsSkipVerify=true` on
+    // the burrow side the SAN is informational, but it stays accurate
+    // so flipping skip-verify off (e.g. with a pinned-CA workflow
+    // later) doesn't immediately break.
+    let certified = generate_simple_self_signed(vec![host_only.clone()])
+        .map_err(|e| anyhow::anyhow!("rcgen self-signed: {e}"))?;
+    let cert_pem = certified.cert.pem();
+    let key_pem = certified.key_pair.serialize_pem();
+
+    // Token: 32 random bytes, base64. Matches the keygen pattern;
+    // reuses the same getrandom backend already pulled in by x25519.
+    let token_bytes = StaticSecret::random();
+    let token = base64::engine::general_purpose::STANDARD.encode(token_bytes.to_bytes());
+
+    Ok(RelayArtifacts {
+        host_port,
+        token,
+        cert_pem,
+        key_pem,
+        forward_to: format!("127.0.0.1:{wg_listen_port}"),
+        listen: format!("0.0.0.0:{port}"),
+    })
 }
 
 /// Lay out `.1` for the server, `.2` for the gateway, and `.10..` for
@@ -481,6 +613,100 @@ mod tests {
         assert!(server.contents.contains("AllowedIPs = 10.0.0.2/32\n"));
         let client = out.iter().find(|c| c.filename == "client1.conf").unwrap();
         assert!(client.contents.contains("AllowedIPs = 10.0.0.0/24\n"));
+    }
+
+    #[test]
+    fn relay_mode_appends_bundle_files() {
+        let mut p = default_params();
+        p.relay = Some(RelayParams {
+            host_port: "relay.example.com:443".into(),
+        });
+        let out = generate(&p).unwrap();
+        let names: Vec<&str> = out.iter().map(|c| c.filename.as_str()).collect();
+        for expected in [
+            "server.conf",
+            "burrow.conf",
+            "client1.conf",
+            "relay-bundle/cert.pem",
+            "relay-bundle/key.pem",
+            "relay-bundle/token.txt",
+            "relay-bundle/listen.txt",
+            "relay-bundle/forward.txt",
+        ] {
+            assert!(names.contains(&expected), "missing {expected} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn relay_mode_burrow_conf_carries_transport_lines() {
+        let mut p = default_params();
+        p.relay = Some(RelayParams {
+            host_port: "relay.example.com:443".into(),
+        });
+        let out = generate(&p).unwrap();
+        let burrow = out.iter().find(|c| c.filename == "burrow.conf").unwrap();
+        assert!(
+            burrow.contents.contains("Transport = wss://relay.example.com:443/v1/wg"),
+            "missing Transport line, got:\n{}",
+            burrow.contents
+        );
+        assert!(burrow.contents.contains("RelayToken = "));
+        assert!(burrow.contents.contains("TlsSkipVerify = true"));
+    }
+
+    #[test]
+    fn relay_mode_burrow_conf_still_roundtrips_through_parser() {
+        let mut p = default_params();
+        p.relay = Some(RelayParams {
+            host_port: "relay.example.com".into(), // default port 443
+        });
+        let out = generate(&p).unwrap();
+        let burrow = out.iter().find(|c| c.filename == "burrow.conf").unwrap();
+        let cfg = crate::config::parse_str(&burrow.contents).expect("burrow.conf must parse");
+        assert_eq!(
+            cfg.interface.transport.as_deref(),
+            Some("wss://relay.example.com:443/v1/wg")
+        );
+        assert!(cfg.interface.tls_skip_verify);
+        assert!(cfg.interface.relay_token.is_some());
+    }
+
+    #[test]
+    fn relay_token_unique_across_runs() {
+        let mut p = default_params();
+        p.relay = Some(RelayParams {
+            host_port: "r:443".into(),
+        });
+        let a = generate(&p).unwrap();
+        let b = generate(&p).unwrap();
+        let token = |out: &[GeneratedConfig]| {
+            out.iter()
+                .find(|c| c.filename == "relay-bundle/token.txt")
+                .unwrap()
+                .contents
+                .clone()
+        };
+        assert_ne!(token(&a), token(&b));
+    }
+
+    #[test]
+    fn relay_artifacts_are_pem_shaped() {
+        let mut p = default_params();
+        p.relay = Some(RelayParams {
+            host_port: "127.0.0.1:8443".into(),
+        });
+        let out = generate(&p).unwrap();
+        let cert = out
+            .iter()
+            .find(|c| c.filename == "relay-bundle/cert.pem")
+            .unwrap();
+        let key = out
+            .iter()
+            .find(|c| c.filename == "relay-bundle/key.pem")
+            .unwrap();
+        assert!(cert.contents.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(cert.contents.contains("-----END CERTIFICATE-----"));
+        assert!(key.contents.contains("PRIVATE KEY"));
     }
 
     #[test]

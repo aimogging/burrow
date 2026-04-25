@@ -25,6 +25,9 @@ fn build_pair() -> (WgCore, WgCore) {
             address: "10.0.0.1/24".parse().unwrap(),
             control_port: burrow::config::DEFAULT_CONTROL_PORT,
             dns_enabled: true,
+            transport: None,
+            relay_token: None,
+            tls_skip_verify: false,
         },
         peer: PeerConfig {
             public_key: server_public,
@@ -40,6 +43,9 @@ fn build_pair() -> (WgCore, WgCore) {
             address: "10.0.0.2/24".parse().unwrap(),
             control_port: burrow::config::DEFAULT_CONTROL_PORT,
             dns_enabled: true,
+            transport: None,
+            relay_token: None,
+            tls_skip_verify: false,
         },
         peer: PeerConfig {
             public_key: client_public,

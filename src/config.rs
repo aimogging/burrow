@@ -47,6 +47,19 @@ pub struct InterfaceConfig {
     /// reverse-tunnel registration on port 53 always takes precedence
     /// over the DNS service regardless of this flag.
     pub dns_enabled: bool,
+    /// Optional transport URL override (`wss://host/path` or
+    /// `udp://host:port`). When set, replaces the implicit UDP path
+    /// that uses `[Peer] Endpoint`. Mirrors the `--transport` CLI flag
+    /// and rides the embedded-config feature so it can be baked in.
+    pub transport: Option<String>,
+    /// Bearer token for the WSS relay. Mirrors `--relay-token` /
+    /// `BURROW_RELAY_TOKEN`. Only meaningful when `transport` is set
+    /// to a WSS URL.
+    pub relay_token: Option<String>,
+    /// Whether to skip TLS certificate verification on the WSS
+    /// transport. Default false. Required for the `gen --relay`
+    /// self-signed-cert workflow; no-op for udp:// or ws://.
+    pub tls_skip_verify: bool,
 }
 
 /// Default TCP port for the burrow control channel on the WG interface
@@ -96,6 +109,9 @@ struct InterfaceBuilder {
     address: Option<Ipv4Cidr>,
     control_port: Option<u16>,
     dns_enabled: Option<bool>,
+    transport: Option<String>,
+    relay_token: Option<String>,
+    tls_skip_verify: Option<bool>,
 }
 
 #[derive(Default)]
@@ -161,6 +177,9 @@ pub fn parse_str(input: &str) -> Result<Config> {
             .ok_or_else(|| anyhow!("[Interface] missing Address"))?,
         control_port: iface.control_port.unwrap_or(DEFAULT_CONTROL_PORT),
         dns_enabled: iface.dns_enabled.unwrap_or(true),
+        transport: iface.transport,
+        relay_token: iface.relay_token,
+        tls_skip_verify: iface.tls_skip_verify.unwrap_or(false),
     };
     let peer = PeerConfig {
         public_key: peer
@@ -243,6 +262,28 @@ fn apply_interface_kv(
                 ),
             };
             builder.dns_enabled = Some(enabled);
+        }
+        "transport" => {
+            if value.is_empty() {
+                bail!("line {lineno}: empty Transport");
+            }
+            builder.transport = Some(value.to_string());
+        }
+        "relaytoken" => {
+            if value.is_empty() {
+                bail!("line {lineno}: empty RelayToken");
+            }
+            builder.relay_token = Some(value.to_string());
+        }
+        "tlsskipverify" => {
+            let enabled = match value.to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => true,
+                "false" | "no" | "off" | "0" => false,
+                other => bail!(
+                    "line {lineno}: TlsSkipVerify expects true/false/yes/no/on/off/1/0, got `{other}`"
+                ),
+            };
+            builder.tls_skip_verify = Some(enabled);
         }
         "listenport" | "dns" | "mtu" | "fwmark" | "table" | "preup" | "postup" | "predown"
         | "postdown" | "saveconfig" => {

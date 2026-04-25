@@ -96,6 +96,73 @@ gen-embed *GEN_ARGS:
     cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs
     @just embed ./burrow-configs/burrow.conf {{target}}
 
+# Min-sized silent burrow + burrow-relay pair, both with their respective
+# configs embedded. Run `gen-embed-wss --endpoint host:port --routes ...
+# --relay relayhost[:port]` (other args same as gen-embed). Produces:
+#   target/min/burrow         (gateway, config + transport URL + token + skip-verify)
+#   target/min/burrow-relay   (relay, cert + key + token)
+#   burrow-configs/{server,clientN}.conf
+[unix]
+embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
+    #!/usr/bin/env bash
+    set -eu
+    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+    rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+    repo="$(pwd)"
+    registry_src="$(find "$cargo_home/registry/src" -maxdepth 1 -type d -name 'index.crates.io-*' 2>/dev/null | head -1)"
+    remap="--remap-path-prefix=$repo=src --remap-path-prefix=$cargo_home=cargo --remap-path-prefix=$rustup_home=rustup"
+    if [ -n "$registry_src" ]; then
+        remap="$remap --remap-path-prefix=$registry_src=deps"
+    fi
+    target_flag=""
+    if [ -n "{{TARGET}}" ]; then
+        target_flag="--target {{TARGET}}"
+    fi
+    BURROW_EMBEDDED_CONFIG="$(realpath '{{CONFIG}}')" RUSTFLAGS="$remap" \
+        cargo build --bin burrow --profile min --features embedded-config,silent $target_flag
+    bundle="$(realpath '{{BUNDLE_DIR}}')"
+    BURROW_RELAY_EMBED_TOKEN="$(cat "$bundle/token.txt" | tr -d '\n')" \
+    BURROW_RELAY_EMBED_CERT_FILE="$bundle/cert.pem" \
+    BURROW_RELAY_EMBED_KEY_FILE="$bundle/key.pem" \
+    BURROW_RELAY_EMBED_LISTEN="$(cat "$bundle/listen.txt" | tr -d '\n')" \
+    BURROW_RELAY_EMBED_FORWARD="$(cat "$bundle/forward.txt" | tr -d '\n')" \
+    RUSTFLAGS="$remap" \
+        cargo build --bin burrow-relay --profile min --features embedded-relay-bundle,silent $target_flag
+    RUSTFLAGS="$remap" \
+        cargo build --bin burrow-client --profile min --features silent $target_flag
+
+[windows]
+embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }; \
+    $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }; \
+    $repo = (Get-Location).Path; \
+    $registrySrc = (Get-ChildItem "$cargoHome\registry\src" -Directory -Filter 'index.crates.io-*' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName; \
+    $remap = "--remap-path-prefix=$repo=src --remap-path-prefix=$cargoHome=cargo --remap-path-prefix=$rustupHome=rustup"; \
+    if ($registrySrc) { $remap = "$remap --remap-path-prefix=$registrySrc=deps" }; \
+    $env:RUSTFLAGS = $remap; \
+    $env:BURROW_EMBEDDED_CONFIG = (Resolve-Path '{{CONFIG}}').Path; \
+    $t = if ('{{TARGET}}' -eq '') { @() } else { @('--target','{{TARGET}}') }; \
+    cargo build --bin burrow --profile min --features embedded-config,silent @t; \
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
+    $bundle = (Resolve-Path '{{BUNDLE_DIR}}').Path; \
+    $env:BURROW_RELAY_EMBED_TOKEN = (Get-Content "$bundle\token.txt" -Raw).Trim(); \
+    $env:BURROW_RELAY_EMBED_CERT_FILE = "$bundle\cert.pem"; \
+    $env:BURROW_RELAY_EMBED_KEY_FILE = "$bundle\key.pem"; \
+    $env:BURROW_RELAY_EMBED_LISTEN = (Get-Content "$bundle\listen.txt" -Raw).Trim(); \
+    $env:BURROW_RELAY_EMBED_FORWARD = (Get-Content "$bundle\forward.txt" -Raw).Trim(); \
+    cargo build --bin burrow-relay --profile min --features embedded-relay-bundle,silent @t; \
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
+    cargo build --bin burrow-client --profile min --features silent @t
+
+# Generate the WSS deployment package + build the paired binaries.
+# Pass through the same gen args (--endpoint, --routes, --dns, ...) plus
+# --relay HOST[:PORT]. End result: target/min/{burrow,burrow-relay}
+# both runnable with no CLI args, plus server.conf + clientN.conf for
+# the kernel-WG side.
+gen-embed-wss *GEN_ARGS:
+    cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs
+    @just embed-wss-pair ./burrow-configs/burrow.conf ./burrow-configs/relay-bundle {{target}}
+
 # Passthrough to `burrow-client gen`. Same args as the binary's gen subcommand.
 gen *ARGS:
     cargo run --release --bin burrow-client -- gen {{ARGS}}

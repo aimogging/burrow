@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use burrow::config::{parse_ipv4_cidr, DEFAULT_CONTROL_PORT};
-use burrow::config_gen::{generate, GenParams};
+use burrow::config_gen::{generate, GenParams, RelayParams};
 use burrow::reverse_registry::OpenRequest;
 use burrow::shell_protocol as sp;
 use burrow::wire::{
@@ -144,6 +144,14 @@ struct GenArgs {
     /// Output directory (created if missing). Existing files are overwritten.
     #[arg(long, default_value = "burrow-configs")]
     out: PathBuf,
+
+    /// Build a paired (burrow, burrow-relay) deployment for WSS.
+    /// Pass `host[:port]` (default port 443) — burrow.conf gets
+    /// `Transport=wss://<host:port>/v1/wg`, `RelayToken=...`, and
+    /// `TlsSkipVerify=true` lines, and a self-signed cert/key + token
+    /// land in `<out>/relay-bundle/` for embedding into burrow-relay.
+    #[arg(long, value_name = "HOST[:PORT]")]
+    relay: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -205,6 +213,7 @@ fn gen_configs(args: GenArgs) -> Result<ExitCode> {
         clients: args.clients,
         listen_port: args.listen_port,
         control_port: DEFAULT_CONTROL_PORT,
+        relay: args.relay.map(|host_port| RelayParams { host_port }),
     };
     let configs = generate(&params)?;
 
@@ -212,6 +221,10 @@ fn gen_configs(args: GenArgs) -> Result<ExitCode> {
         .with_context(|| format!("failed to create {}", args.out.display()))?;
     for c in &configs {
         let path = args.out.join(&c.filename);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
         std::fs::write(&path, &c.contents)
             .with_context(|| format!("failed to write {}", path.display()))?;
         set_private_file_permissions(&path);

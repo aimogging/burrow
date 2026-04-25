@@ -89,12 +89,27 @@ struct Cli {
     /// wss://...`. Falls back to the `BURROW_RELAY_TOKEN` env var.
     #[arg(long)]
     relay_token: Option<String>,
+
+    /// Skip TLS certificate verification when connecting to the WSS
+    /// relay. Required for the typical self-signed-cert deploy
+    /// produced by `gen --relay`. Has no effect on `udp://` or
+    /// `ws://` URLs.
+    #[arg(long)]
+    tls_skip_verify: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    run(cli.config, cli.endpoint, cli.keepalive, cli.transport, cli.relay_token).await
+    run(
+        cli.config,
+        cli.endpoint,
+        cli.keepalive,
+        cli.transport,
+        cli.relay_token,
+        cli.tls_skip_verify,
+    )
+    .await
 }
 
 async fn run(
@@ -103,6 +118,7 @@ async fn run(
     keepalive: Option<u16>,
     transport_url: Option<String>,
     relay_token: Option<String>,
+    tls_skip_verify: bool,
 ) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -159,6 +175,13 @@ async fn run(
     if let Some(ka) = keepalive {
         cfg.peer.persistent_keepalive = if ka == 0 { None } else { Some(ka) };
     }
+    // CLI flags layer over the config: a string flag overrides the
+    // corresponding config-file key; the bool flag is OR-ed (passing
+    // --tls-skip-verify forces it on, but a config-file `TlsSkipVerify
+    // = true` is enough on its own).
+    let transport_url = transport_url.or_else(|| cfg.interface.transport.clone());
+    let relay_token = relay_token.or_else(|| cfg.interface.relay_token.clone());
+    let tls_skip_verify = tls_skip_verify || cfg.interface.tls_skip_verify;
 
     info!(
         endpoint = %cfg.peer.endpoint,
@@ -174,9 +197,14 @@ async fn run(
     info!("interface Address is informational under Phase 11 (smoltcp side uses 198.18.0.0/15 internally)");
 
     let nat = Arc::new(NatTable::new());
-    let transport = build_transport(&cfg, transport_url.as_deref(), relay_token.as_deref())
-        .await
-        .context("WireGuard transport")?;
+    let transport = build_transport(
+        &cfg,
+        transport_url.as_deref(),
+        relay_token.as_deref(),
+        tls_skip_verify,
+    )
+    .await
+    .context("WireGuard transport")?;
     let tunnel = Arc::new(WgTunnel::with_transport(&cfg, transport));
 
     let wg_ip = cfg.interface.address.address();
@@ -426,6 +454,7 @@ async fn build_transport(
     cfg: &config::Config,
     transport_url: Option<&str>,
     relay_token: Option<&str>,
+    tls_skip_verify: bool,
 ) -> Result<Arc<dyn WgTransport>> {
     match transport_url {
         None => bind_udp(&cfg.peer.endpoint).await,
@@ -437,11 +466,16 @@ async fn build_transport(
             let token = match relay_token {
                 Some(t) => t.to_string(),
                 None => std::env::var("BURROW_RELAY_TOKEN").context(
-                    "WSS transport requires --relay-token or BURROW_RELAY_TOKEN env var",
+                    "WSS transport requires --relay-token, BURROW_RELAY_TOKEN env var, \
+                     or RelayToken= in [Interface]",
                 )?,
             };
-            let t = WssTransport::connect(url, &token).await?;
-            info!(url = %url, "WG transport: WSS (supervisor will connect in background)");
+            let t = WssTransport::connect_with(url, &token, tls_skip_verify).await?;
+            info!(
+                url = %url,
+                tls_skip_verify,
+                "WG transport: WSS (supervisor will connect in background)"
+            );
             Ok(t as Arc<dyn WgTransport>)
         }
         Some(other) => bail!("unsupported --transport URL: `{other}` (expected udp:// or wss://)"),
