@@ -140,6 +140,11 @@ deploy-client *ARGS:
 netns-shell *ARGS:
     bash scripts/netns-shell.sh {{ARGS}}
 
+# Ship a pre-built burrow-relay to the WG server box and (re)start it.
+# Pass --target user@host. See `bash scripts/deploy-relay.sh --help`.
+deploy-relay *ARGS:
+    bash scripts/deploy-relay.sh {{ARGS}}
+
 # List sizes of built burrow / burrow-client binaries across profiles.
 [unix]
 size:

@@ -234,14 +234,93 @@ burrow-client shell 10.0.0.2 --program /usr/bin/python3 -- -i
 burrow-client shell 10.0.0.2 --program cmd.exe -- /c "dir C:\"
 ```
 
+### WSS transport — burrow over HTTPS
+
+Some networks block egress UDP (corporate, hotel, captive-portal). For
+those, the server↔burrow leg can ride an HTTPS WebSocket served by
+**burrow-relay**, a small sidecar that runs on the WG server box and
+bridges WS frames to local UDP packets aimed at kernel `wg0`. The
+client↔server leg stays plain WG/UDP — only burrow needs to know.
+
+```mermaid
+flowchart LR
+    client[client<br/>kernel WG] -->|UDP/51820| wgs
+    subgraph srv [WG server box]
+        wgs["kernel wg0<br/>(127.0.0.1:51820)"]
+        relay["burrow-relay<br/>(0.0.0.0:443 TLS)"]
+        wgs <-->|UDP loopback| relay
+    end
+    relay <-->|HTTPS WSS| burrow["burrow<br/>(behind NAT)"]
+```
+
+#### Server side: install burrow-relay
+
+```sh
+# 1. Build for the server's target.
+cargo build --release --bin burrow-relay
+# (or cross-compile, e.g. --target x86_64-unknown-linux-gnu)
+
+# 2. Provision certs + token on the server, ahead of deploy.
+ssh root@vpn.example.com '
+  mkdir -p /etc/burrow-relay
+  # Public TLS cert for the relays Server Name (use Lets Encrypt or
+  # your CA — self-signed will not work without burrow-side trust glue):
+  install -m 0644 /etc/letsencrypt/live/vpn.example.com/fullchain.pem /etc/burrow-relay/
+  install -m 0600 /etc/letsencrypt/live/vpn.example.com/privkey.pem   /etc/burrow-relay/
+  # Bearer token. Anything random and non-empty; share it with peers
+  # the same way you would share a Pre-Shared Key.
+  printf "BURROW_RELAY_TOKEN=%s\n" "$(head -c32 /dev/urandom | base64)" \
+    > /etc/burrow-relay/env
+  chmod 600 /etc/burrow-relay/env
+'
+
+# 3. Ship the binary + systemd unit and (re)start the service.
+just deploy-relay --target root@vpn.example.com --key ~/.ssh/id_ed25519
+```
+
+`deploy-relay` installs the binary to `/usr/local/bin/burrow-relay`
+and the unit to `/etc/systemd/system/burrow-relay.service`, then
+starts it if all three files in `/etc/burrow-relay/` are present.
+The unit pins ambient `CAP_NET_BIND_SERVICE` so it can listen on 443
+without running as root.
+
+Teardown (leaves cert + token files in place so re-deploy is fast):
+
+```sh
+just deploy-relay --target root@vpn.example.com --teardown
+```
+
+#### Burrow side: point at the relay
+
+Two flags on the burrow gateway invocation:
+
+```sh
+burrow --config burrow.conf \
+       --transport wss://vpn.example.com/v1/wg \
+       --relay-token "$(cat /path/to/token)"
+# or, in a systemd unit / wrapper script, set BURROW_RELAY_TOKEN in
+# the environment instead of passing --relay-token on the command line.
+```
+
+The config's `Endpoint = host:port` is ignored when `--transport
+wss://...` is set. The keys, allowed-IPs, and keepalive in the config
+still apply — kernel WG on the server side does its own per-peer
+crypto auth as usual; the relay is just a transport.
+
+If the relay is unreachable, the burrow gateway keeps retrying with
+capped exponential backoff. WG handshakes restart automatically once
+the connection comes back.
+
 ## Commands
 
 ```
-burrow [--config <PATH>]                    # the gateway
-burrow-client tunnel <wg_ip> start -R ...   # reverse tunnels (TCP; -U for UDP)
-burrow-client shell  <wg_ip>                # interactive PTY on the burrow host
-burrow-client keygen                        # base64 x25519 keypair
-burrow-client gen ...                       # write server/burrow/client configs
+burrow [--config <PATH>] [--transport <URL>] # the gateway
+                                             # (URL: udp://host:port or wss://host/v1/wg)
+burrow-client tunnel <wg_ip> start -R ...    # reverse tunnels (TCP; -U for UDP)
+burrow-client shell  <wg_ip>                 # interactive PTY on the burrow host
+burrow-client keygen                         # base64 x25519 keypair
+burrow-client gen ...                        # write server/burrow/client configs
+burrow-relay --listen ... --cert ... --key ... # WSS↔UDP bridge for the WG server box
 ```
 
 `--help` on any subcommand for the full option surface. `just --list`

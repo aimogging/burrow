@@ -1,0 +1,35 @@
+[Unit]
+Description=burrow-relay (WSS-to-UDP bridge for kernel wg0)
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Token comes from this file (key=value lines, must contain
+# BURROW_RELAY_TOKEN=...). Owned by root, mode 0600 — anyone who can
+# read it can connect to the relay as any peer.
+EnvironmentFile=/etc/burrow-relay/env
+ExecStart=/usr/local/bin/burrow-relay \
+    --listen 0.0.0.0:443 \
+    --cert /etc/burrow-relay/fullchain.pem \
+    --key  /etc/burrow-relay/privkey.pem \
+    --forward-to 127.0.0.1:51820
+
+# Capability so we can bind 443 without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# Read-only access to certs/key + the env file.
+ReadOnlyPaths=/etc/burrow-relay
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
