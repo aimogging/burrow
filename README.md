@@ -61,42 +61,79 @@ flowchart LR
 
 ## Quick start
 
+Three boxes — a public WG server, the burrow gateway behind NAT, and
+one or more clients. One command builds the binaries and writes the
+configs that pair them up.
+
 ```sh
-# 1. Build binaries + generate configs. Embeds burrow.conf into the
-#    gateway binary so it runs with no config args. Artifacts:
-#      target/min/burrow(.exe)         -- gateway, config embedded
-#      target/min/burrow-client(.exe)  -- companion CLI
-#      burrow-configs/{server,burrow,client1}.conf
-just gen-embed --endpoint vpn.example.com:51820 --routes 192.168.1.0/24
+# Pick a transport. UDP is the default; WSS is for networks that
+# block egress UDP (corporate, hotel, captive-portal). Same args
+# either way; the WSS variant additionally takes --relay HOST[:PORT].
 
-# 2. Transfer the gateway binary to the host that will sit inside your
-#    private network. It has the config baked in; no args needed.
-#    Linux gateway:
-scp target/min/burrow gateway-host:
-ssh gateway-host ./burrow
-#    Windows gateway, over SMB using the built-in C$ admin share
-#    (from PowerShell on this box; works if you have admin creds on
-#    the target — `net use` prompts if not cached):
-Copy-Item target\min\burrow.exe \\gateway-host\c$\Users\Administrator\
-# then RDP / `Enter-PSSession gateway-host` and run `.\burrow.exe`.
-# (Or enable the optional OpenSSH Server on the Windows host and
-# use `scp target/min/burrow.exe gateway-host:` like Linux.)
+# UDP transport — produces target/min/{burrow,burrow-client}
+just gen-embed     --endpoint vpn.example.com:51820 \
+                   --routes 192.168.1.0/24
 
-# 3. Bring up the WG server on the public VPS (uses server.conf).
+# WSS transport — also produces target/min/burrow-relay (with a
+# self-signed cert + token baked in) plus burrow-configs/relay-bundle/.
+just gen-embed-wss --endpoint vpn.example.com:51820 \
+                   --routes 192.168.1.0/24 \
+                   --relay vpn.example.com:443
+```
+
+Both recipes embed `burrow.conf` into the gateway binary — no
+`--config` flag at runtime, no shipping the config file alongside.
+Output set:
+
+```
+target/min/burrow(.exe)         gateway, config embedded
+target/min/burrow-client(.exe)  companion CLI
+target/min/burrow-relay         only with gen-embed-wss; cert/key/token embedded
+burrow-configs/server.conf      kernel WG server config (wg-quick)
+burrow-configs/burrow.conf      same content that's embedded — keep around for reference
+burrow-configs/client1.conf     wg-quick config for the client peer
+```
+
+Ship the binaries to the boxes that need them and run with no args:
+
+```sh
+# WG server box (kernel WireGuard, plus burrow-relay when on WSS)
+scp burrow-configs/server.conf root@vpn.example.com:/etc/wireguard/wg0.conf
+ssh root@vpn.example.com 'wg-quick up wg0'
+# WSS only — also ship burrow-relay and run it (foreground; nohup or tmux to detach):
+scp target/min/burrow-relay root@vpn.example.com: && ssh root@vpn.example.com ./burrow-relay
+
+# burrow gateway (the host inside the private network)
+scp target/min/burrow gateway-host: && ssh gateway-host ./burrow
+
+# each client peer
+sudo wg-quick up ./burrow-configs/client1.conf
+```
+
+For Windows gateway hosts, use SMB (`Copy-Item target\min\burrow.exe
+\\gateway-host\c$\Users\Administrator\`) or enable OpenSSH Server +
+`scp` like Linux.
+
+### Try it locally without leaving your laptop
+
+`just deploy-server` / `deploy-client` stand the WG server up in a
+netns on a remote box and pull the client into a local netns —
+useful for trying burrow out without involving real infrastructure:
+
+```sh
 just deploy-server --target root@vpn.example.com --key ~/.ssh/id_ed25519
-
-# 4. Bring up the WG client here + drop into the tunnel's netns.
 just deploy-client
 just netns-shell
 # (inside the netns: anything you curl / dig / ssh to the exposed
 #  subnets reaches through burrow.)
 ```
 
-Three machines:
-- **WG server** (step 3): public VPS running kernel WireGuard.
-- **burrow host** (step 2): gateway sitting inside the private network.
-- **Client** (step 4): this box, running in an isolated netns so the
-  tunnel doesn't touch host routing.
+Teardown mirrors:
+
+```sh
+just deploy-server --target root@vpn.example.com --teardown
+just deploy-client --teardown
+```
 
 ### `--routes`: split tunnel vs full tunnel
 
@@ -125,13 +162,6 @@ Two modes:
 
   Throughput is bounded by burrow's LAN pipe; fine for a handful of
   peers, not a commercial-grade VPN service.
-
-Teardown mirrors deploy:
-
-```sh
-just deploy-server --target root@vpn.example.com --teardown
-just deploy-client --teardown
-```
 
 ## Examples
 
