@@ -238,14 +238,14 @@ burrow-client shell 10.0.0.2 --program cmd.exe -- /c "dir C:\"
 
 Some networks block egress UDP (corporate, hotel, captive-portal). For
 those, the server↔burrow leg can ride an HTTPS WebSocket served by
-**burrow-relay**, a small sidecar that runs on the WG server box and
-bridges WS frames to local UDP packets aimed at kernel `wg0`. The
-client↔server leg stays plain WG/UDP — only burrow needs to know.
+**burrow-relay**, a small sidecar that sits next to kernel `wg0` on
+the WG server box and bridges WS frames to local UDP. The
+client↔server leg stays plain WG/UDP — only burrow has to know.
 
 ```mermaid
 flowchart LR
-    client[client<br/>kernel WG] -->|UDP/51820| wgs
-    subgraph srv [WG server box]
+    client["client<br/>kernel WG"] -->|UDP/51820| wgs
+    subgraph srv ["WG server box"]
         wgs["kernel wg0<br/>(127.0.0.1:51820)"]
         relay["burrow-relay<br/>(0.0.0.0:443 TLS)"]
         wgs <-->|UDP loopback| relay
@@ -253,59 +253,75 @@ flowchart LR
     relay <-->|HTTPS WSS| burrow["burrow<br/>(behind NAT)"]
 ```
 
-#### Server side: install burrow-relay
+The `gen-embed-wss` recipe builds a paired `(burrow, burrow-relay)`
+package: matching keys, matching token, matching cert — both binaries
+self-contained and runnable with **no CLI args**. No Let's Encrypt,
+no systemd unit, no `/etc/burrow-relay/` provisioning.
 
 ```sh
-# 1. Build for the server's target.
-cargo build --release --bin burrow-relay
-# (or cross-compile, e.g. --target x86_64-unknown-linux-gnu)
-
-# 2. Provision certs + token on the server, ahead of deploy.
-ssh root@vpn.example.com '
-  mkdir -p /etc/burrow-relay
-  # Public TLS cert for the relays Server Name (use Lets Encrypt or
-  # your CA — self-signed will not work without burrow-side trust glue):
-  install -m 0644 /etc/letsencrypt/live/vpn.example.com/fullchain.pem /etc/burrow-relay/
-  install -m 0600 /etc/letsencrypt/live/vpn.example.com/privkey.pem   /etc/burrow-relay/
-  # Bearer token. Anything random and non-empty; share it with peers
-  # the same way you would share a Pre-Shared Key.
-  printf "BURROW_RELAY_TOKEN=%s\n" "$(head -c32 /dev/urandom | base64)" \
-    > /etc/burrow-relay/env
-  chmod 600 /etc/burrow-relay/env
-'
-
-# 3. Ship the binary + systemd unit and (re)start the service.
-just deploy-relay --target root@vpn.example.com --key ~/.ssh/id_ed25519
+# One command produces:
+#   target/min/burrow            -- WG keys + transport URL + token + skip-verify embedded
+#   target/min/burrow-relay      -- TLS cert + key + token embedded
+#   target/min/burrow-client     -- companion CLI
+#   burrow-configs/server.conf   -- kernel wg-quick on the WG server
+#   burrow-configs/client1.conf  -- kernel wg-quick on each client
+just gen-embed-wss --endpoint vpn.example.com:51820 \
+                   --routes 192.168.1.0/24 \
+                   --relay vpn.example.com:443
 ```
 
-`deploy-relay` installs the binary to `/usr/local/bin/burrow-relay`
-and the unit to `/etc/systemd/system/burrow-relay.service`, then
-starts it if all three files in `/etc/burrow-relay/` are present.
-The unit pins ambient `CAP_NET_BIND_SERVICE` so it can listen on 443
-without running as root.
+`--relay HOST[:PORT]` — where burrow will dial. The host part lands
+in the cert's SAN; default port 443. Use any reachable address —
+DNS hostname, public IP literal, or a wildcard-DNS service like
+`159-65-218-242.nip.io`. The cert is freshly-generated ECDSA P-256
+self-signed; burrow trusts it because `gen --relay` flips the
+`TlsSkipVerify=true` bit in `burrow.conf`. Bearer-token auth is
+still enforced; the TLS layer is pure obfuscation.
 
-Teardown (leaves cert + token files in place so re-deploy is fast):
+Run model — three boxes, three commands, no args anywhere:
 
 ```sh
-just deploy-relay --target root@vpn.example.com --teardown
+# 1. WG server box (kernel WireGuard server)
+sudo wg-quick up ./server.conf
+./burrow-relay     # foreground; nohup or tmux it if you want it detached
+
+# 2. burrow gateway (the host inside the private network)
+./burrow
+
+# 3. each client peer
+sudo wg-quick up ./client1.conf
 ```
 
-#### Burrow side: point at the relay
+burrow.conf for the embed-mode build looks like this — the `Transport`,
+`RelayToken`, and `TlsSkipVerify` lines are how the existing wg-quick
+INI carries the WSS extras through the same embed mechanism that
+already exists:
 
-Two flags on the burrow gateway invocation:
+```ini
+[Interface]
+PrivateKey = ...
+Address = 10.0.0.2/24
+ControlPort = 57821
+DnsEnabled = true
+Transport = wss://vpn.example.com:443/v1/wg
+RelayToken = <base64>
+TlsSkipVerify = true
 
-```sh
-burrow --config burrow.conf \
-       --transport wss://vpn.example.com/v1/wg \
-       --relay-token "$(cat /path/to/token)"
-# or, in a systemd unit / wrapper script, set BURROW_RELAY_TOKEN in
-# the environment instead of passing --relay-token on the command line.
+[Peer]
+PublicKey = ...
+Endpoint = vpn.example.com:51820       # ignored when Transport is set
+AllowedIPs = 10.0.0.0/24
+PersistentKeepalive = 25
 ```
 
-The config's `Endpoint = host:port` is ignored when `--transport
-wss://...` is set. The keys, allowed-IPs, and keepalive in the config
-still apply — kernel WG on the server side does its own per-peer
-crypto auth as usual; the relay is just a transport.
+If you'd rather skip the embed step (e.g. use a CA-issued cert from a
+real DNS name), all three settings have CLI flags too:
+`--transport wss://host/v1/wg`, `--relay-token TOKEN` (or
+`BURROW_RELAY_TOKEN` env), `--tls-skip-verify`. Drop
+`--tls-skip-verify` when the relay's cert is signed by a CA that's
+in webpki-roots. Build burrow-relay normally
+(`cargo build --release --bin burrow-relay`) and pass `--cert`/`--key`/
+`--token`/`--listen`/`--forward-to` at runtime.
 
 If the relay is unreachable, the burrow gateway keeps retrying with
 capped exponential backoff. WG handshakes restart automatically once
@@ -314,13 +330,20 @@ the connection comes back.
 ## Commands
 
 ```
-burrow [--config <PATH>] [--transport <URL>] # the gateway
-                                             # (URL: udp://host:port or wss://host/v1/wg)
-burrow-client tunnel <wg_ip> start -R ...    # reverse tunnels (TCP; -U for UDP)
-burrow-client shell  <wg_ip>                 # interactive PTY on the burrow host
-burrow-client keygen                         # base64 x25519 keypair
-burrow-client gen ...                        # write server/burrow/client configs
-burrow-relay --listen ... --cert ... --key ... # WSS↔UDP bridge for the WG server box
+burrow [--config <PATH>] [--transport <URL>]   # the gateway
+                                               # (URL: udp://host:port or wss://host/v1/wg)
+burrow-client tunnel <wg_ip> start -R ...      # reverse tunnels (TCP; -U for UDP)
+burrow-client shell  <wg_ip>                   # interactive PTY on the burrow host
+burrow-client keygen                           # base64 x25519 keypair
+burrow-client gen ... [--relay HOST[:PORT]]    # write server/burrow/client configs
+                                               # (--relay also produces a relay-bundle/)
+burrow-relay [--cert ... --key ...]            # WSS↔UDP bridge; CLI args optional under
+                                               # --features embedded-relay-bundle
+```
+
+```
+just gen-embed              # UDP transport: pair of binaries + WG configs
+just gen-embed-wss          # WSS transport: same, plus burrow-relay with bundle baked in
 ```
 
 `--help` on any subcommand for the full option surface. `just --list`
@@ -339,9 +362,15 @@ for build / deploy recipes.
 5. Reverse tunnels bind real OS listeners on the gateway. Incoming
    connections are yamux-multiplexed back to the owning client, which
    originates the `forward_to` connection locally.
+6. The WG transport is pluggable behind a `WgTransport` trait. UDP
+   is the default; WSS rides binary WebSocket frames over TLS to a
+   `burrow-relay` sidecar on the WG server box, which bridges back
+   to kernel `wg0` over loopback UDP. Adding HTTP/2, QUIC, or a
+   raw-TCP framing is a localised change behind that trait.
 
 On the WG server: standard `AllowedIPs` routing, `ip_forward = 1`. No
-custom daemon.
+custom daemon required for the UDP transport. For WSS, run
+`burrow-relay` next to kernel `wg0`.
 
 ## Limitations
 
@@ -364,7 +393,7 @@ custom daemon.
 ## Development
 
 ```sh
-cargo test                              # 101 lib + 32 integration tests
+cargo test                              # ~145 lib + integration tests
 cargo clippy --all-targets -- -D warnings
 ```
 
