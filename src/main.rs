@@ -24,7 +24,8 @@ use burrow::proxy::{spawn_tcp_proxy_with_stream, ProxyMsg};
 use burrow::reverse_registry::ReverseRegistry;
 use burrow::rewrite::{self, build_tcp_rst, PROTO_ICMP, PROTO_TCP, PROTO_UDP};
 use burrow::runtime::{spawn_smoltcp, ConnectionId, SmoltcpEvent, SmoltcpHandle};
-use burrow::transport::UdpTransport;
+use burrow::transport::{UdpTransport, WgTransport};
+use burrow::transport_wss::WssTransport;
 use burrow::tunnel::WgTunnel;
 use burrow::udp_proxy::{extract_udp_payload, spawn_udp_proxy};
 
@@ -76,18 +77,32 @@ struct Cli {
     /// Override PersistentKeepalive (seconds; 0 disables).
     #[arg(long)]
     keepalive: Option<u16>,
+
+    /// Transport URL. `udp://host:port` for the original UDP path (the
+    /// default — derived from the config's `Endpoint` if omitted) or
+    /// `wss://host[:port]/path` to tunnel WG datagrams over an HTTPS
+    /// WebSocket served by `burrow-relay`.
+    #[arg(long)]
+    transport: Option<String>,
+
+    /// Bearer token for the WSS relay. Used only with `--transport
+    /// wss://...`. Falls back to the `BURROW_RELAY_TOKEN` env var.
+    #[arg(long)]
+    relay_token: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    run(cli.config, cli.endpoint, cli.keepalive).await
+    run(cli.config, cli.endpoint, cli.keepalive, cli.transport, cli.relay_token).await
 }
 
 async fn run(
     config_path: Option<PathBuf>,
     endpoint: Option<String>,
     keepalive: Option<u16>,
+    transport_url: Option<String>,
+    relay_token: Option<String>,
 ) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -159,15 +174,10 @@ async fn run(
     info!("interface Address is informational under Phase 11 (smoltcp side uses 198.18.0.0/15 internally)");
 
     let nat = Arc::new(NatTable::new());
-    let udp_transport = UdpTransport::bind(&cfg.peer.endpoint)
+    let transport = build_transport(&cfg, transport_url.as_deref(), relay_token.as_deref())
         .await
-        .context("WireGuard UDP transport")?;
-    info!(
-        local = %udp_transport.local_addr()?,
-        peer = %udp_transport.endpoint(),
-        "WG socket bound"
-    );
-    let tunnel = Arc::new(WgTunnel::with_transport(&cfg, udp_transport));
+        .context("WireGuard transport")?;
+    let tunnel = Arc::new(WgTunnel::with_transport(&cfg, transport));
 
     let wg_ip = cfg.interface.address.address();
     let dns_enabled = cfg.interface.dns_enabled;
@@ -406,6 +416,42 @@ async fn run(
     sweep.abort();
     direct_egress.abort();
     result
+}
+
+/// Build the WG transport based on `--transport` (or fall back to UDP using
+/// the config's `Endpoint`). UDP is the only path that has a meaningful
+/// "local socket" to log; for WSS the supervisor task does its own
+/// connection-state logging.
+async fn build_transport(
+    cfg: &config::Config,
+    transport_url: Option<&str>,
+    relay_token: Option<&str>,
+) -> Result<Arc<dyn WgTransport>> {
+    match transport_url {
+        None => bind_udp(&cfg.peer.endpoint).await,
+        Some(url) if url.starts_with("udp://") => {
+            let host_port = url.trim_start_matches("udp://");
+            bind_udp(host_port).await
+        }
+        Some(url) if url.starts_with("wss://") || url.starts_with("ws://") => {
+            let token = match relay_token {
+                Some(t) => t.to_string(),
+                None => std::env::var("BURROW_RELAY_TOKEN").context(
+                    "WSS transport requires --relay-token or BURROW_RELAY_TOKEN env var",
+                )?,
+            };
+            let t = WssTransport::connect(url, &token).await?;
+            info!(url = %url, "WG transport: WSS (supervisor will connect in background)");
+            Ok(t as Arc<dyn WgTransport>)
+        }
+        Some(other) => bail!("unsupported --transport URL: `{other}` (expected udp:// or wss://)"),
+    }
+}
+
+async fn bind_udp(host_port: &str) -> Result<Arc<dyn WgTransport>> {
+    let udp = UdpTransport::bind(host_port).await?;
+    info!(local = %udp.local_addr()?, peer = %udp.endpoint(), "WG transport: UDP");
+    Ok(udp as Arc<dyn WgTransport>)
 }
 
 /// Take a decrypted IPv4 packet from the WG tunnel, run NAT rewrite, and

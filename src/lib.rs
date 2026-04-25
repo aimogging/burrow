@@ -14,6 +14,7 @@ pub mod shell_protocol;
 pub mod smoltcp_iface;
 pub mod test_helpers;
 pub mod transport;
+pub mod transport_wss;
 pub mod tunnel;
 pub mod udp_proxy;
 pub mod udp_reverse;
