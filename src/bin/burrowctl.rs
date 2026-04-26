@@ -51,6 +51,12 @@ enum Cmd {
         #[arg(long)]
         deploy_host: Option<String>,
 
+        /// Optional SSH private key path (`ssh -i`) for the deploy
+        /// host. Most setups don't need this — the user's agent /
+        /// `~/.ssh/config` / default key already works.
+        #[arg(long, value_name = "PATH")]
+        ssh_key: Option<String>,
+
         /// Transport: `udp` (default) or `wss`.
         #[arg(long)]
         transport: Option<String>,
@@ -188,6 +194,7 @@ fn real_main() -> Result<()> {
             endpoint,
             gateway_target,
             deploy_host,
+            ssh_key,
             transport,
             relay_host,
             tls,
@@ -210,6 +217,7 @@ fn real_main() -> Result<()> {
                 endpoint,
                 gateway_target,
                 deploy_host,
+                ssh_key,
                 transport,
                 relay_host,
                 tls,

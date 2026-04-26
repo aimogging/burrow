@@ -39,6 +39,7 @@ pub fn server(name: &str) -> Result<()> {
     }
 
     let host = deploy.server.host.as_str();
+    let key = deploy.server.ssh_key.as_deref();
     let ns = deploy.server.namespace.as_str();
     let remote_conf = format!("/tmp/burrow-{ns}.conf");
 
@@ -46,7 +47,7 @@ pub fn server(name: &str) -> Result<()> {
         ">>> shipping {} -> {host}:{remote_conf}",
         layout.server_conf().display()
     );
-    exec::scp_to(&layout.server_conf(), host, &remote_conf)?;
+    exec::scp_to(&layout.server_conf(), host, key, &remote_conf)?;
 
     let want_relay = spec.transport.mode == TransportMode::Wss;
     if want_relay {
@@ -63,12 +64,12 @@ pub fn server(name: &str) -> Result<()> {
             ">>> shipping {} -> {host}:/tmp/burrow-relay-new",
             relay_bin.display()
         );
-        exec::scp_to(&relay_bin, host, "/tmp/burrow-relay-new")?;
+        exec::scp_to(&relay_bin, host, key, "/tmp/burrow-relay-new")?;
     }
 
     let script = build_server_script(ns, &remote_conf, want_relay);
     println!(">>> running netns + wg setup on {host} (namespace={ns})");
-    exec::ssh_sudo_script(host, &script)
+    exec::ssh_sudo_script(host, key, &script)
         .with_context(|| format!("server-side setup on {host}"))
 }
 
@@ -120,8 +121,9 @@ pub fn down(name: &str) -> Result<()> {
 
     // Remote server side.
     let host = deploy.server.host.as_str();
+    let key = deploy.server.ssh_key.as_deref();
     let ns = deploy.server.namespace.as_str();
-    if let Err(e) = exec::ssh_sudo_script(host, &build_teardown_script(ns, true)) {
+    if let Err(e) = exec::ssh_sudo_script(host, key, &build_teardown_script(ns, true)) {
         errors.push(format!("server-side teardown ({host}): {e:#}"));
     }
 

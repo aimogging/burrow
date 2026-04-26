@@ -108,6 +108,9 @@ pub fn format_spec(state: &FormState) -> String {
         let _ = writeln!(out);
         let _ = writeln!(out, "[deploy.server]");
         let _ = writeln!(out, "host = {}", quote(&state.deploy_host));
+        if !state.deploy_ssh_key.is_empty() {
+            let _ = writeln!(out, "ssh_key = {}", quote(&state.deploy_ssh_key));
+        }
         if let Some(ns) = &state.server_namespace {
             let _ = writeln!(out, "namespace = {}", quote(ns));
         } else {
@@ -153,6 +156,7 @@ mod tests {
             gateway_target: "x86_64-unknown-linux-gnu".into(),
             deploy_enabled: false,
             deploy_host: String::new(),
+            deploy_ssh_key: String::new(),
             transport: super::super::state::TransportChoice::Udp,
             relay_host: String::new(),
             tls_strategy: super::super::state::TlsChoice::SelfSigned,

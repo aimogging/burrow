@@ -92,6 +92,7 @@ pub struct FormState {
     pub gateway_target: String,
     pub deploy_enabled: bool,
     pub deploy_host: String,
+    pub deploy_ssh_key: String,
     pub transport: TransportChoice,
     pub relay_host: String,
     pub tls_strategy: TlsChoice,
@@ -122,6 +123,7 @@ impl FormState {
             gateway_target: detect_host_triple().to_string(),
             deploy_enabled: true,
             deploy_host: String::new(),
+            deploy_ssh_key: String::new(),
             transport: TransportChoice::Udp,
             relay_host: String::new(),
             tls_strategy: TlsChoice::SelfSigned,
@@ -158,6 +160,11 @@ impl FormState {
                 .deploy
                 .as_ref()
                 .map(|d| d.server.host.clone())
+                .unwrap_or_default(),
+            deploy_ssh_key: spec
+                .deploy
+                .as_ref()
+                .and_then(|d| d.server.ssh_key.clone())
                 .unwrap_or_default(),
             transport,
             relay_host: spec.transport.relay_host.clone().unwrap_or_default(),
@@ -248,6 +255,7 @@ impl FormState {
             gateway_target,
             deploy_enabled,
             deploy_host,
+            deploy_ssh_key: args.ssh_key.clone().unwrap_or_default(),
             transport,
             relay_host,
             tls_strategy,
@@ -310,6 +318,7 @@ pub struct InitArgs {
     pub endpoint: Option<String>,
     pub gateway_target: Option<String>,
     pub deploy_host: Option<String>,
+    pub ssh_key: Option<String>,
     pub transport: Option<String>,
     pub relay_host: Option<String>,
     pub routes: Option<String>,
@@ -340,6 +349,7 @@ impl InitArgs {
         self.endpoint.is_some()
             || self.gateway_target.is_some()
             || self.deploy_host.is_some()
+            || self.ssh_key.is_some()
             || self.transport.is_some()
             || self.relay_host.is_some()
             || self.routes.is_some()

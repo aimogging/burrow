@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -53,11 +54,13 @@ use super::state::{detect_host_triple, FormState};
 fn placeholder(f: Field) -> &'static str {
     match f {
         Field::Endpoint   => "vpn.example.com:51820",
-        Field::DeployHost => "vpn.example.com  (or user@host, or IP)",
+        Field::DeployHost => "user@vpn.example.com  (or ssh-config alias)",
+        Field::SshKey     => "/path/to/id_ed25519  (optional — agent / default key by default)",
         Field::RelayHost  => "vpn.example.com:443",
         Field::CertPath   => "/etc/letsencrypt/live/host/fullchain.pem",
         Field::KeyPath    => "/etc/letsencrypt/live/host/privkey.pem",
         Field::Routes     => "192.168.1.0/24, 10.50.0.0/24",
+        Field::Dns        => "10.0.0.2  (or 1.1.1.1, 9.9.9.9 — empty = system resolver)",
         // Advanced fields use their default-shown-as-greyed UI; no
         // placeholder needed — the default value IS the hint.
         _ => "",
@@ -82,8 +85,12 @@ fn help_text(f: Field) -> (&'static str, &'static str) {
             "  on / off",
         ),
         Field::DeployHost => (
-            "ssh-resolvable: alias from ~/.ssh/config, user@host, or bare IP. Used by `burrowctl ship-server` and `burrowctl up`.",
+            "ssh-resolvable: alias from ~/.ssh/config, user@host, or bare host:port. Used by `burrowctl ship-server` and `burrowctl up`. Password authentication isn't supported (the relay-start step pipes a script over stdin, which collides with sshd's TTY-based password prompt) — use ssh-agent or set SSH_KEY below.",
             "  vpn.example.com\n  root@vpn.example.com\n  do          (alias from ~/.ssh/config)",
+        ),
+        Field::SshKey => (
+            "Optional path to an SSH private key (`ssh -i`). Most setups don't need this — the user's agent / ~/.ssh/config / default key already works. Set it when you have a non-default key for this deployment.",
+            "  /home/user/.ssh/id_ed25519_burrow\n  ./deploy-key",
         ),
         Field::Transport => (
             "How burrow's WireGuard datagrams reach the WG server. UDP is native + lowest overhead. WSS tunnels the same datagrams through HTTPS WebSockets — use it when egress UDP is blocked (corporate, hotel, captive-portal).",
@@ -189,8 +196,13 @@ fn drive(
 fn enter_tui() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("enter alt screen")?;
+    crossterm::execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+    )
+    .context("enter alt screen")?;
     Terminal::new(CrosstermBackend::new(stdout)).context("init terminal")
 }
 
@@ -199,7 +211,12 @@ struct TuiGuard;
 impl Drop for TuiGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = crossterm::execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+        );
     }
 }
 
@@ -213,17 +230,18 @@ enum Field {
     Gateway,
     DeployToggle,
     DeployHost,
+    SshKey,
     Transport,
     RelayHost,
     TlsChoice,
     CertPath,
     KeyPath,
     Routes,
+    Dns,
     AdvancedToggle,
     Subnet,
     Clients,
     ListenPort,
-    Dns,
     ServerNs,
     ClientNs,
     RelayTarget,
@@ -235,17 +253,18 @@ const ALL_FIELDS: &[Field] = &[
     Field::Gateway,
     Field::DeployToggle,
     Field::DeployHost,
+    Field::SshKey,
     Field::Transport,
     Field::RelayHost,
     Field::TlsChoice,
     Field::CertPath,
     Field::KeyPath,
     Field::Routes,
+    Field::Dns,
     Field::AdvancedToggle,
     Field::Subnet,
     Field::Clients,
     Field::ListenPort,
-    Field::Dns,
     Field::ServerNs,
     Field::ClientNs,
     Field::RelayTarget,
@@ -256,7 +275,6 @@ const ADVANCED_FIELDS: &[Field] = &[
     Field::Subnet,
     Field::Clients,
     Field::ListenPort,
-    Field::Dns,
     Field::ServerNs,
     Field::ClientNs,
     Field::RelayTarget,
@@ -278,6 +296,20 @@ struct Model {
     advanced_expanded: bool,
     /// Whether the `?` help modal is open for the focused field.
     help_open: bool,
+    /// Whether the Gateway list modal (popped on Enter) is open.
+    gateway_modal_open: bool,
+    /// Selected row inside the gateway modal; len(TARGET_PRESETS) =
+    /// "Other..." (the custom-triple text input row).
+    gateway_modal_idx: usize,
+    /// Cached `rustup target list --installed` output. None until
+    /// the gateway modal is first opened (lazy fetch).
+    installed_targets: Option<Vec<String>>,
+    /// User has manually touched these fields — once true, never auto-
+    /// infer their value (e.g. from WG_ENDPOINT) again. Without this,
+    /// toggling DEPLOY_VIA_SSH off/on or TRANSPORT WSS→UDP→WSS could
+    /// stomp on input the user typed earlier.
+    deploy_host_touched: bool,
+    relay_host_touched: bool,
 }
 
 impl Model {
@@ -294,6 +326,10 @@ impl Model {
             || state.client_namespace.is_some()
             || state.relay_target.is_some()
             || state.client_target.is_some();
+        // Treat any seeded value as user-provided so cycling the
+        // toggles never overwrites it.
+        let deploy_host_touched = !state.deploy_host.is_empty();
+        let relay_host_touched = !state.relay_host.is_empty();
         Self {
             state,
             focus: Field::Endpoint,
@@ -302,6 +338,11 @@ impl Model {
             cmd_buffer: None,
             advanced_expanded,
             help_open: false,
+            gateway_modal_open: false,
+            gateway_modal_idx: 0,
+            installed_targets: None,
+            deploy_host_touched,
+            relay_host_touched,
         }
     }
 
@@ -323,14 +364,15 @@ impl Model {
             self.focus,
             Field::Endpoint
                 | Field::DeployHost
+                | Field::SshKey
                 | Field::RelayHost
                 | Field::CertPath
                 | Field::KeyPath
                 | Field::Routes
+                | Field::Dns
                 | Field::Subnet
                 | Field::Clients
                 | Field::ListenPort
-                | Field::Dns
                 | Field::ServerNs
                 | Field::ClientNs
                 | Field::RelayTarget
@@ -341,7 +383,7 @@ impl Model {
     /// Fields skip themselves when their gating toggle is off.
     fn focusable(&self, f: Field) -> bool {
         match f {
-            Field::DeployHost => self.state.deploy_enabled,
+            Field::DeployHost | Field::SshKey => self.state.deploy_enabled,
             Field::RelayHost | Field::TlsChoice => self.state.transport.is_wss(),
             Field::CertPath | Field::KeyPath => {
                 self.state.transport.is_wss()
@@ -350,7 +392,6 @@ impl Model {
             Field::Subnet
             | Field::Clients
             | Field::ListenPort
-            | Field::Dns
             | Field::ServerNs
             | Field::ClientNs
             | Field::RelayTarget
@@ -393,6 +434,17 @@ enum Outcome {
 }
 
 fn handle(evt: Event, m: &mut Model) -> Outcome {
+    // Bracketed paste: terminals that support it deliver pasted text
+    // as one Event::Paste. Append into whichever text-ish field has
+    // focus. Falls back gracefully for terminals that just stream
+    // KeyCode::Char per pasted character (the existing edit_text
+    // handler already covers that).
+    if let Event::Paste(s) = &evt {
+        if !m.help_open && m.cmd_buffer.is_none() {
+            paste_into_focused(m, s);
+        }
+        return Outcome::Continue;
+    }
     let Event::Key(k) = evt else {
         return Outcome::Continue;
     };
@@ -404,11 +456,16 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
     if m.help_open {
         if matches!(
             k.code,
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') | KeyCode::Char('q')
+            KeyCode::Esc | KeyCode::Enter | KeyCode::F(1) | KeyCode::Char('?') | KeyCode::Char('q')
         ) {
             m.help_open = false;
         }
         return Outcome::Continue;
+    }
+
+    // Gateway list modal handles its own keys.
+    if m.gateway_modal_open {
+        return handle_gateway_modal(k, m);
     }
 
     // If we're in command-bar mode (`:w` / `:q` / `:wq`), keystrokes
@@ -442,9 +499,8 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
             return on_save(m);
         }
         // ↑/↓ always navigate fields. Tab/Shift-Tab cycle Select
-        // values when focused on one; otherwise they fall through to
-        // navigation. (Lets vim-ish users use Tab to flip TRANSPORT
-        // / TLS / GW_TARGET without leaving the field.)
+        // values when focused on one; on non-Select fields Tab is a
+        // no-op (use ↑/↓ to move).
         (KeyCode::Up, _) => {
             m.focus_prev();
             return Outcome::Continue;
@@ -454,25 +510,25 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
             return Outcome::Continue;
         }
         (KeyCode::Tab, _) => {
-            if !m.focus_is_select() {
-                m.focus_next();
-                return Outcome::Continue;
+            if m.focus_is_select() {
+                cycle_select(m, true);
             }
-            // Select cycling falls through to per-field handler below
-            // via the `cycle_select(m, true)` translation.
-            cycle_select(m, true);
             return Outcome::Continue;
         }
         (KeyCode::BackTab, _) => {
-            if !m.focus_is_select() {
-                m.focus_prev();
-                return Outcome::Continue;
+            if m.focus_is_select() {
+                cycle_select(m, false);
             }
-            cycle_select(m, false);
             return Outcome::Continue;
         }
-        // `?` opens the per-field help modal — but only when focus
-        // isn't on a text field, where `?` is a legitimate character.
+        // F1 opens the per-field help modal — works from any field
+        // including text inputs (no key collision). `?` is also bound
+        // as an alias when focus isn't on a text field, since `?` is
+        // a literal character there.
+        (KeyCode::F(1), _) => {
+            m.help_open = true;
+            return Outcome::Continue;
+        }
         (KeyCode::Char('?'), KeyModifiers::NONE) | (KeyCode::Char('?'), KeyModifiers::SHIFT)
             if !m.focus_is_text() =>
         {
@@ -491,13 +547,23 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
 
     match m.focus {
         Field::Endpoint => edit_text(&mut m.state.endpoint, k.code),
-        Field::DeployHost => edit_text(&mut m.state.deploy_host, k.code),
-        Field::RelayHost => edit_text(&mut m.state.relay_host, k.code),
+        Field::DeployHost => {
+            edit_text(&mut m.state.deploy_host, k.code);
+            m.deploy_host_touched = true;
+        }
+        Field::SshKey => edit_text(&mut m.state.deploy_ssh_key, k.code),
+        Field::RelayHost => {
+            edit_text(&mut m.state.relay_host, k.code);
+            m.relay_host_touched = true;
+        }
         Field::Routes => edit_text(&mut m.state.routes, k.code),
         Field::DeployToggle => {
             if matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter) {
                 m.state.deploy_enabled = !m.state.deploy_enabled;
-                if m.state.deploy_enabled && m.state.deploy_host.is_empty() {
+                if m.state.deploy_enabled
+                    && !m.deploy_host_touched
+                    && m.state.deploy_host.is_empty()
+                {
                     m.state.deploy_host = endpoint_host(&m.state.endpoint);
                 }
             }
@@ -528,8 +594,13 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
         Field::RelayTarget => edit_optional(&mut m.state.relay_target, k.code),
         Field::ClientTarget => edit_optional(&mut m.state.client_target, k.code),
         Field::Gateway => match k.code {
+            KeyCode::Enter => {
+                // Pop the list modal so the user can see all options
+                // (with toolchain-installed markers) at once.
+                open_gateway_modal(m);
+            }
             KeyCode::Left => cycle_select(m, false),
-            KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter => cycle_select(m, true),
+            KeyCode::Right | KeyCode::Char(' ') => cycle_select(m, true),
             // When on "Other", let the user type to edit the triple.
             _ if m.gateway_idx >= TARGET_PRESETS.len() => {
                 edit_text(&mut m.state.gateway_target, k.code);
@@ -582,6 +653,117 @@ fn endpoint_host(endpoint: &str) -> String {
     endpoint.split(':').next().unwrap_or("").to_string()
 }
 
+/// Append pasted text to whichever field has focus, if it's a text
+/// input. No-op for Select / checkbox focus (paste into a checkbox
+/// makes no sense; just drop it).
+fn paste_into_focused(m: &mut Model, s: &str) {
+    let focus = m.focus;
+    let target: Option<&mut String> = match focus {
+        Field::Endpoint        => Some(&mut m.state.endpoint),
+        Field::DeployHost      => Some(&mut m.state.deploy_host),
+        Field::SshKey          => Some(&mut m.state.deploy_ssh_key),
+        Field::RelayHost       => Some(&mut m.state.relay_host),
+        Field::CertPath        => Some(&mut m.state.cert_path),
+        Field::KeyPath         => Some(&mut m.state.key_path),
+        Field::Routes          => Some(&mut m.state.routes),
+        // Gateway "Other" mode is also text input.
+        Field::Gateway if m.gateway_idx >= TARGET_PRESETS.len() => Some(&mut m.state.gateway_target),
+        _ => None,
+    };
+    if let Some(buf) = target {
+        // Strip line breaks — pasted multi-line content rarely makes
+        // sense in our single-line fields.
+        let cleaned: String = s.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        buf.push_str(&cleaned);
+        if focus == Field::DeployHost {
+            m.deploy_host_touched = true;
+        } else if focus == Field::RelayHost {
+            m.relay_host_touched = true;
+        }
+        return;
+    }
+    // Advanced fields are Option<String>; promote to Some on paste.
+    let opt: Option<&mut Option<String>> = match m.focus {
+        Field::Subnet       => Some(&mut m.state.subnet),
+        Field::Clients      => Some(&mut m.state.clients),
+        Field::ListenPort   => Some(&mut m.state.listen_port),
+        Field::Dns          => Some(&mut m.state.dns),
+        Field::ServerNs     => Some(&mut m.state.server_namespace),
+        Field::ClientNs     => Some(&mut m.state.client_namespace),
+        Field::RelayTarget  => Some(&mut m.state.relay_target),
+        Field::ClientTarget => Some(&mut m.state.client_target),
+        _ => None,
+    };
+    if let Some(slot) = opt {
+        let cleaned: String = s.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        slot.get_or_insert_with(String::new).push_str(&cleaned);
+    }
+}
+
+/// Open the gateway-target picker modal. Lazily fetches `rustup
+/// target list --installed` on first open + caches it for session.
+fn open_gateway_modal(m: &mut Model) {
+    if m.installed_targets.is_none() {
+        m.installed_targets = Some(fetch_installed_targets());
+    }
+    // Land on the row matching the current selection.
+    m.gateway_modal_idx = m.gateway_idx.min(TARGET_PRESETS.len());
+    m.gateway_modal_open = true;
+}
+
+/// Run `rustup target list --installed` and parse triples. Returns
+/// an empty vec on any failure (rustup missing, weird output, etc.) —
+/// the modal then just shows nothing as installed, which is a safe
+/// regression to "we don't know".
+fn fetch_installed_targets() -> Vec<String> {
+    let out = std::process::Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Modal-mode key handling. Up/Down navigate options; Enter selects
+/// + closes; Esc cancels. When focused on the "Other..." row, typing
+/// edits the custom triple.
+fn handle_gateway_modal(k: crossterm::event::KeyEvent, m: &mut Model) -> Outcome {
+    let other_idx = TARGET_PRESETS.len();
+    let max = other_idx; // valid indices: 0..=other_idx
+    match k.code {
+        KeyCode::Esc => {
+            m.gateway_modal_open = false;
+        }
+        KeyCode::Up => {
+            if m.gateway_modal_idx > 0 {
+                m.gateway_modal_idx -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if m.gateway_modal_idx < max {
+                m.gateway_modal_idx += 1;
+            }
+        }
+        KeyCode::Enter => {
+            m.gateway_idx = m.gateway_modal_idx;
+            sync_gateway(m);
+            m.gateway_modal_open = false;
+        }
+        // When on "Other...", let the user type to edit the triple.
+        _ if m.gateway_modal_idx >= TARGET_PRESETS.len() => {
+            edit_text(&mut m.state.gateway_target, k.code);
+        }
+        _ => {}
+    }
+    Outcome::Continue
+}
+
 /// Cycle the currently-focused Select field one step. `forward = true`
 /// = next option; `false` = previous. Triggered by Tab/Shift-Tab on
 /// Gateway/Transport/TlsChoice.
@@ -605,7 +787,10 @@ fn cycle_select(m: &mut Model, forward: bool) {
                 (cur + T::ALL.len() - 1) % T::ALL.len()
             };
             m.state.transport = T::ALL[next];
-            if m.state.transport.is_wss() && m.state.relay_host.is_empty() {
+            if m.state.transport.is_wss()
+                && !m.relay_host_touched
+                && m.state.relay_host.is_empty()
+            {
                 let host = endpoint_host(&m.state.endpoint);
                 if !host.is_empty() {
                     m.state.relay_host = format!("{host}:443");
@@ -679,7 +864,10 @@ fn render(f: &mut Frame, m: &Model) {
     let wss = m.state.transport.is_wss();
     let byo = wss && m.state.tls_strategy == super::state::TlsChoice::Byo;
     let mut rows_plan: Vec<Field> = vec![Field::Endpoint, Field::Gateway, Field::DeployToggle];
-    if m.state.deploy_enabled { rows_plan.push(Field::DeployHost); }
+    if m.state.deploy_enabled {
+        rows_plan.push(Field::DeployHost);
+        rows_plan.push(Field::SshKey);
+    }
     rows_plan.push(Field::Transport);
     if wss {
         rows_plan.push(Field::RelayHost);
@@ -690,6 +878,7 @@ fn render(f: &mut Frame, m: &Model) {
         }
     }
     rows_plan.push(Field::Routes);
+    rows_plan.push(Field::Dns);
     rows_plan.push(Field::AdvancedToggle);
     if m.advanced_expanded {
         rows_plan.extend(ADVANCED_FIELDS);
@@ -733,13 +922,16 @@ fn render(f: &mut Frame, m: &Model) {
             Style::default().fg(PHOSPHOR_BRIGHT).add_modifier(Modifier::BOLD),
         );
         let help = Span::styled(
-            "↑/↓:NAV  TAB:CYCLE  SPC:TOG  ?:HELP  ^S/:w COMMIT  ESC/:q ABORT",
+            "↑/↓:NAV  TAB:CYCLE  SPC:TOG  F1:HELP  ^S/:w COMMIT  ESC/:q ABORT",
             Style::default().fg(PHOSPHOR_DIM),
         );
         Line::from(vec![prefix, help])
     };
     f.render_widget(Paragraph::new(bottom), rows[last]);
 
+    if m.gateway_modal_open {
+        render_gateway_modal(f, m, area);
+    }
     if m.help_open {
         render_help_modal(f, m, area);
     }
@@ -751,10 +943,10 @@ fn dynamic_height(m: &Model) -> u16 {
     let wss = m.state.transport.is_wss();
     let byo = wss && m.state.tls_strategy == super::state::TlsChoice::Byo;
     let mut n: u16 = 3; // endpoint + gateway + deploy toggle
-    if m.state.deploy_enabled { n += 1; }
+    if m.state.deploy_enabled { n += 2; } // deploy_host + ssh_key
     n += 1; // transport
     if wss { n += 2; if byo { n += 2; } }
-    n += 2; // routes + advanced toggle
+    n += 3; // routes + dns + advanced toggle
     if m.advanced_expanded { n += ADVANCED_FIELDS.len() as u16; }
     n + 3 + 2 // spacer + err + help/cmd  +  borders
 }
@@ -769,14 +961,24 @@ fn render_field(f: &mut Frame, m: &Model, field: Field, area: Rect) {
         Field::Gateway => f.render_widget(gateway_field(m), area),
         Field::DeployToggle => f.render_widget(checkbox(m, field, "DEPLOY_VIA_SSH", m.state.deploy_enabled), area),
         Field::DeployHost => f.render_widget(sub_field(m, field, "  SSH_HOST         ", &m.state.deploy_host, m.state.deploy_enabled), area),
+        Field::SshKey => f.render_widget(sub_field(m, field, "  SSH_KEY          ", &m.state.deploy_ssh_key, m.state.deploy_enabled), area),
         Field::Transport => f.render_widget(transport_field(m), area),
         Field::RelayHost => f.render_widget(sub_field(m, field, "  RELAY_HOSTPORT   ", &m.state.relay_host, true), area),
         Field::TlsChoice => f.render_widget(tls_field(m), area),
         Field::CertPath => f.render_widget(sub_field(m, field, "  CERT_PEM_PATH    ", &m.state.cert_path, true), area),
         Field::KeyPath => f.render_widget(sub_field(m, field, "  KEY_PEM_PATH     ", &m.state.key_path, true), area),
         Field::Routes => f.render_widget(text_field(m, field, "ROUTES_CIDR       ", &m.state.routes), area),
+        Field::Dns => {
+            // DNS is now a top-level text field. Renders as Option<String>
+            // because the FormState carries it that way (None = empty).
+            let value = m.state.dns.clone().unwrap_or_default();
+            f.render_widget(
+                text_field(m, field, "DNS               ", &value),
+                area,
+            );
+        }
         Field::AdvancedToggle => f.render_widget(checkbox(m, field, "ADVANCED (subnet, namespaces, cross-targets, ...)", m.advanced_expanded), area),
-        Field::Subnet | Field::Clients | Field::ListenPort | Field::Dns
+        Field::Subnet | Field::Clients | Field::ListenPort
         | Field::ServerNs | Field::ClientNs | Field::RelayTarget | Field::ClientTarget => {
             // Look up the (label, default) for this advanced field.
             let (label, default) = ADVANCED_FIELD_META.iter()
@@ -798,6 +1000,106 @@ fn render_field(f: &mut Frame, m: &Model, field: Field, area: Rect) {
         }
     }
     let _ = TlsChoice::SelfSigned; // silence unused-import warning if any
+}
+
+/// Render the gateway-target picker modal over `parent`. Each preset
+/// row shows: `[*]` for the current selection, `[+]`/`[ ]` for
+/// toolchain installed/not. Last row is "Other..." for a custom triple.
+fn render_gateway_modal(f: &mut Frame, m: &Model, parent: Rect) {
+    let other_idx = TARGET_PRESETS.len();
+    let n_rows = TARGET_PRESETS.len() + 1; // + Other...
+    // Sized to fit: ~5 lines chrome + one line per row.
+    let w = parent.width.saturating_sub(8).min(72);
+    let h = (n_rows as u16 + 5).min(parent.height.saturating_sub(4));
+    let area = centered(parent, w, h);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(AMBER_FOCUS))
+        .title(Span::styled(
+            " GATEWAY TARGET ",
+            Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(&block, area);
+    let inner = block.inner(area);
+
+    let mut constraints: Vec<Constraint> =
+        (0..n_rows).map(|_| Constraint::Length(1)).collect();
+    constraints.push(Constraint::Min(1));    // spacer
+    constraints.push(Constraint::Length(1)); // hint
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    let installed = m.installed_targets.as_deref().unwrap_or(&[]);
+    let is_installed = |triple: &str| installed.iter().any(|t| t == triple);
+
+    for (i, (label, triple)) in TARGET_PRESETS.iter().enumerate() {
+        let highlighted = i == m.gateway_modal_idx;
+        let selected = i == m.gateway_idx;
+        let install_marker = if is_installed(triple) { "[+]" } else { "[ ]" };
+        let sel_marker = if selected { "[*]" } else { "   " };
+        let arrow = if highlighted { "▶ " } else { "  " };
+        let line_text = format!(" {arrow}{sel_marker} {install_marker}  {label}  ({triple}) ");
+        let style = if highlighted {
+            Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default().fg(PHOSPHOR_BRIGHT)
+        } else {
+            Style::default().fg(PHOSPHOR_MED)
+        };
+        f.render_widget(Paragraph::new(Line::from(Span::styled(line_text, style))), rows[i]);
+    }
+
+    // "Other..." row — text input when highlighted.
+    let highlighted = m.gateway_modal_idx == other_idx;
+    let selected = m.gateway_idx == other_idx;
+    let sel_marker = if selected { "[*]" } else { "   " };
+    let arrow = if highlighted { "▶ " } else { "  " };
+    let label_style_ = if highlighted {
+        Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default().fg(PHOSPHOR_BRIGHT)
+    } else {
+        Style::default().fg(PHOSPHOR_MED)
+    };
+    let prefix = format!(" {arrow}{sel_marker}      Other...  ");
+    let mut spans = vec![Span::styled(prefix, label_style_)];
+    if highlighted {
+        if m.state.gateway_target.is_empty() {
+            spans.push(Span::styled("▏", cursor_style()));
+            spans.push(Span::styled(
+                "type a custom triple",
+                Style::default().fg(DIM_GRAY),
+            ));
+        } else {
+            spans.push(Span::styled(
+                m.state.gateway_target.clone(),
+                Style::default().fg(PHOSPHOR_BRIGHT).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled("▏", cursor_style()));
+        }
+    } else if !m.state.gateway_target.is_empty()
+        && !TARGET_PRESETS.iter().any(|(_, t)| *t == m.state.gateway_target)
+    {
+        spans.push(Span::styled(
+            m.state.gateway_target.clone(),
+            Style::default().fg(PHOSPHOR_MED),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[other_idx]);
+
+    let hint = "↑/↓ MOVE  ENTER SELECT  ESC CANCEL    [+]=toolchain installed  [*]=current";
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(PHOSPHOR_DIM),
+        ))),
+        rows[rows.len() - 1],
+    );
 }
 
 /// Render the help modal over `parent` — clears a centered area then
@@ -842,6 +1144,7 @@ fn field_help_title(f: Field) -> &'static str {
         Field::Gateway => "GW_TARGET",
         Field::DeployToggle => "DEPLOY_VIA_SSH",
         Field::DeployHost => "SSH_HOST",
+        Field::SshKey => "SSH_KEY",
         Field::Transport => "TRANSPORT",
         Field::RelayHost => "RELAY_HOSTPORT",
         Field::TlsChoice => "TLS",
@@ -864,7 +1167,6 @@ const ADVANCED_FIELD_META: &[(Field, &str, &str)] = &[
     (Field::Subnet,       "  SUBNET              ", "10.0.0.0/24"),
     (Field::Clients,      "  CLIENTS             ", "1"),
     (Field::ListenPort,   "  WG_LISTEN_PORT      ", "51820"),
-    (Field::Dns,          "  DNS_CSV             ", "(empty)"),
     (Field::ServerNs,     "  SRV_NETNS           ", "burrow"),
     (Field::ClientNs,     "  CLIENT_NETNS        ", "burrow"),
     (Field::RelayTarget,  "  RELAY_TARGET        ", "x86_64-unknown-linux-gnu"),
@@ -895,19 +1197,31 @@ fn tls_field(m: &Model) -> Paragraph<'_> {
 
 fn adv_field<'a>(m: &Model, field: Field, label: &'a str, value: Option<&'a str>, default: &'a str) -> Paragraph<'a> {
     let focused = m.focus == field;
-    let (display, style) = match value {
-        Some(v) => (v.to_string(), value_style(focused)),
-        None => (
-            format!("{default}  (default)"),
-            disabled_style(),
-        ),
+    let label_span = Span::styled(label.to_string(), label_style(focused));
+    let cursor_span = if focused {
+        Span::styled("▏", cursor_style())
+    } else {
+        Span::raw("")
     };
-    let cursor = if focused { Span::styled("▏", cursor_style()) } else { Span::raw("") };
-    Paragraph::new(Line::from(vec![
-        Span::styled(label.to_string(), label_style(focused)),
-        Span::styled(display, style),
-        cursor,
-    ]))
+    match value {
+        Some(v) => {
+            // User has an override — render normally with cursor at end.
+            Paragraph::new(Line::from(vec![
+                label_span,
+                Span::styled(v.to_string(), value_style(focused)),
+                cursor_span,
+            ]))
+        }
+        None => {
+            // Default placeholder — cursor anchors before so it reads as
+            // "start typing here" rather than already-entered content.
+            Paragraph::new(Line::from(vec![
+                label_span,
+                cursor_span,
+                Span::styled(format!("{default}  (default)"), disabled_style()),
+            ]))
+        }
+    }
 }
 
 fn text_field<'a>(m: &Model, f: Field, label: &'a str, value: &'a str) -> Paragraph<'a> {

@@ -36,10 +36,15 @@ pub fn local_sudo_script(script: &str) -> Result<()> {
 }
 
 /// Pipe `script` into `ssh <host> sudo bash -s`. Errors include the
-/// host so multi-host runs are debuggable.
-pub fn ssh_sudo_script(host: &str, script: &str) -> Result<()> {
-    let mut child = Command::new("ssh")
-        .args([host, "sudo", "bash", "-s"])
+/// host so multi-host runs are debuggable. `key` is the optional
+/// `-i <key>` path; otherwise ssh's normal resolution applies.
+pub fn ssh_sudo_script(host: &str, key: Option<&str>, script: &str) -> Result<()> {
+    let mut cmd = Command::new("ssh");
+    if let Some(k) = key {
+        cmd.args(["-i", k]);
+    }
+    cmd.args([host, "sudo", "bash", "-s"]);
+    let mut child = cmd
         .stdin(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning `ssh {host} sudo bash -s`"))?;
@@ -56,14 +61,16 @@ pub fn ssh_sudo_script(host: &str, script: &str) -> Result<()> {
     Ok(())
 }
 
-/// Copy `local` to `<host>:<remote>` via scp. The remote path is
-/// passed as one shell-arg to scp, so embed quoting carefully if the
-/// path contains spaces (currently never the case for our use).
-pub fn scp_to(local: &Path, host: &str, remote: &str) -> Result<()> {
+/// Copy `local` to `<host>:<remote>` via scp. `key` is the optional
+/// `-i <key>` path.
+pub fn scp_to(local: &Path, host: &str, key: Option<&str>, remote: &str) -> Result<()> {
     let dest = format!("{host}:{remote}");
-    let status = Command::new("scp")
-        .arg(local)
-        .arg(&dest)
+    let mut cmd = Command::new("scp");
+    if let Some(k) = key {
+        cmd.args(["-i", k]);
+    }
+    cmd.arg(local).arg(&dest);
+    let status = cmd
         .status()
         .with_context(|| format!("spawning scp {} -> {dest}", local.display()))?;
     if !status.success() {
@@ -79,11 +86,14 @@ pub fn scp_to(local: &Path, host: &str, remote: &str) -> Result<()> {
 /// Spawn an interactive ssh — used by `shell` for a remote netns. The
 /// `-t` flag forces TTY allocation so the inner shell behaves
 /// interactively. Inherits the user's terminal directly.
-pub fn ssh_interactive(host: &str, remote_cmd: &str) -> Result<()> {
-    let status = Command::new("ssh")
-        .arg("-t")
-        .arg(host)
-        .arg(remote_cmd)
+pub fn ssh_interactive(host: &str, key: Option<&str>, remote_cmd: &str) -> Result<()> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-t");
+    if let Some(k) = key {
+        cmd.args(["-i", k]);
+    }
+    cmd.arg(host).arg(remote_cmd);
+    let status = cmd
         .status()
         .with_context(|| format!("spawning interactive `ssh -t {host}`"))?;
     if !status.success() {

@@ -160,8 +160,17 @@ pub struct DeployServer {
     /// Anything ssh accepts: an SSH-config alias, `user@host`, or a
     /// bare hostname/IP. Auth resolves through the usual
     /// agent / `~/.ssh/config` / default-key path; if you need
-    /// something custom, set it in `~/.ssh/config`.
+    /// something custom, set it in `~/.ssh/config` or use
+    /// `ssh_key` below.
     pub host: String,
+    /// Optional path to an SSH private key (`ssh -i <path>`).
+    /// Most setups don't need this — the user's agent /
+    /// `~/.ssh/config` / default key already work. Password
+    /// authentication is not supported (the relay-start step pipes
+    /// a script over stdin, which collides with sshd's TTY-based
+    /// password prompt); use a key file or ssh-agent.
+    #[serde(default)]
+    pub ssh_key: Option<String>,
     /// netns name on the remote. Default `burrow`.
     #[serde(default = "default_namespace")]
     pub namespace: String,
