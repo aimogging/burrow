@@ -22,8 +22,8 @@ routes = ["192.168.1.0/24"]
 mode = "wss"
 relay_host = "vpn.example.com:443"
 
-[build]
-gateway = "x86_64-pc-windows-msvc"
+[build.gateway]
+target = "x86_64-pc-windows-msvc"
 "#;
 
 #[test]
@@ -81,8 +81,8 @@ fn gen_for_udp_spec_skips_relay_bundle() {
         endpoint = "vpn.example.com:51820"
         [transport]
         mode = "udp"
-        [build]
-        gateway = "x86_64-unknown-linux-gnu"
+        [build.gateway]
+        target = "x86_64-unknown-linux-gnu"
         "#,
     )
     .unwrap();

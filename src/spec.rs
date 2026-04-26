@@ -81,26 +81,39 @@ pub enum TransportMode {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct BuildSection {
-    /// Target triple for the burrow gateway binary. Required — the
+    /// Build settings for the burrow gateway binary. Required — the
     /// gateway runs on whatever your private-network host is, which
     /// may not match the orchestration host's OS.
-    pub gateway: String,
-    /// Target triple for `burrow-relay`. Defaults to 64-bit Linux
+    pub gateway: BinaryBuild,
+    /// Build settings for `burrow-relay`. Defaults to 64-bit Linux
     /// because the relay sits next to kernel WG on the WG server box,
     /// which is essentially always Linux.
-    #[serde(default = "default_linux")]
-    pub relay: String,
-    /// Target triple for `burrow-client`. Same Linux default for the
+    #[serde(default = "default_linux_build")]
+    pub relay: BinaryBuild,
+    /// Build settings for `burrow-client`. Same Linux default for the
     /// same reason — the operator-side CLI runs on the dev box, which
     /// is typically Linux/macOS, but this is overridable.
-    #[serde(default = "default_linux")]
-    pub client: String,
+    #[serde(default = "default_linux_build")]
+    pub client: BinaryBuild,
+}
+
+/// Per-binary build knobs. Just `target` for now; nested as a table
+/// so we can add `features`, `profile`, `cargo` (e.g. swap to `cross`),
+/// etc., later without reshuffling the spec format.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct BinaryBuild {
+    /// Standard rustc target triple (e.g. `x86_64-pc-windows-msvc`,
+    /// `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`).
+    pub target: String,
 }
 
 fn default_subnet() -> String { "10.0.0.0/24".into() }
 fn default_clients() -> u16 { 1 }
 fn default_listen_port() -> u16 { 51820 }
-fn default_linux() -> String { "x86_64-unknown-linux-gnu".into() }
+fn default_linux_build() -> BinaryBuild {
+    BinaryBuild { target: "x86_64-unknown-linux-gnu".into() }
+}
 
 impl Spec {
     /// Parse a spec TOML file.
@@ -147,8 +160,14 @@ impl Spec {
             }
         }
 
-        if self.build.gateway.trim().is_empty() {
-            bail!("[build] gateway target triple is required");
+        if self.build.gateway.target.trim().is_empty() {
+            bail!("[build.gateway] target triple is required");
+        }
+        if self.build.relay.target.trim().is_empty() {
+            bail!("[build.relay] target triple must not be empty");
+        }
+        if self.build.client.target.trim().is_empty() {
+            bail!("[build.client] target triple must not be empty");
         }
         Ok(())
     }
@@ -250,8 +269,8 @@ mod tests {
             mode = "wss"
             relay_host = "vpn.example.com:443"
 
-            [build]
-            gateway = "x86_64-pc-windows-msvc"
+            [build.gateway]
+            target = "x86_64-pc-windows-msvc"
             "#,
         );
         let spec = Spec::parse(&p).unwrap();
@@ -261,9 +280,9 @@ mod tests {
         assert_eq!(spec.wg.listen_port, 51820);
         assert_eq!(spec.transport.mode, TransportMode::Wss);
         assert_eq!(spec.transport.relay_host.as_deref(), Some("vpn.example.com:443"));
-        assert_eq!(spec.build.gateway, "x86_64-pc-windows-msvc");
-        assert_eq!(spec.build.relay, "x86_64-unknown-linux-gnu");
-        assert_eq!(spec.build.client, "x86_64-unknown-linux-gnu");
+        assert_eq!(spec.build.gateway.target, "x86_64-pc-windows-msvc");
+        assert_eq!(spec.build.relay.target, "x86_64-unknown-linux-gnu");
+        assert_eq!(spec.build.client.target, "x86_64-unknown-linux-gnu");
     }
 
     #[test]
@@ -278,8 +297,8 @@ mod tests {
             [transport]
             mode = "udp"
 
-            [build]
-            gateway = "x86_64-unknown-linux-gnu"
+            [build.gateway]
+            target = "x86_64-unknown-linux-gnu"
             "#,
         );
         let spec = Spec::parse(&p).unwrap();
@@ -297,8 +316,8 @@ mod tests {
             endpoint = "vpn.example.com:51820"
             [transport]
             mode = "wss"
-            [build]
-            gateway = "x86_64-pc-windows-msvc"
+            [build.gateway]
+            target = "x86_64-pc-windows-msvc"
             "#,
         );
         let err = Spec::parse(&p).unwrap_err();
@@ -317,8 +336,8 @@ mod tests {
             [transport]
             mode = "udp"
             relay_host = "x:443"
-            [build]
-            gateway = "x86_64-unknown-linux-gnu"
+            [build.gateway]
+            target = "x86_64-unknown-linux-gnu"
             "#,
         );
         let err = Spec::parse(&p).unwrap_err();
@@ -336,8 +355,8 @@ mod tests {
             endpoint = ""
             [transport]
             mode = "udp"
-            [build]
-            gateway = "x86_64-unknown-linux-gnu"
+            [build.gateway]
+            target = "x86_64-unknown-linux-gnu"
             "#,
         );
         let err = Spec::parse(&p).unwrap_err();
@@ -355,8 +374,8 @@ mod tests {
             endpoint = "vpn.example.com"
             [transport]
             mode = "udp"
-            [build]
-            gateway = "x86_64-unknown-linux-gnu"
+            [build.gateway]
+            target = "x86_64-unknown-linux-gnu"
             "#,
         );
         let err = Spec::parse(&p).unwrap_err();
@@ -375,8 +394,8 @@ mod tests {
             routes = ["not-a-cidr"]
             [transport]
             mode = "udp"
-            [build]
-            gateway = "x86_64-unknown-linux-gnu"
+            [build.gateway]
+            target = "x86_64-unknown-linux-gnu"
             "#,
         );
         let err = Spec::parse(&p).unwrap_err();
@@ -394,8 +413,8 @@ mod tests {
             endpoint = "vpn.example.com:51820"
             [transport]
             mode = "h2"
-            [build]
-            gateway = "x86_64-unknown-linux-gnu"
+            [build.gateway]
+            target = "x86_64-unknown-linux-gnu"
             "#,
         );
         assert!(Spec::parse(&p).is_err());
@@ -411,8 +430,8 @@ mod tests {
             endpoint = "vpn.example.com:51820"
             [transport]
             mode = "udp"
-            [build]
-            gateway = ""
+            [build.gateway]
+            target = ""
             "#,
         );
         let err = Spec::parse(&p).unwrap_err();
@@ -431,8 +450,8 @@ mod tests {
             mystery = true
             [transport]
             mode = "udp"
-            [build]
-            gateway = "x86_64-unknown-linux-gnu"
+            [build.gateway]
+            target = "x86_64-unknown-linux-gnu"
             "#,
         );
         // serde's deny_unknown_fields catches this — guards against

@@ -45,11 +45,11 @@ pub fn run(name: &str) -> Result<()> {
         layout.ensure_dirs(true)?;
     }
 
-    build_gateway(&layout, &spec.build.gateway)?;
+    build_gateway(&layout, &spec.build.gateway.target)?;
     if spec.transport.mode == TransportMode::Wss {
-        build_relay(&layout, &spec.build.relay)?;
+        build_relay(&layout, &spec.build.relay.target)?;
     }
-    build_client(&spec.build.client)?;
+    build_client(&spec.build.client.target)?;
 
     collect_artifacts(&layout, &spec)?;
 
@@ -127,12 +127,12 @@ fn build_client(target: &str) -> Result<()> {
 fn collect_artifacts(layout: &Layout, spec: &Spec) -> Result<()> {
     let bundle = layout.bundle_dir();
     let triples = [
-        ("burrow", spec.build.gateway.as_str()),
-        ("burrow-client", spec.build.client.as_str()),
+        ("burrow", spec.build.gateway.target.as_str()),
+        ("burrow-client", spec.build.client.target.as_str()),
     ];
     let mut all: Vec<(&str, &str)> = triples.to_vec();
     if spec.transport.mode == TransportMode::Wss {
-        all.push(("burrow-relay", spec.build.relay.as_str()));
+        all.push(("burrow-relay", spec.build.relay.target.as_str()));
     }
     for (bin, triple) in all {
         let mut copied = false;

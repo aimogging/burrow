@@ -78,10 +78,10 @@ routes   = ["192.168.1.0/24"]          # CIDRs the gateway exposes
 mode       = "wss"                     # or "udp"
 relay_host = "vpn.example.com:443"     # required when mode = "wss"
 
-[build]
-gateway = "x86_64-pc-windows-msvc"     # required — pick the gateway host's OS
-# relay  defaults to x86_64-unknown-linux-gnu
-# client defaults to x86_64-unknown-linux-gnu
+[build.gateway]
+target = "x86_64-pc-windows-msvc"      # required — pick the gateway host's OS
+# [build.relay]   target defaults to "x86_64-unknown-linux-gnu"
+# [build.client]  target defaults to "x86_64-unknown-linux-gnu"
 ```
 
 `burrowctl validate dev` parses + sanity-checks it.

@@ -85,9 +85,9 @@ fn real_main() -> Result<()> {
                     .as_deref()
                     .map(|h| format!(" ({h})"))
                     .unwrap_or_default(),
-                spec.build.gateway,
-                spec.build.relay,
-                spec.build.client,
+                spec.build.gateway.target,
+                spec.build.relay.target,
+                spec.build.client.target,
             );
         }
         Cmd::Gen { name } => gen::run(&name)?,
