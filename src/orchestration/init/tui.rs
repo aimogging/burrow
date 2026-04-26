@@ -103,6 +103,15 @@ enum Field {
     WssToggle,
     RelayHost,
     Routes,
+    AdvancedToggle,
+    Subnet,
+    Clients,
+    ListenPort,
+    Dns,
+    ServerNs,
+    ClientNs,
+    RelayTarget,
+    ClientTarget,
 }
 
 const ALL_FIELDS: &[Field] = &[
@@ -113,6 +122,26 @@ const ALL_FIELDS: &[Field] = &[
     Field::WssToggle,
     Field::RelayHost,
     Field::Routes,
+    Field::AdvancedToggle,
+    Field::Subnet,
+    Field::Clients,
+    Field::ListenPort,
+    Field::Dns,
+    Field::ServerNs,
+    Field::ClientNs,
+    Field::RelayTarget,
+    Field::ClientTarget,
+];
+
+const ADVANCED_FIELDS: &[Field] = &[
+    Field::Subnet,
+    Field::Clients,
+    Field::ListenPort,
+    Field::Dns,
+    Field::ServerNs,
+    Field::ClientNs,
+    Field::RelayTarget,
+    Field::ClientTarget,
 ];
 
 struct Model {
@@ -125,6 +154,9 @@ struct Model {
     /// `None` in normal form mode. Mutually exclusive with the
     /// per-field key handling.
     cmd_buffer: Option<String>,
+    /// Whether the Advanced section is expanded. Auto-expands when
+    /// the seeded FormState already has any advanced field set.
+    advanced_expanded: bool,
 }
 
 impl Model {
@@ -133,12 +165,21 @@ impl Model {
             .iter()
             .position(|(_, t)| *t == state.gateway_target)
             .unwrap_or(TARGET_PRESETS.len());
+        let advanced_expanded = state.subnet.is_some()
+            || state.clients.is_some()
+            || state.listen_port.is_some()
+            || state.dns.is_some()
+            || state.server_namespace.is_some()
+            || state.client_namespace.is_some()
+            || state.relay_target.is_some()
+            || state.client_target.is_some();
         Self {
             state,
             focus: Field::Endpoint,
             gateway_idx,
             error: None,
             cmd_buffer: None,
+            advanced_expanded,
         }
     }
 
@@ -148,7 +189,18 @@ impl Model {
     fn focus_is_text(&self) -> bool {
         matches!(
             self.focus,
-            Field::Endpoint | Field::DeployHost | Field::RelayHost | Field::Routes
+            Field::Endpoint
+                | Field::DeployHost
+                | Field::RelayHost
+                | Field::Routes
+                | Field::Subnet
+                | Field::Clients
+                | Field::ListenPort
+                | Field::Dns
+                | Field::ServerNs
+                | Field::ClientNs
+                | Field::RelayTarget
+                | Field::ClientTarget
         ) || (self.focus == Field::Gateway && self.gateway_idx >= TARGET_PRESETS.len())
     }
 
@@ -157,6 +209,14 @@ impl Model {
         match f {
             Field::DeployHost => self.state.deploy_enabled,
             Field::RelayHost => self.state.wss_enabled,
+            Field::Subnet
+            | Field::Clients
+            | Field::ListenPort
+            | Field::Dns
+            | Field::ServerNs
+            | Field::ClientNs
+            | Field::RelayTarget
+            | Field::ClientTarget => self.advanced_expanded,
             _ => true,
         }
     }
@@ -276,6 +336,19 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
                 }
             }
         }
+        Field::AdvancedToggle => {
+            if matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter) {
+                m.advanced_expanded = !m.advanced_expanded;
+            }
+        }
+        Field::Subnet => edit_optional(&mut m.state.subnet, k.code),
+        Field::Clients => edit_optional(&mut m.state.clients, k.code),
+        Field::ListenPort => edit_optional(&mut m.state.listen_port, k.code),
+        Field::Dns => edit_optional(&mut m.state.dns, k.code),
+        Field::ServerNs => edit_optional(&mut m.state.server_namespace, k.code),
+        Field::ClientNs => edit_optional(&mut m.state.client_namespace, k.code),
+        Field::RelayTarget => edit_optional(&mut m.state.relay_target, k.code),
+        Field::ClientTarget => edit_optional(&mut m.state.client_target, k.code),
         Field::Gateway => match k.code {
             KeyCode::Up => {
                 if m.gateway_idx > 0 {
@@ -297,6 +370,26 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
         },
     }
     Outcome::Continue
+}
+
+/// `Option<String>` text edit — typing creates the Some, fully
+/// backspacing it goes back to None (so emit treats it as "use
+/// default" again).
+fn edit_optional(buf: &mut Option<String>, code: KeyCode) {
+    match code {
+        KeyCode::Char(c) => {
+            buf.get_or_insert_with(String::new).push(c);
+        }
+        KeyCode::Backspace => {
+            if let Some(s) = buf.as_mut() {
+                s.pop();
+                if s.is_empty() {
+                    *buf = None;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn edit_text(buf: &mut String, code: KeyCode) {
@@ -361,58 +454,73 @@ fn on_save(m: &mut Model) -> Outcome {
 // ----------------------------------------------------------------------------
 
 fn render(f: &mut Frame, m: &Model) {
-    let area = centered(f.area(), 78, 22);
+    let height = if m.advanced_expanded { 32 } else { 22 };
+    let area = centered(f.area(), 80, height);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" burrowctl init ");
     f.render_widget(&block, area);
     let inner = block.inner(area);
 
+    let mut constraints = vec![
+        Constraint::Length(1), // endpoint
+        Constraint::Length(1), // gateway
+        Constraint::Length(1), // deploy toggle
+        Constraint::Length(1), // deploy host
+        Constraint::Length(1), // wss toggle
+        Constraint::Length(1), // relay host
+        Constraint::Length(1), // routes
+        Constraint::Length(1), // advanced toggle
+    ];
+    if m.advanced_expanded {
+        for _ in 0..ADVANCED_FIELDS.len() {
+            constraints.push(Constraint::Length(1));
+        }
+    }
+    constraints.push(Constraint::Min(1)); // spacer
+    constraints.push(Constraint::Length(1)); // error
+    constraints.push(Constraint::Length(1)); // help / cmd bar
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // endpoint
-            Constraint::Length(2), // gateway
-            Constraint::Length(1), // deploy toggle
-            Constraint::Length(2), // deploy host
-            Constraint::Length(1), // wss toggle
-            Constraint::Length(2), // relay host
-            Constraint::Length(2), // routes
-            Constraint::Min(1),    // spacer
-            Constraint::Length(1), // error line
-            Constraint::Length(1), // help line
-        ])
+        .constraints(constraints)
         .split(inner);
 
-    f.render_widget(text_field(m, Field::Endpoint, "WireGuard endpoint", &m.state.endpoint), rows[0]);
-    f.render_widget(gateway_field(m), rows[1]);
-    f.render_widget(checkbox(m, Field::DeployToggle, "Deploy via SSH", m.state.deploy_enabled), rows[2]);
-    f.render_widget(
-        sub_field(m, Field::DeployHost, "  SSH host         ", &m.state.deploy_host, m.state.deploy_enabled),
-        rows[3],
-    );
-    f.render_widget(
-        checkbox(m, Field::WssToggle, "WSS transport (only if egress UDP is blocked)", m.state.wss_enabled),
-        rows[4],
-    );
-    f.render_widget(
-        sub_field(m, Field::RelayHost, "  Relay host:port  ", &m.state.relay_host, m.state.wss_enabled),
-        rows[5],
-    );
-    f.render_widget(
-        text_field(m, Field::Routes, "Routes (comma-separated CIDRs, optional)", &m.state.routes),
-        rows[6],
-    );
+    let mut i = 0;
+    f.render_widget(text_field(m, Field::Endpoint, "WireGuard endpoint", &m.state.endpoint), rows[i]); i += 1;
+    f.render_widget(gateway_field(m), rows[i]); i += 1;
+    f.render_widget(checkbox(m, Field::DeployToggle, "Deploy via SSH", m.state.deploy_enabled), rows[i]); i += 1;
+    f.render_widget(sub_field(m, Field::DeployHost, "  SSH host         ", &m.state.deploy_host, m.state.deploy_enabled), rows[i]); i += 1;
+    f.render_widget(checkbox(m, Field::WssToggle, "WSS transport (only if egress UDP is blocked)", m.state.wss_enabled), rows[i]); i += 1;
+    f.render_widget(sub_field(m, Field::RelayHost, "  Relay host:port  ", &m.state.relay_host, m.state.wss_enabled), rows[i]); i += 1;
+    f.render_widget(text_field(m, Field::Routes, "Routes (comma-separated CIDRs, optional)", &m.state.routes), rows[i]); i += 1;
+    f.render_widget(checkbox(m, Field::AdvancedToggle, "Advanced (subnet, namespaces, cross-targets, ...)", m.advanced_expanded), rows[i]); i += 1;
+
+    if m.advanced_expanded {
+        for &(field, label, default) in ADVANCED_FIELD_META {
+            let val = match field {
+                Field::Subnet => &m.state.subnet,
+                Field::Clients => &m.state.clients,
+                Field::ListenPort => &m.state.listen_port,
+                Field::Dns => &m.state.dns,
+                Field::ServerNs => &m.state.server_namespace,
+                Field::ClientNs => &m.state.client_namespace,
+                Field::RelayTarget => &m.state.relay_target,
+                Field::ClientTarget => &m.state.client_target,
+                _ => unreachable!(),
+            };
+            f.render_widget(adv_field(m, field, label, val.as_deref(), default), rows[i]);
+            i += 1;
+        }
+    }
 
     let err_line = m
         .error
         .as_deref()
         .map(|e| Line::from(Span::styled(format!("error: {e}"), Style::default().fg(Color::Red))))
         .unwrap_or_else(|| Line::from(""));
-    f.render_widget(Paragraph::new(err_line), rows[8]);
+    f.render_widget(Paragraph::new(err_line), rows[constraints_len(m) - 2]);
 
-    // The bottom line doubles as the help bar OR the active command
-    // buffer when the user has hit `:`.
     let bottom = if let Some(buf) = &m.cmd_buffer {
         Line::from(Span::styled(
             format!(":{buf}_"),
@@ -424,7 +532,39 @@ fn render(f: &mut Frame, m: &Model) {
             Style::default().fg(Color::DarkGray),
         ))
     };
-    f.render_widget(Paragraph::new(bottom), rows[9]);
+    f.render_widget(Paragraph::new(bottom), rows[constraints_len(m) - 1]);
+}
+
+const ADVANCED_FIELD_META: &[(Field, &str, &str)] = &[
+    (Field::Subnet,       "  Subnet              ", "10.0.0.0/24"),
+    (Field::Clients,      "  Clients             ", "1"),
+    (Field::ListenPort,   "  WG listen port      ", "51820"),
+    (Field::Dns,          "  DNS (csv)           ", "(empty)"),
+    (Field::ServerNs,     "  Server netns name   ", "burrow"),
+    (Field::ClientNs,     "  Client netns name   ", "burrow"),
+    (Field::RelayTarget,  "  Relay target triple ", "x86_64-unknown-linux-gnu"),
+    (Field::ClientTarget, "  Client target triple", "x86_64-unknown-linux-gnu"),
+];
+
+fn constraints_len(m: &Model) -> usize {
+    8 + (if m.advanced_expanded { ADVANCED_FIELDS.len() } else { 0 }) + 3
+}
+
+fn adv_field<'a>(m: &Model, field: Field, label: &'a str, value: Option<&'a str>, default: &'a str) -> Paragraph<'a> {
+    let focused = m.focus == field;
+    let (display, style) = match value {
+        Some(v) => (v.to_string(), value_style(focused)),
+        None => (
+            format!("{default}  (default)"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+    let cursor = if focused { Span::styled("▏", cursor_style()) } else { Span::raw("") };
+    Paragraph::new(Line::from(vec![
+        Span::styled(label.to_string(), label_style(focused)),
+        Span::styled(display, style),
+        cursor,
+    ]))
 }
 
 fn text_field<'a>(m: &Model, f: Field, label: &'a str, value: &'a str) -> Paragraph<'a> {

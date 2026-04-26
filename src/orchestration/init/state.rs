@@ -12,8 +12,12 @@
 
 use anyhow::{bail, Result};
 
-/// Wizard fields surfaced in Phase 1. Order roughly matches the TUI
-/// layout. Phase 3 grows this with the advanced fields.
+/// Wizard fields. The Phase 3 advanced fields are stored as
+/// optional strings: `None` means "leave at the spec default";
+/// `Some` means "user/CLI overrode it" and gets emitted explicitly.
+/// The TUI's "Advanced" toggle reveals them; collapsing the section
+/// without changes keeps them `None` so the emitted spec stays
+/// minimal.
 #[derive(Debug, Clone)]
 pub struct FormState {
     pub endpoint: String,
@@ -23,6 +27,18 @@ pub struct FormState {
     pub wss_enabled: bool,
     pub relay_host: String,
     pub routes: String,
+
+    // Advanced — None means "use spec default", Some means override.
+    // Stored as strings so the TUI's text-input path is uniform; the
+    // post-emit `Spec::parse_str` gate catches non-numeric content.
+    pub subnet: Option<String>,
+    pub clients: Option<String>,
+    pub listen_port: Option<String>,
+    pub dns: Option<String>,
+    pub server_namespace: Option<String>,
+    pub client_namespace: Option<String>,
+    pub relay_target: Option<String>,
+    pub client_target: Option<String>,
 }
 
 impl FormState {
@@ -38,13 +54,25 @@ impl FormState {
             wss_enabled: false,
             relay_host: String::new(),
             routes: String::new(),
+            subnet: None,
+            clients: None,
+            listen_port: None,
+            dns: None,
+            server_namespace: None,
+            client_namespace: None,
+            relay_target: None,
+            client_target: None,
         }
     }
 
     /// Populate from a parsed `Spec` — used by `burrowctl edit` so the
-    /// TUI starts on the existing values.
+    /// TUI starts on the existing values. Advanced fields are surfaced
+    /// only when they differ from the spec-side defaults so the user
+    /// doesn't see Some everywhere.
     pub fn from_spec(spec: &crate::spec::Spec) -> Self {
         let wss = spec.transport.mode == crate::spec::TransportMode::Wss;
+        let some_if = |v: String, default: &str| if v == default { None } else { Some(v) };
+        let some_u16 = |v: u16, default: u16| if v == default { None } else { Some(v.to_string()) };
         Self {
             endpoint: spec.wg.endpoint.clone(),
             gateway_target: spec.build.gateway.target.clone(),
@@ -57,6 +85,24 @@ impl FormState {
             wss_enabled: wss,
             relay_host: spec.transport.relay_host.clone().unwrap_or_default(),
             routes: spec.wg.routes.join(", "),
+            subnet: some_if(spec.wg.subnet.clone(), "10.0.0.0/24"),
+            clients: some_u16(spec.wg.clients, 1),
+            listen_port: some_u16(spec.wg.listen_port, 51820),
+            dns: if spec.wg.dns.is_empty() {
+                None
+            } else {
+                Some(spec.wg.dns.join(", "))
+            },
+            server_namespace: spec
+                .deploy
+                .as_ref()
+                .and_then(|d| some_if(d.server.namespace.clone(), "burrow")),
+            client_namespace: spec
+                .deploy
+                .as_ref()
+                .and_then(|d| some_if(d.client.namespace.clone(), "burrow")),
+            relay_target: some_if(spec.build.relay.target.clone(), "x86_64-unknown-linux-gnu"),
+            client_target: some_if(spec.build.client.target.clone(), "x86_64-unknown-linux-gnu"),
         }
     }
 
@@ -113,6 +159,14 @@ impl FormState {
             wss_enabled,
             relay_host,
             routes,
+            subnet: args.subnet.clone(),
+            clients: args.clients.map(|n| n.to_string()),
+            listen_port: args.listen_port.map(|n| n.to_string()),
+            dns: args.dns.clone(),
+            server_namespace: args.server_namespace.clone(),
+            client_namespace: args.client_namespace.clone(),
+            relay_target: args.relay_target.clone(),
+            client_target: args.client_target.clone(),
         })
     }
 
@@ -159,6 +213,16 @@ pub struct InitArgs {
     pub force: bool,
     pub prefill: bool,
     pub editor: bool,
+
+    // Phase 3 advanced fields.
+    pub subnet: Option<String>,
+    pub clients: Option<u16>,
+    pub listen_port: Option<u16>,
+    pub dns: Option<String>,
+    pub server_namespace: Option<String>,
+    pub client_namespace: Option<String>,
+    pub relay_target: Option<String>,
+    pub client_target: Option<String>,
 }
 
 impl InitArgs {
@@ -172,6 +236,14 @@ impl InitArgs {
             || self.transport.is_some()
             || self.relay_host.is_some()
             || self.routes.is_some()
+            || self.subnet.is_some()
+            || self.clients.is_some()
+            || self.listen_port.is_some()
+            || self.dns.is_some()
+            || self.server_namespace.is_some()
+            || self.client_namespace.is_some()
+            || self.relay_target.is_some()
+            || self.client_target.is_some()
     }
 
     /// Sanity-check flag values that aren't tied to required-field

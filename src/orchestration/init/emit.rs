@@ -31,14 +31,37 @@ pub fn format_spec(state: &FormState) -> String {
         let formatted: Vec<String> = routes.iter().map(|r| quote(r)).collect();
         let _ = writeln!(out, "routes   = [{}]", formatted.join(", "));
     }
-    let _ = writeln!(
-        out,
-        "# Hidden defaults — uncomment + set to override:\n\
-         # subnet      = \"10.0.0.0/24\"\n\
-         # clients     = 1\n\
-         # dns         = []\n\
-         # listen_port = 51820"
-    );
+    if let Some(s) = &state.subnet {
+        let _ = writeln!(out, "subnet   = {}", quote(s));
+    }
+    if let Some(n) = &state.clients {
+        let _ = writeln!(out, "clients  = {n}");
+    }
+    if let Some(d) = &state.dns {
+        let dns_list: Vec<String> = d
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(quote)
+            .collect();
+        let _ = writeln!(out, "dns      = [{}]", dns_list.join(", "));
+    }
+    if let Some(p) = &state.listen_port {
+        let _ = writeln!(out, "listen_port = {p}");
+    }
+    // Show the hidden-defaults hint only for the fields we didn't
+    // already emit above.
+    let mut hidden = Vec::new();
+    if state.subnet.is_none() { hidden.push("# subnet      = \"10.0.0.0/24\""); }
+    if state.clients.is_none() { hidden.push("# clients     = 1"); }
+    if state.dns.is_none() { hidden.push("# dns         = []"); }
+    if state.listen_port.is_none() { hidden.push("# listen_port = 51820"); }
+    if !hidden.is_empty() {
+        let _ = writeln!(out, "# Hidden defaults — uncomment + set to override:");
+        for line in hidden {
+            let _ = writeln!(out, "{line}");
+        }
+    }
 
     // [transport]
     let _ = writeln!(out);
@@ -54,24 +77,41 @@ pub fn format_spec(state: &FormState) -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "[build.gateway]");
     let _ = writeln!(out, "target = {}", quote(&state.gateway_target));
-    let _ = writeln!(
-        out,
-        "# Hidden defaults: [build.relay].target and [build.client].target\n\
-         # both default to \"x86_64-unknown-linux-gnu\". Override per-binary."
-    );
+    if let Some(t) = &state.relay_target {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "[build.relay]");
+        let _ = writeln!(out, "target = {}", quote(t));
+    }
+    if let Some(t) = &state.client_target {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "[build.client]");
+        let _ = writeln!(out, "target = {}", quote(t));
+    }
+    if state.relay_target.is_none() && state.client_target.is_none() {
+        let _ = writeln!(
+            out,
+            "# Hidden defaults: [build.relay].target and [build.client].target\n\
+             # both default to \"x86_64-unknown-linux-gnu\". Override per-binary."
+        );
+    }
 
     // [deploy]
     if state.deploy_enabled {
         let _ = writeln!(out);
         let _ = writeln!(out, "[deploy.server]");
         let _ = writeln!(out, "host = {}", quote(&state.deploy_host));
-        let _ = writeln!(
-            out,
-            "# Hidden default: namespace = \"burrow\"\n\
-             \n\
-             [deploy.client]\n\
-             # Hidden default: namespace = \"burrow\""
-        );
+        if let Some(ns) = &state.server_namespace {
+            let _ = writeln!(out, "namespace = {}", quote(ns));
+        } else {
+            let _ = writeln!(out, "# Hidden default: namespace = \"burrow\"");
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(out, "[deploy.client]");
+        if let Some(ns) = &state.client_namespace {
+            let _ = writeln!(out, "namespace = {}", quote(ns));
+        } else {
+            let _ = writeln!(out, "# Hidden default: namespace = \"burrow\"");
+        }
     } else {
         let _ = writeln!(out);
         let _ = writeln!(
@@ -108,6 +148,14 @@ mod tests {
             wss_enabled: false,
             relay_host: String::new(),
             routes: String::new(),
+            subnet: None,
+            clients: None,
+            listen_port: None,
+            dns: None,
+            server_namespace: None,
+            client_namespace: None,
+            relay_target: None,
+            client_target: None,
         }
     }
 
@@ -164,6 +212,32 @@ mod tests {
         let s = base();
         let body = format_spec(&s);
         assert!(body.contains("routes   = []"));
+    }
+
+    #[test]
+    fn advanced_overrides_emit_explicitly_and_round_trip() {
+        let mut s = base();
+        s.subnet = Some("10.50.0.0/24".into());
+        s.clients = Some("3".into());
+        s.listen_port = Some("51900".into());
+        s.dns = Some("1.1.1.1, 9.9.9.9".into());
+        s.relay_target = Some("x86_64-unknown-linux-musl".into());
+        s.client_target = Some("aarch64-unknown-linux-gnu".into());
+        s.deploy_enabled = true;
+        s.deploy_host = "vpn.example.com".into();
+        s.server_namespace = Some("burrow-prod".into());
+        s.client_namespace = Some("burrow-test".into());
+        let body = format_spec(&s);
+        let parsed = Spec::parse_str(&body).unwrap();
+        assert_eq!(parsed.wg.subnet, "10.50.0.0/24");
+        assert_eq!(parsed.wg.clients, 3);
+        assert_eq!(parsed.wg.listen_port, 51900);
+        assert_eq!(parsed.wg.dns, vec!["1.1.1.1", "9.9.9.9"]);
+        assert_eq!(parsed.build.relay.target, "x86_64-unknown-linux-musl");
+        assert_eq!(parsed.build.client.target, "aarch64-unknown-linux-gnu");
+        let d = parsed.deploy.unwrap();
+        assert_eq!(d.server.namespace, "burrow-prod");
+        assert_eq!(d.client.namespace, "burrow-test");
     }
 
     #[test]

@@ -79,6 +79,27 @@ enum Cmd {
         /// re-opened with the error annotated at the top.
         #[arg(long)]
         editor: bool,
+
+        // -------------------------------------------------------------
+        // Advanced fields — most users never need these. Defaults
+        // documented in the TUI's Hidden defaults comment.
+        // -------------------------------------------------------------
+        #[arg(long, value_name = "CIDR", help_heading = "Advanced")]
+        subnet: Option<String>,
+        #[arg(long, value_name = "N", help_heading = "Advanced")]
+        clients: Option<u16>,
+        #[arg(long, value_name = "PORT", help_heading = "Advanced")]
+        listen_port: Option<u16>,
+        #[arg(long, value_name = "IP[,IP...]", help_heading = "Advanced")]
+        dns: Option<String>,
+        #[arg(long, value_name = "NAME", help_heading = "Advanced")]
+        server_namespace: Option<String>,
+        #[arg(long, value_name = "NAME", help_heading = "Advanced")]
+        client_namespace: Option<String>,
+        #[arg(long, value_name = "TRIPLE", help_heading = "Advanced")]
+        relay_target: Option<String>,
+        #[arg(long, value_name = "TRIPLE", help_heading = "Advanced")]
+        client_target: Option<String>,
     },
     /// Open the TUI populated from an existing
     /// `deployments/<name>/spec.toml`. Save (Ctrl-S / `:w`) writes
@@ -159,6 +180,14 @@ fn real_main() -> Result<()> {
             force,
             prefill,
             editor,
+            subnet,
+            clients,
+            listen_port,
+            dns,
+            server_namespace,
+            client_namespace,
+            relay_target,
+            client_target,
         } => {
             let args = InitArgs {
                 endpoint,
@@ -170,6 +199,14 @@ fn real_main() -> Result<()> {
                 force,
                 prefill,
                 editor,
+                subnet,
+                clients,
+                listen_port,
+                dns,
+                server_namespace,
+                client_namespace,
+                relay_target,
+                client_target,
             };
             args.validate_shape()?;
             init::run(&name, args)?;
