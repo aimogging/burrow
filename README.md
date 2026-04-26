@@ -64,10 +64,9 @@ flowchart LR
 Three boxes — a public WG server, the burrow gateway behind NAT, and
 one or more clients. Decisions live in **one TOML file per
 deployment**, under `deployments/<name>/spec.toml`. `burrowctl`
-generates the kernel-WG configs + cert + token, then cross-builds
-each binary for whatever OS it lives on.
+takes the deployment from there to running tunnel in one command.
 
-**1. Write a spec.** `deployments/dev/spec.toml`:
+Write `deployments/dev/spec.toml`:
 
 ```toml
 [wg]
@@ -82,114 +81,76 @@ relay_host = "vpn.example.com:443"     # required when mode = "wss"
 target = "x86_64-pc-windows-msvc"      # required — pick the gateway host's OS
 # [build.relay]   target defaults to "x86_64-unknown-linux-gnu"
 # [build.client]  target defaults to "x86_64-unknown-linux-gnu"
+
+[deploy.server]
+host = "vpn.example.com"               # ssh-resolvable (alias, user@host, or IP)
+# namespace = "burrow"                 # default
+
+[deploy.client]
+# namespace = "burrow"                 # default; client always runs locally
 ```
 
-`burrowctl validate dev` parses + sanity-checks it.
-
-**2. Generate configs and bundle materials:**
+Then everything is one command:
 
 ```sh
-cargo run --bin burrowctl -- gen dev
-# produces deployments/dev/{server.conf, burrow.conf, client1.conf,
-# relay-bundle/{cert.pem, key.pem, token.txt, listen.txt, forward.txt}}
+just ctl up dev          # gen + build + ship-server + ship-client
+just ctl shell dev       # drop into the local client netns
+# (inside: anything you curl / dig / ssh hits the tunnel)
+just ctl down dev        # tear both sides down
 ```
 
-**3. Cross-build the three binaries:**
+`up` is composed of four idempotent steps you can also run individually:
+
+| command | what it does |
+|---|---|
+| `burrowctl validate dev` | parse + sanity-check the spec |
+| `burrowctl gen dev`      | write `server.conf` + `burrow.conf` + `client1.conf` + `relay-bundle/{cert,key,token,listen,forward}` |
+| `burrowctl build dev`    | cross-build burrow + burrow-relay + burrow-client per `[build]` targets; collect into `relay-bundle/` |
+| `burrowctl ship-server dev` | scp + ssh kernel WG into a netns on the deploy host; drop the relay binary alongside (WSS) |
+| `burrowctl ship-client dev` | local-only: bring up a kernel WG client inside a netns on this box |
+
+**Cross-compile prerequisites.** Each non-host target needs `rustup
+target add <triple>` plus a working linker. `cross` is a drop-in
+cargo wrapper that handles linkers via docker if you'd rather not
+set toolchains up by hand. Set `CARGO=cross` to swap globally.
+
+**Multiple deployments** coexist — `deployments/prod/`,
+`deployments/staging/` — each with its own spec + bundle.
+
+**Manual ship.** If you'd rather drive scp/ssh yourself, `gen` +
+`build` produce a self-contained `relay-bundle/` you can ship by
+hand:
 
 ```sh
-cargo run --bin burrowctl -- build dev
-# invokes cargo three times with the right --target / --features
-# / embed env vars set internally; collects the binaries into
-# deployments/dev/relay-bundle/{burrow(.exe), burrow-relay, burrow-client}
-```
-
-You'll need each non-host target installed (`rustup target add
-<triple>`) plus a working linker. `cross` is a drop-in cargo wrapper
-that handles linkers via docker if you'd rather not set toolchains up
-by hand.
-
-**4. Ship + run** — everything you need is now in one directory:
-
-```sh
-# WG server box (kernel WireGuard + burrow-relay when on WSS)
 scp deployments/dev/server.conf root@vpn.example.com:/etc/wireguard/wg0.conf
-ssh root@vpn.example.com 'wg-quick up wg0'
 scp deployments/dev/relay-bundle/burrow-relay root@vpn.example.com: \
-    && ssh root@vpn.example.com ./burrow-relay        # WSS only
-
-# burrow gateway, Linux host
-scp deployments/dev/relay-bundle/burrow gateway-host: && ssh gateway-host ./burrow
-# burrow gateway, Windows host: SMB via the built-in C$ admin share
-# (or enable OpenSSH Server on the host and `scp` like Linux).
-Copy-Item deployments\dev\relay-bundle\burrow.exe \\gateway-host\c$\Users\Administrator\
-# then RDP / Enter-PSSession gateway-host and run .\burrow.exe
-
-# connect peer client
-sudo wg-quick up ./deployments/dev/client1.conf
+    && ssh root@vpn.example.com 'wg-quick up wg0; ./burrow-relay &'
+scp deployments/dev/relay-bundle/burrow.exe gateway-host:           # then run it
+sudo wg-quick up ./deployments/dev/client1.conf                     # client peer
 ```
 
-Multiple deployments coexist — `deployments/prod/`, `deployments/staging/`,
-each with its own spec + bundle. `burrowctl` always takes the
-deployment name as the last positional argument.
+### `routes`: split tunnel vs full tunnel
 
-### Legacy: `just gen-embed-wss`
-
-Pre-`burrowctl`, the same flow lived in `just gen-embed-wss` driven
-by `BURROW_TARGET` / `BURROW_RELAY_TARGET` / `BURROW_CLIENT_TARGET`
-env vars and wrote into `burrow-configs/`. That recipe still works
-for now, but `burrowctl` is the path forward — the env-var dance is
-strictly worse to maintain than a TOML file.
-
-### Easy deployment
-
-`just deploy-server` automates the WG server bring-up: SSHes to the
-remote, drops `server.conf` in place, runs `wg-quick up` inside an
-ephemeral netns. If `burrow-configs/relay-bundle/` is present (i.e.
-you used `gen-embed-wss`), it also ships `target/min/burrow-relay`
-and starts it — one command stands the whole server side up.
-
-The client side is local: `deploy-client` puts a kernel WG client
-into a netns on this box; `netns-shell` drops you into it so any
-traffic you generate (curl, dig, ssh) rides the tunnel.
-
-```sh
-just deploy-server --target root@vpn.example.com --key ~/.ssh/id_ed25519
-just deploy-client
-just netns-shell
-# (inside the netns: anything you curl / dig / ssh to the exposed
-#  subnets reaches through burrow.)
-```
-
-Teardown:
-
-```sh
-just deploy-server --target root@vpn.example.com --teardown
-just deploy-client --teardown
-```
-
-### `--routes`: split tunnel vs full tunnel
-
-`--routes` controls which destinations get directed through burrow.
-Two modes:
+`[wg].routes` controls which destinations get directed through burrow:
 
 - **Split tunnel** (typical): one or more specific CIDRs. Only traffic
   destined for those ranges rides the tunnel; everything else uses
   the client's normal network.
 
-  ```sh
-  just gen-embed --endpoint vpn.example.com:51820 \
-      --routes 192.168.1.0/24,10.50.0.0/24
+  ```toml
+  [wg]
+  routes = ["192.168.1.0/24", "10.50.0.0/24"]
   ```
 
 - **Full tunnel**: `0.0.0.0/0`. All client traffic goes through the WG
   server, through burrow, and out burrow's LAN uplink — burrow
-  becomes a self-hosted VPN egress. MASQUERADE is implicit (it's
-  already how burrow handles outbound). Pair with `--dns` so DNS has
-  a reachable resolver through the tunnel:
+  becomes a self-hosted VPN egress. Pair with `[wg].dns` pointing at
+  burrow's WG IP so DNS has a reachable resolver through the tunnel:
 
-  ```sh
-  just gen-embed --endpoint vpn.example.com:51820 \
-      --routes 0.0.0.0/0 --dns 10.0.0.2
+  ```toml
+  [wg]
+  routes = ["0.0.0.0/0"]
+  dns    = ["10.0.0.2"]
   ```
 
   Throughput is bounded by burrow's LAN pipe; fine for a handful of
@@ -197,9 +158,9 @@ Two modes:
 
 ## Examples
 
-All of these run from inside the client netns (`just netns-shell`) so
-traffic uses the tunnel. `10.0.0.2` is the burrow host's WG address in
-the examples — adjust for your subnet.
+All of these run from inside the client netns (`just ctl shell dev`)
+so traffic uses the tunnel. `10.0.0.2` is the burrow host's WG
+address in the examples — adjust for your subnet.
 
 ### Reach an internal host
 
@@ -220,8 +181,8 @@ resolver (on by default; `DnsEnabled = true` in `burrow.conf`):
 dig @10.0.0.2 internal.corp.lan
 ```
 
-Pass `--dns 10.0.0.2` to `burrow-client gen` to have the generated
-client.conf set `DNS = 10.0.0.2`, so wg-quick points every tool's
+Set `[wg].dns = ["10.0.0.2"]` in the spec to have the generated
+`client.conf` set `DNS = 10.0.0.2`, so wg-quick points every tool's
 resolver at burrow automatically while the tunnel is up.
 
 ### Reverse tunnel — expose a local service
@@ -237,11 +198,11 @@ burrow-client tunnel 10.0.0.2 start -R 443:127.0.0.1:8080
 ```
 
 `HOST` can be a hostname — resolved on the machine running
-`burrow-client` when a connection arrives, using whatever DNS
-the client's system has configured. That includes burrow's built-in
-resolver if `client.conf` set `DNS = 10.0.0.2` (pass `--dns` to
-`burrow-client gen`); otherwise it uses the client's system resolver
-/ `/etc/resolv.conf`.
+`burrow-client` when a connection arrives, using whatever DNS the
+client's system has configured. That includes burrow's built-in
+resolver if `client.conf` has `DNS = 10.0.0.2` (set `[wg].dns` in
+the spec); otherwise it uses the client's system resolver /
+`/etc/resolv.conf`.
 
 ```sh
 burrow-client tunnel 10.0.0.2 start -R 443:db.internal.example.com:5432
@@ -298,11 +259,12 @@ burrow-client shell 10.0.0.2 --program cmd.exe -- /c "dir C:\"
 
 ### WSS transport — burrow over HTTPS
 
-Some networks block egress UDP (corporate, hotel, captive-portal). For
-those, the server↔burrow leg can ride an HTTPS WebSocket served by
-**burrow-relay**, a small sidecar that sits next to kernel `wg0` on
-the WG server box and bridges WS frames to local UDP. The
-client↔server leg stays plain WG/UDP — only burrow has to know.
+Some networks block egress UDP (corporate, hotel, captive-portal).
+For those, set `[transport].mode = "wss"` in the spec and the
+gateway's outbound leg rides an HTTPS WebSocket served by
+**burrow-relay**, a sidecar that sits next to kernel `wg0` on the WG
+server box and bridges WS frames to local UDP. The client↔server leg
+stays plain WG/UDP — only the burrow gateway has to know.
 
 ```mermaid
 flowchart LR
@@ -315,75 +277,18 @@ flowchart LR
     relay <-->|HTTPS WSS| burrow["burrow<br/>(behind NAT)"]
 ```
 
-The `gen-embed-wss` recipe builds a paired `(burrow, burrow-relay)`
-package: matching keys, matching token, matching cert — both binaries
-self-contained and runnable with **no CLI args**. No Let's Encrypt,
-no systemd unit, no `/etc/burrow-relay/` provisioning.
+`burrowctl gen` produces a fresh ECDSA P-256 self-signed cert in
+`relay-bundle/cert.pem`. `burrowctl build` bakes it (plus a random
+bearer token) into the `burrow-relay` binary, and bakes
+`TlsSkipVerify=true` into the burrow gateway side so it accepts the
+cert. Bearer-token auth is what actually keeps unauthorized peers
+out — the TLS layer is pure obfuscation.
 
-```sh
-# One command produces:
-#   target/min/burrow            -- WG keys + transport URL + token + skip-verify embedded
-#   target/min/burrow-relay      -- TLS cert + key + token embedded
-#   target/min/burrow-client     -- companion CLI
-#   burrow-configs/server.conf   -- kernel wg-quick on the WG server
-#   burrow-configs/client1.conf  -- kernel wg-quick on each client
-just gen-embed-wss --endpoint vpn.example.com:51820 \
-                   --routes 192.168.1.0/24 \
-                   --relay vpn.example.com:443
-```
-
-`--relay HOST[:PORT]` — where burrow will dial. The host part lands
-in the cert's SAN; default port 443. Use any reachable address —
-DNS hostname, public IP literal, or a wildcard-DNS service like
-`159-65-218-242.nip.io`. The cert is freshly-generated ECDSA P-256
-self-signed; burrow trusts it because `gen --relay` flips the
-`TlsSkipVerify=true` bit in `burrow.conf`. Bearer-token auth is
-still enforced; the TLS layer is pure obfuscation.
-
-Run model — three boxes, three commands, no args anywhere:
-
-```sh
-# 1. WG server box (kernel WireGuard server)
-sudo wg-quick up ./server.conf
-./burrow-relay     # foreground; nohup or tmux it if you want it detached
-
-# 2. burrow gateway (the host inside the private network)
-./burrow
-
-# 3. each client peer
-sudo wg-quick up ./client1.conf
-```
-
-burrow.conf for the embed-mode build looks like this — the `Transport`,
-`RelayToken`, and `TlsSkipVerify` lines are how the existing wg-quick
-INI carries the WSS extras through the same embed mechanism that
-already exists:
-
-```ini
-[Interface]
-PrivateKey = ...
-Address = 10.0.0.2/24
-ControlPort = 57821
-DnsEnabled = true
-Transport = wss://vpn.example.com:443/v1/wg
-RelayToken = <base64>
-TlsSkipVerify = true
-
-[Peer]
-PublicKey = ...
-Endpoint = vpn.example.com:51820       # ignored when Transport is set
-AllowedIPs = 10.0.0.0/24
-PersistentKeepalive = 25
-```
-
-If you'd rather skip the embed step (e.g. use a CA-issued cert from a
-real DNS name), all three settings have CLI flags too:
-`--transport wss://host/v1/wg`, `--relay-token TOKEN` (or
-`BURROW_RELAY_TOKEN` env), `--tls-skip-verify`. Drop
-`--tls-skip-verify` when the relay's cert is signed by a CA that's
-in webpki-roots. Build burrow-relay normally
-(`cargo build --release --bin burrow-relay`) and pass `--cert`/`--key`/
-`--token`/`--listen`/`--forward-to` at runtime.
+If you'd rather use a CA-issued cert (so burrow can do real cert
+verification), drop your fullchain into `deployments/<name>/relay-bundle/cert.pem`
++ `key.pem` after running `gen` and re-run `build`. The `TlsSkipVerify`
+knob is currently always-on for embed-mode; a `[transport].tls = "byo"`
+escape hatch is the obvious next axis to add.
 
 If the relay is unreachable, the burrow gateway keeps retrying with
 capped exponential backoff. WG handshakes restart automatically once
@@ -392,24 +297,25 @@ the connection comes back.
 ## Commands
 
 ```
-burrow [--config <PATH>] [--transport <URL>]   # the gateway
-                                               # (URL: udp://host:port or wss://host/v1/wg)
-burrow-client tunnel <wg_ip> start -R ...      # reverse tunnels (TCP; -U for UDP)
-burrow-client shell  <wg_ip>                   # interactive PTY on the burrow host
-burrow-client keygen                           # base64 x25519 keypair
-burrow-client gen ... [--relay HOST[:PORT]]    # write server/burrow/client configs
-                                               # (--relay also produces a relay-bundle/)
-burrow-relay [--cert ... --key ...]            # WSS↔UDP bridge; CLI args optional under
-                                               # --features embedded-relay-bundle
-```
+burrowctl validate <name>      # parse + sanity-check spec
+burrowctl gen <name>           # write server.conf + burrow.conf + clientN.conf + relay-bundle/
+burrowctl build <name>         # cross-build per [build] targets, collect into relay-bundle/
+burrowctl ship-server <name>   # scp + ssh: kernel WG netns + relay (WSS only) on the deploy host
+burrowctl ship-client <name>   # local-only: kernel WG client netns
+burrowctl shell <name>         # drop into the local client netns
+burrowctl up <name>            # gen + build + ship-server + ship-client
+burrowctl down <name>          # tear both sides down
 
-```
-just gen-embed              # UDP transport: pair of binaries + WG configs
-just gen-embed-wss          # WSS transport: same, plus burrow-relay with bundle baked in
+burrow [--config <PATH>] [--transport <URL>]    # the gateway runtime (rarely run directly —
+                                                # the embedded build needs no args)
+burrow-client tunnel <wg_ip> start -R ...       # reverse tunnels (TCP; -U for UDP)
+burrow-client shell  <wg_ip>                    # interactive PTY on the burrow host
+burrow-client keygen                            # base64 x25519 keypair (utility)
+burrow-relay [--cert ... --key ...]             # WSS↔UDP bridge runtime (rarely run directly)
 ```
 
 `--help` on any subcommand for the full option surface. `just --list`
-for build / deploy recipes.
+for the dev-loop recipes (`build`, `test`, `clippy`, `fmt`, `ctl`).
 
 ## How it works
 
@@ -455,12 +361,12 @@ custom daemon required for the UDP transport. For WSS, run
 ## Development
 
 ```sh
-cargo test                              # ~145 lib + integration tests
+cargo test                              # 160+ lib + integration tests
 cargo clippy --all-targets -- -D warnings
 ```
 
-See `justfile` for cross-compile recipes and `scripts/` for the deploy
-helpers.
+`just --list` shows the dev-loop recipes (build / test / clippy / fmt /
+ctl / size). Build + deploy lives in `burrowctl` — see the Quick start.
 
 ## License
 

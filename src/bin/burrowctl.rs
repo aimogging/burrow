@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use burrow::orchestration::{build, gen};
+use burrow::orchestration::{build, gen, ship};
 use burrow::spec::{Layout, Spec};
 
 #[derive(Parser, Debug)]
@@ -46,6 +46,33 @@ enum Cmd {
     /// spec's `[build]` targets, with the bundle's embed materials set
     /// internally. Collects artifacts into `relay-bundle/`.
     Build {
+        name: String,
+    },
+    /// scp `server.conf` (and burrow-relay if WSS) to the deploy
+    /// target's host, then ssh + bring up kernel WG inside a netns.
+    /// The relay is started under `setsid -f` so the ssh session
+    /// disconnects cleanly.
+    ShipServer {
+        name: String,
+    },
+    /// Local-only: bring up a kernel WG client inside a netns on this
+    /// box. Linux only.
+    ShipClient {
+        name: String,
+    },
+    /// `gen` + `build` + `ship-server` + `ship-client` end-to-end.
+    Up {
+        name: String,
+    },
+    /// Tear down both sides — kill the remote relay + drop both
+    /// netnses. Best-effort; partial state is reported but doesn't
+    /// stop the rest of the teardown.
+    Down {
+        name: String,
+    },
+    /// Drop into an interactive bash inside the local client netns.
+    /// Anything you run from there (curl, dig, ssh) rides the tunnel.
+    Shell {
         name: String,
     },
 }
@@ -92,6 +119,16 @@ fn real_main() -> Result<()> {
         }
         Cmd::Gen { name } => gen::run(&name)?,
         Cmd::Build { name } => build::run(&name)?,
+        Cmd::ShipServer { name } => ship::server(&name)?,
+        Cmd::ShipClient { name } => ship::client(&name)?,
+        Cmd::Up { name } => {
+            gen::run(&name)?;
+            build::run(&name)?;
+            ship::server(&name)?;
+            ship::client(&name)?;
+        }
+        Cmd::Down { name } => ship::down(&name)?,
+        Cmd::Shell { name } => ship::shell(&name)?,
     }
     Ok(())
 }

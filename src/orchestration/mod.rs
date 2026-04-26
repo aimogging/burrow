@@ -7,4 +7,6 @@
 //! land later — see `~/.claude/plans/zzz-i-hate-the-enchanted-cerf.md`.
 
 pub mod build;
+pub mod exec;
 pub mod gen;
+pub mod ship;

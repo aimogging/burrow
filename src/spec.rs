@@ -33,6 +33,11 @@ pub struct Spec {
     pub wg: WgSection,
     pub transport: TransportSection,
     pub build: BuildSection,
+    /// Where the binaries actually run. Optional — only required for
+    /// `ship` / `up` / `down` / `shell`. `gen` and `build` work
+    /// without it.
+    #[serde(default)]
+    pub deploy: Option<DeploySection>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -108,6 +113,48 @@ pub struct BinaryBuild {
     pub target: String,
 }
 
+/// Deploy targets — where each side of the tunnel actually runs.
+/// Optional in the spec because `gen` and `build` don't need it; only
+/// the lifecycle commands (`ship`, `up`, `down`, `shell`) do.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DeploySection {
+    pub server: DeployServer,
+    #[serde(default)]
+    pub client: DeployClient,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DeployServer {
+    /// Anything ssh accepts: an SSH-config alias, `user@host`, or a
+    /// bare hostname/IP. Auth resolves through the usual
+    /// agent / `~/.ssh/config` / default-key path; if you need
+    /// something custom, set it in `~/.ssh/config`.
+    pub host: String,
+    /// netns name on the remote. Default `burrow`.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DeployClient {
+    /// Local netns name. Default `burrow`. The client always runs
+    /// locally — burrowctl is a dev-host tool and the netns wrapper
+    /// is meant to isolate test traffic from your host's routing.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+}
+
+impl Default for DeployClient {
+    fn default() -> Self {
+        Self { namespace: default_namespace() }
+    }
+}
+
+fn default_namespace() -> String { "burrow".into() }
+
 fn default_subnet() -> String { "10.0.0.0/24".into() }
 fn default_clients() -> u16 { 1 }
 fn default_listen_port() -> u16 { 51820 }
@@ -169,7 +216,34 @@ impl Spec {
         if self.build.client.target.trim().is_empty() {
             bail!("[build.client] target triple must not be empty");
         }
+
+        if let Some(d) = &self.deploy {
+            if d.server.host.trim().is_empty() {
+                bail!("[deploy.server] host must not be empty");
+            }
+            if d.server.namespace.trim().is_empty() {
+                bail!("[deploy.server] namespace must not be empty");
+            }
+            if d.client.namespace.trim().is_empty() {
+                bail!("[deploy.client] namespace must not be empty");
+            }
+        }
         Ok(())
+    }
+
+    /// Fetch the `[deploy]` section, erroring with a pointer to the
+    /// missing field if absent. Used by `ship` / `up` / `down` /
+    /// `shell` (which need it); `gen` and `build` use direct access
+    /// because they tolerate it being missing.
+    pub fn require_deploy(&self) -> Result<&DeploySection> {
+        self.deploy.as_ref().ok_or_else(|| {
+            anyhow!(
+                "this command needs a [deploy] section in spec.toml, e.g.:\n  \
+                 [deploy.server]\n  host = \"vpn.example.com\"\n  \
+                 # namespace = \"burrow\"  (default)\n  \
+                 [deploy.client]\n  # namespace = \"burrow\"  (default)"
+            )
+        })
     }
 }
 
