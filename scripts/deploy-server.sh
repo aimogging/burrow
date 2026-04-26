@@ -19,7 +19,7 @@
 set -euo pipefail
 
 DEFAULT_CONFIG="burrow-configs/server.conf"
-DEFAULT_RELAY_BIN="target/min/burrow-relay"
+DEFAULT_RELAY_BIN="burrow-configs/relay-bundle/burrow-relay"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_deploy_common.sh
@@ -60,8 +60,8 @@ Notes:
     sits alongside the config. That directory is produced by
     \`burrow-client gen --relay\` / \`just gen-embed-wss\`. The
     binary itself is loaded from --relay-binary (default
-    $DEFAULT_RELAY_BIN). If you're on a non-Linux host, cross-compile
-    first (e.g. \`cargo build --target x86_64-unknown-linux-gnu ...\`).
+    $DEFAULT_RELAY_BIN — gen-embed-wss collects it there from the
+    cargo output). The binary must be a Linux ELF.
 EOF
 }
 

@@ -34,6 +34,14 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
 target := env_var_or_default("BURROW_TARGET", "")
 
+# WSS pair builds three binaries for potentially three different OSes:
+# burrow runs wherever the gateway lives (often Windows on a dev box),
+# burrow-relay + burrow-client almost always Linux. The defaults
+# reflect that — only BURROW_TARGET is mandatory; override the others
+# only if your relay/client hosts aren't 64-bit Linux.
+relay_target := env_var_or_default("BURROW_RELAY_TARGET", "x86_64-unknown-linux-gnu")
+client_target := env_var_or_default("BURROW_CLIENT_TARGET", "x86_64-unknown-linux-gnu")
+
 # List recipes.
 default:
     @just --list
@@ -96,16 +104,30 @@ gen-embed *GEN_ARGS:
     cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs
     @just embed ./burrow-configs/burrow.conf {{target}}
 
-# Min-sized silent burrow + burrow-relay pair, both with their respective
-# configs embedded. Run `gen-embed-wss --endpoint host:port --routes ...
-# --relay relayhost[:port]` (other args same as gen-embed). Produces:
-#   target/min/burrow         (gateway, config + transport URL + token + skip-verify)
-#   target/min/burrow-relay   (relay, cert + key + token)
-#   burrow-configs/{server,clientN}.conf
+# Min-sized silent burrow + burrow-relay + burrow-client trio with their
+# respective configs/materials embedded. Each binary builds for its own
+# target triple — typically the gateway runs on a different OS from the
+# relay/client. Targets:
+#   GW_TARGET      = $BURROW_TARGET                — REQUIRED, no default.
+#   RELAY_TARGET   = $BURROW_RELAY_TARGET          — defaults to x86_64-unknown-linux-gnu.
+#   CLIENT_TARGET  = $BURROW_CLIENT_TARGET         — defaults to x86_64-unknown-linux-gnu.
+# Cross-compile toolchains must already be installed (rustup target add
+# <triple>, plus a matching linker — `cross` works as a drop-in cargo if
+# you don't want to set it up by hand).
 [unix]
-embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
+embed-wss-pair CONFIG BUNDLE_DIR GW_TARGET=target RELAY_TARGET=relay_target CLIENT_TARGET=client_target:
     #!/usr/bin/env bash
     set -eu
+    if [ -z "{{GW_TARGET}}" ]; then
+        echo "embed-wss-pair: BURROW_TARGET must be set (target triple for the burrow gateway)." >&2
+        echo "  Common values:" >&2
+        echo "    x86_64-pc-windows-msvc      Windows 10/11 (MSVC)" >&2
+        echo "    x86_64-pc-windows-gnu       Windows 10/11 (mingw)" >&2
+        echo "    x86_64-unknown-linux-gnu    Linux x86_64 glibc" >&2
+        echo "    aarch64-apple-darwin        macOS Apple Silicon" >&2
+        echo "  BURROW_RELAY_TARGET / BURROW_CLIENT_TARGET default to x86_64-unknown-linux-gnu." >&2
+        exit 2
+    fi
     if [ ! -f "{{BUNDLE_DIR}}/cert.pem" ] || [ ! -f "{{BUNDLE_DIR}}/key.pem" ] || [ ! -f "{{BUNDLE_DIR}}/token.txt" ]; then
         echo "embed-wss-pair: {{BUNDLE_DIR}} is missing cert.pem / key.pem / token.txt." >&2
         echo "  Run \`burrow-client gen --relay HOST[:PORT] ...\` first, or use" >&2
@@ -120,37 +142,37 @@ embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
     if [ -n "$registry_src" ]; then
         remap="$remap --remap-path-prefix=$registry_src=deps"
     fi
-    target_flag=""
-    if [ -n "{{TARGET}}" ]; then
-        target_flag="--target {{TARGET}}"
-    fi
-    BURROW_EMBEDDED_CONFIG="$(realpath '{{CONFIG}}')" RUSTFLAGS="$remap" \
-        cargo build --bin burrow --profile min --features embedded-config,silent $target_flag
     bundle="$(realpath '{{BUNDLE_DIR}}')"
+    BURROW_EMBEDDED_CONFIG="$(realpath '{{CONFIG}}')" RUSTFLAGS="$remap" \
+        cargo build --bin burrow --profile min --features embedded-config,silent --target {{GW_TARGET}}
     BURROW_RELAY_EMBED_TOKEN="$(cat "$bundle/token.txt" | tr -d '\n')" \
     BURROW_RELAY_EMBED_CERT_FILE="$bundle/cert.pem" \
     BURROW_RELAY_EMBED_KEY_FILE="$bundle/key.pem" \
     BURROW_RELAY_EMBED_LISTEN="$(cat "$bundle/listen.txt" | tr -d '\n')" \
     BURROW_RELAY_EMBED_FORWARD="$(cat "$bundle/forward.txt" | tr -d '\n')" \
     RUSTFLAGS="$remap" \
-        cargo build --bin burrow-relay --profile min --features embedded-relay-bundle,silent $target_flag
+        cargo build --bin burrow-relay --profile min --features embedded-relay-bundle,silent --target {{RELAY_TARGET}}
     RUSTFLAGS="$remap" \
-        cargo build --bin burrow-client --profile min --features silent $target_flag
-    # Collect the deploy artifacts into the bundle dir so the whole
-    # ship-this set is in one place. Match unix and .exe forms so
-    # cross-builds (e.g. --target x86_64-pc-windows-gnu from a unix
-    # host) land correctly.
-    if [ -n "{{TARGET}}" ]; then bin_dir="target/{{TARGET}}/min"; else bin_dir="target/min"; fi
-    for bin in burrow burrow-relay burrow-client; do
+        cargo build --bin burrow-client --profile min --features silent --target {{CLIENT_TARGET}}
+    # Collect each binary from its own per-target output dir into the
+    # bundle. Match unix and .exe forms so any combination of targets
+    # ends up with the right artifacts.
+    for spec in "burrow:{{GW_TARGET}}" "burrow-relay:{{RELAY_TARGET}}" "burrow-client:{{CLIENT_TARGET}}"; do
+        bin="${spec%:*}"
+        tgt="${spec#*:}"
         for variant in "$bin" "$bin.exe"; do
-            if [ -f "$bin_dir/$variant" ]; then
-                cp -f "$bin_dir/$variant" "$bundle/$variant"
+            if [ -f "target/$tgt/min/$variant" ]; then
+                cp -f "target/$tgt/min/$variant" "$bundle/$variant"
             fi
         done
     done
 
 [windows]
-embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
+embed-wss-pair CONFIG BUNDLE_DIR GW_TARGET=target RELAY_TARGET=relay_target CLIENT_TARGET=client_target:
+    if ('{{GW_TARGET}}' -eq '') { \
+        Write-Error "embed-wss-pair: BURROW_TARGET must be set (e.g. x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu). BURROW_RELAY_TARGET / BURROW_CLIENT_TARGET default to x86_64-unknown-linux-gnu."; \
+        exit 2 \
+    }; \
     if (-not ((Test-Path '{{BUNDLE_DIR}}\cert.pem') -and (Test-Path '{{BUNDLE_DIR}}\key.pem') -and (Test-Path '{{BUNDLE_DIR}}\token.txt'))) { \
         Write-Error "embed-wss-pair: {{BUNDLE_DIR}} is missing cert.pem / key.pem / token.txt. Run ``burrow-client gen --relay HOST[:PORT] ...`` first, or use ``just gen-embed-wss --relay HOST[:PORT] ...`` to do both in one shot."; \
         exit 2 \
@@ -163,8 +185,7 @@ embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
     if ($registrySrc) { $remap = "$remap --remap-path-prefix=$registrySrc=deps" }; \
     $env:RUSTFLAGS = $remap; \
     $env:BURROW_EMBEDDED_CONFIG = (Resolve-Path '{{CONFIG}}').Path; \
-    $t = if ('{{TARGET}}' -eq '') { @() } else { @('--target','{{TARGET}}') }; \
-    cargo build --bin burrow --profile min --features embedded-config,silent @t; \
+    cargo build --bin burrow --profile min --features embedded-config,silent --target '{{GW_TARGET}}'; \
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
     $bundle = (Resolve-Path '{{BUNDLE_DIR}}').Path; \
     $env:BURROW_RELAY_EMBED_TOKEN = (Get-Content "$bundle\token.txt" -Raw).Trim(); \
@@ -172,44 +193,57 @@ embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
     $env:BURROW_RELAY_EMBED_KEY_FILE = "$bundle\key.pem"; \
     $env:BURROW_RELAY_EMBED_LISTEN = (Get-Content "$bundle\listen.txt" -Raw).Trim(); \
     $env:BURROW_RELAY_EMBED_FORWARD = (Get-Content "$bundle\forward.txt" -Raw).Trim(); \
-    cargo build --bin burrow-relay --profile min --features embedded-relay-bundle,silent @t; \
+    cargo build --bin burrow-relay --profile min --features embedded-relay-bundle,silent --target '{{RELAY_TARGET}}'; \
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
-    cargo build --bin burrow-client --profile min --features silent @t; \
+    cargo build --bin burrow-client --profile min --features silent --target '{{CLIENT_TARGET}}'; \
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
-    $binDir = if ('{{TARGET}}' -eq '') { 'target\min' } else { "target\{{TARGET}}\min" }; \
-    foreach ($bin in 'burrow','burrow-relay','burrow-client') { \
-        foreach ($variant in $bin, "$bin.exe") { \
-            if (Test-Path "$binDir\$variant") { Copy-Item -Force "$binDir\$variant" "$bundle\$variant" } \
+    foreach ($spec in @{bin='burrow';tgt='{{GW_TARGET}}'}, @{bin='burrow-relay';tgt='{{RELAY_TARGET}}'}, @{bin='burrow-client';tgt='{{CLIENT_TARGET}}'}) { \
+        foreach ($variant in $spec.bin, "$($spec.bin).exe") { \
+            $src = "target\$($spec.tgt)\min\$variant"; \
+            if (Test-Path $src) { Copy-Item -Force $src "$bundle\$variant" } \
         } \
     }
 
 # Generate the WSS deployment package + build the paired binaries.
 # Pass through the same gen args (--endpoint, --routes, --dns, ...) plus
-# --relay HOST[:PORT]. End result: target/min/{burrow,burrow-relay}
-# both runnable with no CLI args, plus server.conf + clientN.conf for
-# the kernel-WG side. --relay is required (use `just gen-embed` for the
-# UDP-only path); failing fast here saves a doomed cargo invocation.
+# --relay HOST[:PORT]. End result: target/<triple>/min/{burrow,burrow-relay,
+# burrow-client} (collected into burrow-configs/relay-bundle/) plus the
+# wg server.conf + clientN.conf. --relay is required (use `just gen-embed`
+# for the UDP-only path); failing fast saves a doomed cargo invocation.
+#
+# Targets read from BURROW_TARGET / BURROW_RELAY_TARGET / BURROW_CLIENT_TARGET.
+# BURROW_TARGET is required. The other two default to x86_64-unknown-linux-gnu.
 [unix]
 gen-embed-wss *GEN_ARGS:
     #!/usr/bin/env bash
     set -eu
+    if [ -z "{{target}}" ]; then
+        echo "gen-embed-wss: BURROW_TARGET must be set (target triple for the burrow gateway)." >&2
+        echo "  e.g.: BURROW_TARGET=x86_64-pc-windows-msvc just gen-embed-wss --endpoint ..." >&2
+        echo "  BURROW_RELAY_TARGET / BURROW_CLIENT_TARGET default to x86_64-unknown-linux-gnu." >&2
+        exit 2
+    fi
     if ! printf ' %s ' {{GEN_ARGS}} | grep -q -- ' --relay '; then
         echo "gen-embed-wss requires --relay HOST[:PORT] in the gen args." >&2
         echo "  (Use 'just gen-embed' for the UDP-only path.)" >&2
         exit 2
     fi
     cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs
-    just embed-wss-pair ./burrow-configs/burrow.conf ./burrow-configs/relay-bundle {{target}}
+    just embed-wss-pair ./burrow-configs/burrow.conf ./burrow-configs/relay-bundle
 
 [windows]
 gen-embed-wss *GEN_ARGS:
+    if ('{{target}}' -eq '') { \
+        Write-Error "gen-embed-wss: BURROW_TARGET must be set (e.g. x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu). BURROW_RELAY_TARGET / BURROW_CLIENT_TARGET default to x86_64-unknown-linux-gnu."; \
+        exit 2 \
+    }; \
     if ('{{GEN_ARGS}}' -notmatch '(^|\s)--relay(\s|$)') { \
         Write-Error "gen-embed-wss requires --relay HOST[:PORT] in the gen args. (Use 'just gen-embed' for the UDP-only path.)"; \
         exit 2 \
     }; \
     cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs; \
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
-    just embed-wss-pair ./burrow-configs/burrow.conf ./burrow-configs/relay-bundle {{target}}
+    just embed-wss-pair ./burrow-configs/burrow.conf ./burrow-configs/relay-bundle
 
 # Passthrough to `burrow-client gen`. Same args as the binary's gen subcommand.
 gen *ARGS:

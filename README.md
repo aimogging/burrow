@@ -74,8 +74,10 @@ configs that pair them up.
 just gen-embed     --endpoint vpn.example.com:51820 \
                    --routes 192.168.1.0/24
 
-# WSS transport — also produces target/min/burrow-relay (with a
-# self-signed cert + token baked in) plus burrow-configs/relay-bundle/.
+# WSS transport — produces all three binaries with cross-targets per
+# binary (gateway often Windows, relay/client almost always Linux).
+# BURROW_TARGET is required; the other two default to Linux.
+BURROW_TARGET=x86_64-pc-windows-msvc \
 just gen-embed-wss --endpoint vpn.example.com:51820 \
                    --routes 192.168.1.0/24 \
                    --relay vpn.example.com:443
@@ -83,41 +85,59 @@ just gen-embed-wss --endpoint vpn.example.com:51820 \
 
 Both recipes embed `burrow.conf` into the gateway binary — no
 `--config` flag at runtime, no shipping the config file alongside.
+
+Per-binary build targets for `gen-embed-wss`:
+
+| env var | what it controls | default |
+|---|---|---|
+| `BURROW_TARGET` | gateway binary's target triple | **required** |
+| `BURROW_RELAY_TARGET` | relay binary's target triple | `x86_64-unknown-linux-gnu` |
+| `BURROW_CLIENT_TARGET` | client binary's target triple | `x86_64-unknown-linux-gnu` |
+
+Each is a standard rustc triple (`x86_64-pc-windows-msvc`,
+`x86_64-pc-windows-gnu`, `x86_64-unknown-linux-gnu`,
+`aarch64-apple-darwin`, ...). You'll need `rustup target add <triple>`
+plus a working linker for each non-host target. `cross` is a drop-in
+cargo wrapper that handles the linker side via docker if you'd rather
+not set toolchains up by hand.
+
 Output set:
 
 ```
-target/min/burrow(.exe)             gateway, config embedded
-target/min/burrow-client(.exe)      companion CLI
-target/min/burrow-relay(.exe)       only with gen-embed-wss; cert/key/token embedded
-burrow-configs/server.conf          kernel WG server config (wg-quick)
-burrow-configs/burrow.conf          same content that's embedded — keep for reference
-burrow-configs/client1.conf         wg-quick config for the client peer
-burrow-configs/relay-bundle/        WSS only — collected deploy package:
-    burrow(.exe)                    copy of target/min/burrow
-    burrow-relay(.exe)              copy of target/min/burrow-relay
-    burrow-client(.exe)             copy of target/min/burrow-client
-    cert.pem / key.pem / token.txt  build inputs (already baked into burrow-relay)
-    listen.txt / forward.txt        build inputs (defaults baked in)
+target/<gw-triple>/min/burrow(.exe)             gateway, config embedded
+target/<relay-triple>/min/burrow-relay          relay, cert/key/token embedded
+target/<client-triple>/min/burrow-client        companion CLI
+burrow-configs/server.conf                      kernel WG server config (wg-quick)
+burrow-configs/burrow.conf                      same content that's embedded — keep for reference
+burrow-configs/client1.conf                     wg-quick config for the client peer
+burrow-configs/relay-bundle/                    WSS only — collected deploy package:
+    burrow(.exe)                                copy of the gateway binary
+    burrow-relay(.exe)                          copy of the relay binary
+    burrow-client(.exe)                         copy of the client binary
+    cert.pem / key.pem / token.txt              build inputs (already baked into burrow-relay)
+    listen.txt / forward.txt                    build inputs (defaults baked in)
 ```
 
 `burrow-configs/relay-bundle/` is the "ship this directory" view —
-binaries plus their build-time materials in one place. `target/min/`
-remains the canonical build output (cargo's territory).
+binaries plus their build-time materials in one place. The per-target
+paths under `target/` remain the canonical cargo outputs.
 
-Ship the binaries to the boxes that need them and run with no args:
+Ship the binaries to the boxes that need them and run with no args.
+After `gen-embed-wss`, everything lives in `burrow-configs/relay-bundle/`:
 
 ```sh
 # WG server box (kernel WireGuard, plus burrow-relay when on WSS)
 scp burrow-configs/server.conf root@vpn.example.com:/etc/wireguard/wg0.conf
 ssh root@vpn.example.com 'wg-quick up wg0'
 # WSS only — also ship burrow-relay and run it (foreground; nohup or tmux to detach):
-scp target/min/burrow-relay root@vpn.example.com: && ssh root@vpn.example.com ./burrow-relay
+scp burrow-configs/relay-bundle/burrow-relay root@vpn.example.com: \
+    && ssh root@vpn.example.com ./burrow-relay
 
 # burrow gateway, Linux host
-scp target/min/burrow gateway-host: && ssh gateway-host ./burrow
+scp burrow-configs/relay-bundle/burrow gateway-host: && ssh gateway-host ./burrow
 # burrow gateway, Windows host: SMB via the built-in C$ admin share
 # (or enable OpenSSH Server on the host and `scp` like Linux).
-Copy-Item target\min\burrow.exe \\gateway-host\c$\Users\Administrator\
+Copy-Item burrow-configs\relay-bundle\burrow.exe \\gateway-host\c$\Users\Administrator\
 # then RDP / Enter-PSSession gateway-host and run .\burrow.exe
 
 # connect peer client
