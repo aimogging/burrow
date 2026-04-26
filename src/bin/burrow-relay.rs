@@ -38,6 +38,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
+#[cfg(not(feature = "silent"))]
 use tracing_subscriber::EnvFilter;
 
 use burrow::relay::serve_ws_connection;
@@ -133,6 +134,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // See main.rs for why this is gated — `silent` statically disables
+    // every tracing event, so installing an EnvFilter would warn that
+    // its directives are unreachable.
+    #[cfg(not(feature = "silent"))]
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()

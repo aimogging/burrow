@@ -1,3 +1,11 @@
+// Detach from any console on Windows when this binary is built for
+// deployment (`silent`). Windows allocates a console for the
+// CONSOLE subsystem; switching to WINDOWS means double-clicking the
+// .exe (or launching from Task Scheduler / a service wrapper) leaves
+// no terminal window. Dev builds keep CONSOLE so cargo run / a
+// terminal session still gets stdio.
+#![cfg_attr(all(windows, feature = "silent"), windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -10,6 +18,7 @@ use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+#[cfg(not(feature = "silent"))]
 use tracing_subscriber::EnvFilter;
 
 use burrow::config;
@@ -120,6 +129,13 @@ async fn run(
     relay_token: Option<String>,
     tls_skip_verify: bool,
 ) -> Result<()> {
+    // `silent` sets `release_max_level_off` on tracing, which makes
+    // every `info!()` / `debug!()` site a compile-time no-op. Wiring up
+    // an EnvFilter on top of that produces a "filter directives would
+    // enable traces that are disabled statically" warning at startup
+    // — gate the entire subscriber init out under silent so deploy
+    // builds boot cleanly.
+    #[cfg(not(feature = "silent"))]
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
