@@ -1,0 +1,435 @@
+//! ratatui form for `burrowctl init`. Single screen, ~15 lines.
+//!
+//! Field set (Phase 1):
+//!   * WireGuard endpoint                  text
+//!   * Gateway target                      Select (4 presets + "other")
+//!   * [x] Deploy via SSH                  toggle
+//!         SSH host                        text (only when toggled on)
+//!   * [ ] WSS transport                   toggle
+//!         Relay host:port                 text (only when toggled on)
+//!   * Routes                              text (comma-separated)
+//!
+//! Navigation: Tab / Shift-Tab move; Space toggles checkboxes;
+//! Up/Down navigate the Select menu when focused; arrows + backspace
+//! edit text fields; Ctrl-S saves; Esc cancels.
+//!
+//! Validation surfaces inline below each field; save is gated on
+//! every required field being valid.
+
+use std::io;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::{Frame, Terminal};
+
+use super::state::{detect_host_triple, FormState};
+
+const TARGET_PRESETS: &[(&str, &str)] = &[
+    ("Linux x86_64",         "x86_64-unknown-linux-gnu"),
+    ("Windows x86_64 MSVC",  "x86_64-pc-windows-msvc"),
+    ("Windows x86_64 mingw", "x86_64-pc-windows-gnu"),
+    ("macOS Apple Silicon",  "aarch64-apple-darwin"),
+    ("macOS Intel",          "x86_64-apple-darwin"),
+];
+
+/// Run the form. Returns `Some(state)` if the user pressed Ctrl-S,
+/// `None` if Esc-cancelled. Restores the terminal on every exit
+/// path including panics-from-render (drop guard).
+pub fn run_form(initial: FormState) -> Result<Option<FormState>> {
+    let mut term = enter_tui().context("entering TUI")?;
+    let _guard = TuiGuard;
+    let outcome = drive(&mut term, initial);
+    // _guard's Drop restores the terminal even if drive() returned Err.
+    outcome
+}
+
+fn drive(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    initial: FormState,
+) -> Result<Option<FormState>> {
+    let mut model = Model::new(initial);
+    loop {
+        term.draw(|f| render(f, &model)).context("draw")?;
+        if !event::poll(Duration::from_millis(250)).context("poll")? {
+            continue;
+        }
+        let evt = event::read().context("read")?;
+        match handle(evt, &mut model) {
+            Outcome::Save => return Ok(Some(model.state)),
+            Outcome::Cancel => return Ok(None),
+            Outcome::Continue => {}
+        }
+    }
+}
+
+fn enter_tui() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enable_raw_mode().context("enable raw mode")?;
+    let mut stdout = io::stdout();
+    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("enter alt screen")?;
+    Terminal::new(CrosstermBackend::new(stdout)).context("init terminal")
+}
+
+/// RAII restorer — runs on normal exit, error, or panic.
+struct TuiGuard;
+impl Drop for TuiGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Model
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Endpoint,
+    Gateway,
+    DeployToggle,
+    DeployHost,
+    WssToggle,
+    RelayHost,
+    Routes,
+}
+
+const ALL_FIELDS: &[Field] = &[
+    Field::Endpoint,
+    Field::Gateway,
+    Field::DeployToggle,
+    Field::DeployHost,
+    Field::WssToggle,
+    Field::RelayHost,
+    Field::Routes,
+];
+
+struct Model {
+    state: FormState,
+    focus: Field,
+    /// Index into TARGET_PRESETS; >= len means "Other (custom)".
+    gateway_idx: usize,
+    error: Option<String>,
+}
+
+impl Model {
+    fn new(state: FormState) -> Self {
+        let gateway_idx = TARGET_PRESETS
+            .iter()
+            .position(|(_, t)| *t == state.gateway_target)
+            .unwrap_or(TARGET_PRESETS.len());
+        Self {
+            state,
+            focus: Field::Endpoint,
+            gateway_idx,
+            error: None,
+        }
+    }
+
+    /// Fields skip themselves when their gating toggle is off.
+    fn focusable(&self, f: Field) -> bool {
+        match f {
+            Field::DeployHost => self.state.deploy_enabled,
+            Field::RelayHost => self.state.wss_enabled,
+            _ => true,
+        }
+    }
+
+    fn focus_next(&mut self) {
+        let cur = ALL_FIELDS.iter().position(|f| *f == self.focus).unwrap_or(0);
+        for offset in 1..=ALL_FIELDS.len() {
+            let i = (cur + offset) % ALL_FIELDS.len();
+            if self.focusable(ALL_FIELDS[i]) {
+                self.focus = ALL_FIELDS[i];
+                return;
+            }
+        }
+    }
+
+    fn focus_prev(&mut self) {
+        let cur = ALL_FIELDS.iter().position(|f| *f == self.focus).unwrap_or(0);
+        for offset in 1..=ALL_FIELDS.len() {
+            let i = (cur + ALL_FIELDS.len() - offset) % ALL_FIELDS.len();
+            if self.focusable(ALL_FIELDS[i]) {
+                self.focus = ALL_FIELDS[i];
+                return;
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Event handling
+// ----------------------------------------------------------------------------
+
+enum Outcome {
+    Continue,
+    Save,
+    Cancel,
+}
+
+fn handle(evt: Event, m: &mut Model) -> Outcome {
+    let Event::Key(k) = evt else {
+        return Outcome::Continue;
+    };
+    if k.kind != KeyEventKind::Press {
+        return Outcome::Continue;
+    }
+
+    // Global keybinds first.
+    match (k.code, k.modifiers) {
+        (KeyCode::Esc, _) => return Outcome::Cancel,
+        (KeyCode::Char('s'), KeyModifiers::CONTROL)
+        | (KeyCode::Char('S'), KeyModifiers::CONTROL) => {
+            return on_save(m);
+        }
+        (KeyCode::Tab, _) => {
+            m.focus_next();
+            return Outcome::Continue;
+        }
+        (KeyCode::BackTab, _) => {
+            m.focus_prev();
+            return Outcome::Continue;
+        }
+        _ => {}
+    }
+
+    match m.focus {
+        Field::Endpoint => edit_text(&mut m.state.endpoint, k.code),
+        Field::DeployHost => edit_text(&mut m.state.deploy_host, k.code),
+        Field::RelayHost => edit_text(&mut m.state.relay_host, k.code),
+        Field::Routes => edit_text(&mut m.state.routes, k.code),
+        Field::DeployToggle => {
+            if matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter) {
+                m.state.deploy_enabled = !m.state.deploy_enabled;
+                if m.state.deploy_enabled && m.state.deploy_host.is_empty() {
+                    m.state.deploy_host = endpoint_host(&m.state.endpoint);
+                }
+            }
+        }
+        Field::WssToggle => {
+            if matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter) {
+                m.state.wss_enabled = !m.state.wss_enabled;
+                if m.state.wss_enabled && m.state.relay_host.is_empty() {
+                    let host = endpoint_host(&m.state.endpoint);
+                    if !host.is_empty() {
+                        m.state.relay_host = format!("{host}:443");
+                    }
+                }
+            }
+        }
+        Field::Gateway => match k.code {
+            KeyCode::Up => {
+                if m.gateway_idx > 0 {
+                    m.gateway_idx -= 1;
+                    sync_gateway(m);
+                }
+            }
+            KeyCode::Down => {
+                if m.gateway_idx + 1 <= TARGET_PRESETS.len() {
+                    m.gateway_idx += 1;
+                    sync_gateway(m);
+                }
+            }
+            // When on "Other", let the user type to edit the triple.
+            _ if m.gateway_idx >= TARGET_PRESETS.len() => {
+                edit_text(&mut m.state.gateway_target, k.code);
+            }
+            _ => {}
+        },
+    }
+    Outcome::Continue
+}
+
+fn edit_text(buf: &mut String, code: KeyCode) {
+    match code {
+        KeyCode::Char(c) => buf.push(c),
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        _ => {}
+    }
+}
+
+fn sync_gateway(m: &mut Model) {
+    if m.gateway_idx < TARGET_PRESETS.len() {
+        m.state.gateway_target = TARGET_PRESETS[m.gateway_idx].1.to_string();
+    } else if m.state.gateway_target.is_empty() {
+        m.state.gateway_target = detect_host_triple().to_string();
+    }
+}
+
+fn endpoint_host(endpoint: &str) -> String {
+    endpoint.split(':').next().unwrap_or("").to_string()
+}
+
+fn on_save(m: &mut Model) -> Outcome {
+    match m.state.require_complete() {
+        Ok(()) => {
+            // Final structural gate via the canonical parser.
+            let body = super::emit::format_spec(&m.state);
+            match crate::spec::Spec::parse_str(&body) {
+                Ok(_) => Outcome::Save,
+                Err(e) => {
+                    m.error = Some(format!("{e:#}"));
+                    Outcome::Continue
+                }
+            }
+        }
+        Err(missing) => {
+            m.error = Some(format!("missing/invalid: {missing}"));
+            Outcome::Continue
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Render
+// ----------------------------------------------------------------------------
+
+fn render(f: &mut Frame, m: &Model) {
+    let area = centered(f.area(), 78, 22);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" burrowctl init ");
+    f.render_widget(&block, area);
+    let inner = block.inner(area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // endpoint
+            Constraint::Length(2), // gateway
+            Constraint::Length(1), // deploy toggle
+            Constraint::Length(2), // deploy host
+            Constraint::Length(1), // wss toggle
+            Constraint::Length(2), // relay host
+            Constraint::Length(2), // routes
+            Constraint::Min(1),    // spacer
+            Constraint::Length(1), // error line
+            Constraint::Length(1), // help line
+        ])
+        .split(inner);
+
+    f.render_widget(text_field(m, Field::Endpoint, "WireGuard endpoint", &m.state.endpoint), rows[0]);
+    f.render_widget(gateway_field(m), rows[1]);
+    f.render_widget(checkbox(m, Field::DeployToggle, "Deploy via SSH", m.state.deploy_enabled), rows[2]);
+    f.render_widget(
+        sub_field(m, Field::DeployHost, "  SSH host         ", &m.state.deploy_host, m.state.deploy_enabled),
+        rows[3],
+    );
+    f.render_widget(
+        checkbox(m, Field::WssToggle, "WSS transport (only if egress UDP is blocked)", m.state.wss_enabled),
+        rows[4],
+    );
+    f.render_widget(
+        sub_field(m, Field::RelayHost, "  Relay host:port  ", &m.state.relay_host, m.state.wss_enabled),
+        rows[5],
+    );
+    f.render_widget(
+        text_field(m, Field::Routes, "Routes (comma-separated CIDRs, optional)", &m.state.routes),
+        rows[6],
+    );
+
+    let err_line = m
+        .error
+        .as_deref()
+        .map(|e| Line::from(Span::styled(format!("error: {e}"), Style::default().fg(Color::Red))))
+        .unwrap_or_else(|| Line::from(""));
+    f.render_widget(Paragraph::new(err_line), rows[8]);
+
+    let help = Line::from(Span::styled(
+        "Tab/Shift-Tab move • Space toggle • ↑/↓ on Gateway • Ctrl-S save • Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(help), rows[9]);
+}
+
+fn text_field<'a>(m: &Model, f: Field, label: &'a str, value: &'a str) -> Paragraph<'a> {
+    let focused = m.focus == f;
+    let label_span = Span::styled(format!("{label}: "), label_style(focused));
+    let value_span = Span::styled(value.to_string(), value_style(focused));
+    let cursor = if focused { Span::styled("▏", cursor_style()) } else { Span::raw("") };
+    Paragraph::new(Line::from(vec![label_span, value_span, cursor]))
+}
+
+fn sub_field<'a>(m: &Model, f: Field, label: &'a str, value: &'a str, enabled: bool) -> Paragraph<'a> {
+    let focused = m.focus == f && enabled;
+    let style = if !enabled {
+        Style::default().fg(Color::DarkGray)
+    } else if focused {
+        value_style(true)
+    } else {
+        value_style(false)
+    };
+    let cursor = if focused { Span::styled("▏", cursor_style()) } else { Span::raw("") };
+    Paragraph::new(Line::from(vec![
+        Span::styled(label.to_string(), label_style(focused)),
+        Span::styled(value.to_string(), style),
+        cursor,
+    ]))
+}
+
+fn checkbox<'a>(m: &Model, f: Field, label: &'a str, on: bool) -> Paragraph<'a> {
+    let focused = m.focus == f;
+    let mark = if on { "[x]" } else { "[ ]" };
+    Paragraph::new(Line::from(vec![
+        Span::styled(format!("{mark} "), label_style(focused)),
+        Span::styled(label.to_string(), label_style(focused)),
+    ]))
+}
+
+fn gateway_field(m: &Model) -> Paragraph<'_> {
+    let focused = m.focus == Field::Gateway;
+    let preset_label = if m.gateway_idx < TARGET_PRESETS.len() {
+        format!("{} ({})", TARGET_PRESETS[m.gateway_idx].0, TARGET_PRESETS[m.gateway_idx].1)
+    } else {
+        format!("Other (custom): {}", m.state.gateway_target)
+    };
+    Paragraph::new(Line::from(vec![
+        Span::styled("Gateway runs on: ", label_style(focused)),
+        Span::styled(preset_label, value_style(focused)),
+    ]))
+}
+
+fn label_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    }
+}
+
+fn value_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+fn cursor_style() -> Style {
+    Style::default().fg(Color::Yellow).add_modifier(Modifier::SLOW_BLINK)
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
+}

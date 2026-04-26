@@ -57,6 +57,10 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto
 # Spec parser for the burrowctl orchestrator. burrowctl is a dev-host
 # tool, never shipped, so the dep weight only affects developer builds.
 toml = "0.8"
+# ratatui form widget for `burrowctl init` / `edit`. Sits on top of
+# the crossterm we already pull in for burrow-client's shell support;
+# net new is just the ratatui crate itself.
+ratatui = "0.29"
 
 [[bin]]
 name = "burrow"

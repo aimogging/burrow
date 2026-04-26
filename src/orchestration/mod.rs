@@ -9,4 +9,5 @@
 pub mod build;
 pub mod exec;
 pub mod gen;
+pub mod init;
 pub mod ship;

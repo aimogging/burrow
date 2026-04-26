@@ -14,7 +14,8 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use burrow::orchestration::{build, gen, ship};
+use burrow::orchestration::{build, gen, init, ship};
+use burrow::orchestration::init::InitArgs;
 use burrow::spec::{Layout, Spec};
 
 #[derive(Parser, Debug)]
@@ -29,6 +30,43 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Bootstrap a new deployment. With no flags + a TTY, opens a
+    /// short ratatui form. With any field flag set (or no TTY), runs
+    /// in batch mode: missing required fields exit non-zero. Refuses
+    /// to overwrite an existing spec without `--force`.
+    Init {
+        /// Deployment name (`deployments/<name>/spec.toml`).
+        name: String,
+
+        /// WireGuard server endpoint (host:port). Required in batch mode.
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// Target triple for the burrow gateway binary. Default = host's triple.
+        #[arg(long)]
+        gateway_target: Option<String>,
+
+        /// SSH host for `ship-server` / `up` / `down`. Pass empty
+        /// string to disable the [deploy] section.
+        #[arg(long)]
+        deploy_host: Option<String>,
+
+        /// Transport: `udp` (default) or `wss`.
+        #[arg(long)]
+        transport: Option<String>,
+
+        /// Relay host:port. Required when --transport wss.
+        #[arg(long)]
+        relay_host: Option<String>,
+
+        /// Routes as a comma-separated list of CIDRs.
+        #[arg(long)]
+        routes: Option<String>,
+
+        /// Overwrite an existing spec.
+        #[arg(long)]
+        force: bool,
+    },
     /// Parse + sanity-check `deployments/<name>/spec.toml`. Exits 0 on
     /// success and prints a one-line summary; exits 2 with the parse /
     /// validation error otherwise.
@@ -90,6 +128,28 @@ fn main() -> ExitCode {
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Init {
+            name,
+            endpoint,
+            gateway_target,
+            deploy_host,
+            transport,
+            relay_host,
+            routes,
+            force,
+        } => {
+            let args = InitArgs {
+                endpoint,
+                gateway_target,
+                deploy_host,
+                transport,
+                relay_host,
+                routes,
+                force,
+            };
+            args.validate_shape()?;
+            init::run(&name, args)?;
+        }
         Cmd::Validate { name } => {
             let layout = Layout::for_name(&name)?;
             layout.require_spec()?;

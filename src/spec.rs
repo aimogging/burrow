@@ -167,10 +167,15 @@ impl Spec {
     pub fn parse(path: &Path) -> Result<Self> {
         let body = fs::read_to_string(path)
             .with_context(|| format!("reading spec {}", path.display()))?;
-        let spec: Spec = toml::from_str(&body)
-            .with_context(|| format!("parsing spec {}", path.display()))?;
-        spec.validate()
-            .with_context(|| format!("validating spec {}", path.display()))?;
+        Self::parse_str(&body)
+            .with_context(|| format!("parsing spec {}", path.display()))
+    }
+
+    /// Parse + validate a spec from a string. Used by the wizard's
+    /// post-emit gate (no file involved) and by tests.
+    pub fn parse_str(body: &str) -> Result<Self> {
+        let spec: Spec = toml::from_str(body).context("toml parse")?;
+        spec.validate()?;
         Ok(spec)
     }
 

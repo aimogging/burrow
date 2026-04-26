@@ -63,32 +63,33 @@ flowchart LR
 
 Three boxes — a public WG server, the burrow gateway behind NAT, and
 one or more clients. Decisions live in **one TOML file per
-deployment**, under `deployments/<name>/spec.toml`. `burrowctl`
-takes the deployment from there to running tunnel in one command.
+deployment**, under `deployments/<name>/spec.toml`. The wizard
+writes one for you:
 
-Write `deployments/dev/spec.toml`:
-
-```toml
-[wg]
-endpoint = "vpn.example.com:51820"     # WG server's public host:port
-routes   = ["192.168.1.0/24"]          # CIDRs the gateway exposes
-
-[transport]
-mode       = "wss"                     # or "udp"
-relay_host = "vpn.example.com:443"     # required when mode = "wss"
-
-[build.gateway]
-target = "x86_64-pc-windows-msvc"      # required — pick the gateway host's OS
-# [build.relay]   target defaults to "x86_64-unknown-linux-gnu"
-# [build.client]  target defaults to "x86_64-unknown-linux-gnu"
-
-[deploy.server]
-host = "vpn.example.com"               # ssh-resolvable (alias, user@host, or IP)
-# namespace = "burrow"                 # default
-
-[deploy.client]
-# namespace = "burrow"                 # default; client always runs locally
+```sh
+just ctl init dev
 ```
+
+Opens a short ratatui form: WG endpoint, gateway OS, deploy host,
+optional WSS, optional routes. Tab to move between fields, Space
+toggles the checkboxes, Ctrl-S saves, Esc cancels. The "Hidden
+defaults" comments in the resulting `spec.toml` point at the
+fields the wizard didn't surface (subnet, client count, namespaces,
+relay/client cross-targets) for power-user editing.
+
+For scripting / CI, `init` also runs in **batch mode** — any field
+flag set switches it off the TUI:
+
+```sh
+just ctl init dev --endpoint vpn.example.com:51820 \
+                   --gateway-target x86_64-pc-windows-msvc \
+                   --deploy-host vpn.example.com
+```
+
+Required in batch: `--endpoint`. `--gateway-target` defaults to the
+host's triple; `--deploy-host` defaults to the endpoint hostname (pass
+`--deploy-host ''` to skip the deploy section); `--transport` defaults
+to `udp`. `--force` overwrites an existing spec.
 
 Then everything is one command:
 
@@ -103,11 +104,12 @@ just ctl down dev        # tear both sides down
 
 | command | what it does |
 |---|---|
-| `burrowctl validate dev` | parse + sanity-check the spec |
-| `burrowctl gen dev`      | write `server.conf` + `burrow.conf` + `client1.conf` + `relay-bundle/{cert,key,token,listen,forward}` |
-| `burrowctl build dev`    | cross-build burrow + burrow-relay + burrow-client per `[build]` targets; collect into `relay-bundle/` |
-| `burrowctl ship-server dev` | scp + ssh kernel WG into a netns on the deploy host; drop the relay binary alongside (WSS) |
-| `burrowctl ship-client dev` | local-only: bring up a kernel WG client inside a netns on this box |
+| `burrowctl init <name>`     | wizard / batch-write `spec.toml` |
+| `burrowctl validate <name>` | parse + sanity-check the spec |
+| `burrowctl gen <name>`      | write `server.conf` + `burrow.conf` + `client1.conf` + `relay-bundle/{cert,key,token,listen,forward}` |
+| `burrowctl build <name>`    | cross-build burrow + burrow-relay + burrow-client per `[build]` targets; collect into `relay-bundle/` |
+| `burrowctl ship-server <name>` | scp + ssh kernel WG into a netns on the deploy host; drop the relay binary alongside (WSS) |
+| `burrowctl ship-client <name>` | local-only: bring up a kernel WG client inside a netns on this box |
 
 **Cross-compile prerequisites.** Each non-host target needs `rustup
 target add <triple>` plus a working linker. `cross` is a drop-in
@@ -297,6 +299,7 @@ the connection comes back.
 ## Commands
 
 ```
+burrowctl init <name>          # short ratatui form (or batch with --endpoint etc.) -> writes spec.toml
 burrowctl validate <name>      # parse + sanity-check spec
 burrowctl gen <name>           # write server.conf + burrow.conf + clientN.conf + relay-bundle/
 burrowctl build <name>         # cross-build per [build] targets, collect into relay-bundle/
