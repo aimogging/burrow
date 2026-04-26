@@ -12,6 +12,42 @@
 
 use anyhow::{bail, Result};
 
+/// Mirror of `crate::spec::TlsStrategy` carried in FormState. Kept
+/// separate so the wizard layer can grow UI hints (e.g. "available
+/// only on Phase 4b") without touching the spec schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsChoice {
+    #[default]
+    SelfSigned,
+    Byo,
+    Acme,
+}
+
+impl TlsChoice {
+    pub fn from_cli(s: &str) -> Result<Self> {
+        match s {
+            "self-signed" | "selfsigned" => Ok(Self::SelfSigned),
+            "byo" => Ok(Self::Byo),
+            "acme" => Ok(Self::Acme),
+            other => bail!("--tls must be `self-signed`, `byo`, or `acme` (got `{other}`)"),
+        }
+    }
+    pub fn as_toml(self) -> &'static str {
+        match self {
+            Self::SelfSigned => "self-signed",
+            Self::Byo => "byo",
+            Self::Acme => "acme",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SelfSigned => "self-signed (default; cert generated)",
+            Self::Byo => "bring your own (drop cert.pem + key.pem)",
+            Self::Acme => "acme (Let's Encrypt; needs DNS to resolve to relay)",
+        }
+    }
+}
+
 /// Wizard fields. The Phase 3 advanced fields are stored as
 /// optional strings: `None` means "leave at the spec default";
 /// `Some` means "user/CLI overrode it" and gets emitted explicitly.
@@ -26,6 +62,8 @@ pub struct FormState {
     pub deploy_host: String,
     pub wss_enabled: bool,
     pub relay_host: String,
+    pub tls_strategy: TlsChoice,
+    pub acme_email: String,
     pub routes: String,
 
     // Advanced — None means "use spec default", Some means override.
@@ -53,6 +91,8 @@ impl FormState {
             deploy_host: String::new(),
             wss_enabled: false,
             relay_host: String::new(),
+            tls_strategy: TlsChoice::SelfSigned,
+            acme_email: String::new(),
             routes: String::new(),
             subnet: None,
             clients: None,
@@ -84,6 +124,12 @@ impl FormState {
                 .unwrap_or_default(),
             wss_enabled: wss,
             relay_host: spec.transport.relay_host.clone().unwrap_or_default(),
+            tls_strategy: match spec.transport.tls {
+                crate::spec::TlsStrategy::SelfSigned => TlsChoice::SelfSigned,
+                crate::spec::TlsStrategy::Byo => TlsChoice::Byo,
+                crate::spec::TlsStrategy::Acme => TlsChoice::Acme,
+            },
+            acme_email: spec.transport.acme_email.clone().unwrap_or_default(),
             routes: spec.wg.routes.join(", "),
             subnet: some_if(spec.wg.subnet.clone(), "10.0.0.0/24"),
             clients: some_u16(spec.wg.clients, 1),
@@ -150,6 +196,11 @@ impl FormState {
         });
 
         let routes = args.routes.clone().unwrap_or_default();
+        let tls_strategy = match &args.tls {
+            Some(s) => TlsChoice::from_cli(s)?,
+            None => TlsChoice::SelfSigned,
+        };
+        let acme_email = args.acme_email.clone().unwrap_or_default();
 
         Ok(Self {
             endpoint,
@@ -158,6 +209,8 @@ impl FormState {
             deploy_host,
             wss_enabled,
             relay_host,
+            tls_strategy,
+            acme_email,
             routes,
             subnet: args.subnet.clone(),
             clients: args.clients.map(|n| n.to_string()),
@@ -188,6 +241,12 @@ impl FormState {
         if self.wss_enabled && self.relay_host.trim().is_empty() {
             return Err("relay-host".into());
         }
+        if self.wss_enabled
+            && self.tls_strategy == TlsChoice::Acme
+            && self.acme_email.trim().is_empty()
+        {
+            return Err("acme-email".into());
+        }
         Ok(())
     }
 
@@ -213,6 +272,9 @@ pub struct InitArgs {
     pub force: bool,
     pub prefill: bool,
     pub editor: bool,
+
+    pub tls: Option<String>,
+    pub acme_email: Option<String>,
 
     // Phase 3 advanced fields.
     pub subnet: Option<String>,
@@ -244,6 +306,8 @@ impl InitArgs {
             || self.client_namespace.is_some()
             || self.relay_target.is_some()
             || self.client_target.is_some()
+            || self.tls.is_some()
+            || self.acme_email.is_some()
     }
 
     /// Sanity-check flag values that aren't tied to required-field

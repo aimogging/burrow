@@ -213,7 +213,10 @@ fn gen_configs(args: GenArgs) -> Result<ExitCode> {
         clients: args.clients,
         listen_port: args.listen_port,
         control_port: DEFAULT_CONTROL_PORT,
-        relay: args.relay.map(|host_port| RelayParams { host_port }),
+        relay: args.relay.map(|host_port| RelayParams {
+            host_port,
+            tls: burrow::config_gen::TlsMode::SelfSigned,
+        }),
     };
     let configs = generate(&params)?;
 

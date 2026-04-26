@@ -102,6 +102,8 @@ enum Field {
     DeployHost,
     WssToggle,
     RelayHost,
+    TlsChoice,
+    AcmeEmail,
     Routes,
     AdvancedToggle,
     Subnet,
@@ -121,6 +123,8 @@ const ALL_FIELDS: &[Field] = &[
     Field::DeployHost,
     Field::WssToggle,
     Field::RelayHost,
+    Field::TlsChoice,
+    Field::AcmeEmail,
     Field::Routes,
     Field::AdvancedToggle,
     Field::Subnet,
@@ -192,6 +196,7 @@ impl Model {
             Field::Endpoint
                 | Field::DeployHost
                 | Field::RelayHost
+                | Field::AcmeEmail
                 | Field::Routes
                 | Field::Subnet
                 | Field::Clients
@@ -208,7 +213,11 @@ impl Model {
     fn focusable(&self, f: Field) -> bool {
         match f {
             Field::DeployHost => self.state.deploy_enabled,
-            Field::RelayHost => self.state.wss_enabled,
+            Field::RelayHost | Field::TlsChoice => self.state.wss_enabled,
+            Field::AcmeEmail => {
+                self.state.wss_enabled
+                    && self.state.tls_strategy == super::state::TlsChoice::Acme
+            }
             Field::Subnet
             | Field::Clients
             | Field::ListenPort
@@ -341,6 +350,29 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
                 m.advanced_expanded = !m.advanced_expanded;
             }
         }
+        Field::TlsChoice => {
+            // ←/→ cycle through the 3 TLS strategies.
+            use super::state::TlsChoice as T;
+            let cur = m.state.tls_strategy;
+            match k.code {
+                KeyCode::Left | KeyCode::Up => {
+                    m.state.tls_strategy = match cur {
+                        T::SelfSigned => T::Acme,
+                        T::Byo => T::SelfSigned,
+                        T::Acme => T::Byo,
+                    };
+                }
+                KeyCode::Right | KeyCode::Down | KeyCode::Char(' ') | KeyCode::Enter => {
+                    m.state.tls_strategy = match cur {
+                        T::SelfSigned => T::Byo,
+                        T::Byo => T::Acme,
+                        T::Acme => T::SelfSigned,
+                    };
+                }
+                _ => {}
+            }
+        }
+        Field::AcmeEmail => edit_text(&mut m.state.acme_email, k.code),
         Field::Subnet => edit_optional(&mut m.state.subnet, k.code),
         Field::Clients => edit_optional(&mut m.state.clients, k.code),
         Field::ListenPort => edit_optional(&mut m.state.listen_port, k.code),
@@ -469,6 +501,8 @@ fn render(f: &mut Frame, m: &Model) {
         Constraint::Length(1), // deploy host
         Constraint::Length(1), // wss toggle
         Constraint::Length(1), // relay host
+        Constraint::Length(1), // tls choice
+        Constraint::Length(1), // acme email
         Constraint::Length(1), // routes
         Constraint::Length(1), // advanced toggle
     ];
@@ -493,6 +527,17 @@ fn render(f: &mut Frame, m: &Model) {
     f.render_widget(sub_field(m, Field::DeployHost, "  SSH host         ", &m.state.deploy_host, m.state.deploy_enabled), rows[i]); i += 1;
     f.render_widget(checkbox(m, Field::WssToggle, "WSS transport (only if egress UDP is blocked)", m.state.wss_enabled), rows[i]); i += 1;
     f.render_widget(sub_field(m, Field::RelayHost, "  Relay host:port  ", &m.state.relay_host, m.state.wss_enabled), rows[i]); i += 1;
+    f.render_widget(tls_field(m), rows[i]); i += 1;
+    f.render_widget(
+        sub_field(
+            m,
+            Field::AcmeEmail,
+            "  ACME email       ",
+            &m.state.acme_email,
+            m.state.wss_enabled && m.state.tls_strategy == super::state::TlsChoice::Acme,
+        ),
+        rows[i],
+    ); i += 1;
     f.render_widget(text_field(m, Field::Routes, "Routes (comma-separated CIDRs, optional)", &m.state.routes), rows[i]); i += 1;
     f.render_widget(checkbox(m, Field::AdvancedToggle, "Advanced (subnet, namespaces, cross-targets, ...)", m.advanced_expanded), rows[i]); i += 1;
 
@@ -547,7 +592,26 @@ const ADVANCED_FIELD_META: &[(Field, &str, &str)] = &[
 ];
 
 fn constraints_len(m: &Model) -> usize {
-    8 + (if m.advanced_expanded { ADVANCED_FIELDS.len() } else { 0 }) + 3
+    10 + (if m.advanced_expanded { ADVANCED_FIELDS.len() } else { 0 }) + 3
+}
+
+fn tls_field(m: &Model) -> Paragraph<'_> {
+    let focused = m.focus == Field::TlsChoice;
+    let enabled = m.state.wss_enabled;
+    let label_style_ = if !enabled {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        label_style(focused)
+    };
+    let value_style_ = if !enabled {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        value_style(focused)
+    };
+    Paragraph::new(Line::from(vec![
+        Span::styled("  TLS              ", label_style_),
+        Span::styled(format!("[ {} ]", m.state.tls_strategy.label()), value_style_),
+    ]))
 }
 
 fn adv_field<'a>(m: &Model, field: Field, label: &'a str, value: Option<&'a str>, default: &'a str) -> Paragraph<'a> {

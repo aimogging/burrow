@@ -69,6 +69,13 @@ pub fn format_spec(state: &FormState) -> String {
     if state.wss_enabled {
         let _ = writeln!(out, "mode       = \"wss\"");
         let _ = writeln!(out, "relay_host = {}", quote(&state.relay_host));
+        // tls = "self-signed" is the default; emit only when overridden.
+        if state.tls_strategy != super::state::TlsChoice::SelfSigned {
+            let _ = writeln!(out, "tls        = {}", quote(state.tls_strategy.as_toml()));
+        }
+        if state.tls_strategy == super::state::TlsChoice::Acme {
+            let _ = writeln!(out, "acme_email = {}", quote(&state.acme_email));
+        }
     } else {
         let _ = writeln!(out, "mode = \"udp\"");
     }
@@ -147,6 +154,8 @@ mod tests {
             deploy_host: String::new(),
             wss_enabled: false,
             relay_host: String::new(),
+            tls_strategy: super::super::state::TlsChoice::SelfSigned,
+            acme_email: String::new(),
             routes: String::new(),
             subnet: None,
             clients: None,

@@ -75,6 +75,20 @@ pub struct RelayParams {
     /// SAN (DNS for hostnames, IP for literals); both halves are
     /// embedded into `burrow.conf`'s `Transport=` URL.
     pub host_port: String,
+    /// How `gen` should obtain the cert + key. `SelfSigned` produces
+    /// a fresh ECDSA P-256 cert and sets TlsSkipVerify=true on burrow;
+    /// `Byo` skips cert generation entirely (operator drops them in)
+    /// and sets TlsSkipVerify=false; `Acme` is reserved (errors).
+    pub tls: TlsMode,
+}
+
+/// Mirror of `crate::spec::TlsStrategy`, decoupled from spec parsing
+/// so config_gen stays usable from tests / non-spec callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsMode {
+    SelfSigned,
+    Byo,
+    Acme,
 }
 
 impl Default for GenParams {
@@ -212,9 +226,10 @@ fn build_burrow_conf(
         Some(r) => format!(
             "Transport = wss://{host}/v1/wg\n\
              RelayToken = {token}\n\
-             TlsSkipVerify = true\n",
+             TlsSkipVerify = {skip}\n",
             host = r.host_port,
             token = r.token,
+            skip = if r.skip_verify { "true" } else { "false" },
         ),
         None => String::new(),
     };
@@ -301,29 +316,26 @@ impl Keypair {
 }
 
 /// Output of cert/token generation when `gen --relay` is in play.
-/// Owns the host, token, and PEMs so `build_burrow_conf` can fold the
-/// token + URL into the burrow side and the trailing files can be
-/// emitted as part of the output set.
+/// Owns the host, token, and (sometimes) PEMs so `build_burrow_conf`
+/// can fold the token + URL into the burrow side and the trailing
+/// files can be emitted as part of the output set.
 struct RelayArtifacts {
     host_port: String,
     token: String,
-    cert_pem: String,
-    key_pem: String,
+    /// `None` when `tls = "byo"` — operator supplies these themselves.
+    cert_pem: Option<String>,
+    key_pem: Option<String>,
     forward_to: String,
     listen: String,
+    /// Drives `TlsSkipVerify = ...` in burrow.conf. True for
+    /// SelfSigned (operator never sees the cert); false for Byo / Acme
+    /// (real cert chain webpki can verify).
+    skip_verify: bool,
 }
 
 impl RelayArtifacts {
     fn into_files(self) -> Vec<GeneratedConfig> {
-        vec![
-            GeneratedConfig {
-                filename: "relay-bundle/cert.pem".into(),
-                contents: self.cert_pem,
-            },
-            GeneratedConfig {
-                filename: "relay-bundle/key.pem".into(),
-                contents: self.key_pem,
-            },
+        let mut out = vec![
             GeneratedConfig {
                 filename: "relay-bundle/token.txt".into(),
                 contents: format!("{}\n", self.token),
@@ -336,7 +348,20 @@ impl RelayArtifacts {
                 filename: "relay-bundle/forward.txt".into(),
                 contents: format!("{}\n", self.forward_to),
             },
-        ]
+        ];
+        if let Some(cert) = self.cert_pem {
+            out.push(GeneratedConfig {
+                filename: "relay-bundle/cert.pem".into(),
+                contents: cert,
+            });
+        }
+        if let Some(key) = self.key_pem {
+            out.push(GeneratedConfig {
+                filename: "relay-bundle/key.pem".into(),
+                contents: key,
+            });
+        }
+        out
     }
 }
 
@@ -357,15 +382,34 @@ fn build_relay_artifacts(rp: &RelayParams, wg_listen_port: u16) -> Result<RelayA
     };
     let host_port = format!("{host_only}:{port}");
 
-    // Single-SAN self-signed cert. We let rcgen pick a default validity
-    // window and a fresh ECDSA P-256 key. With `TlsSkipVerify=true` on
-    // the burrow side the SAN is informational, but it stays accurate
-    // so flipping skip-verify off (e.g. with a pinned-CA workflow
-    // later) doesn't immediately break.
-    let certified = generate_simple_self_signed(vec![host_only.clone()])
-        .map_err(|e| anyhow::anyhow!("rcgen self-signed: {e}"))?;
-    let cert_pem = certified.cert.pem();
-    let key_pem = certified.key_pair.serialize_pem();
+    // Cert + key behaviour depends on the strategy:
+    let (cert_pem, key_pem, skip_verify) = match rp.tls {
+        TlsMode::SelfSigned => {
+            // Single-SAN self-signed cert. rcgen picks a default
+            // validity window + a fresh ECDSA P-256 key. With
+            // TlsSkipVerify=true on the burrow side the SAN is
+            // informational, but it stays accurate so flipping
+            // skip-verify off (e.g. moving to a pinned-CA workflow)
+            // doesn't immediately break.
+            let certified = generate_simple_self_signed(vec![host_only.clone()])
+                .map_err(|e| anyhow::anyhow!("rcgen self-signed: {e}"))?;
+            (Some(certified.cert.pem()), Some(certified.key_pair.serialize_pem()), true)
+        }
+        TlsMode::Byo => {
+            // Operator drops cert.pem + key.pem into relay-bundle/
+            // themselves. We emit nothing for those files; build
+            // step validates they exist before embedding. Burrow
+            // does real cert verification.
+            (None, None, false)
+        }
+        TlsMode::Acme => {
+            bail!(
+                "tls = \"acme\" is not yet implemented (Phase 4b). \
+                 Use \"self-signed\" or run certbot yourself + \
+                 \"byo\" with the resulting fullchain/privkey."
+            );
+        }
+    };
 
     // Token: 32 random bytes, base64. Matches the keygen pattern;
     // reuses the same getrandom backend already pulled in by x25519.
@@ -379,6 +423,7 @@ fn build_relay_artifacts(rp: &RelayParams, wg_listen_port: u16) -> Result<RelayA
         key_pem,
         forward_to: format!("127.0.0.1:{wg_listen_port}"),
         listen: format!("0.0.0.0:{port}"),
+        skip_verify,
     })
 }
 
@@ -620,6 +665,7 @@ mod tests {
         let mut p = default_params();
         p.relay = Some(RelayParams {
             host_port: "relay.example.com:443".into(),
+            tls: TlsMode::SelfSigned,
         });
         let out = generate(&p).unwrap();
         let names: Vec<&str> = out.iter().map(|c| c.filename.as_str()).collect();
@@ -642,6 +688,7 @@ mod tests {
         let mut p = default_params();
         p.relay = Some(RelayParams {
             host_port: "relay.example.com:443".into(),
+            tls: TlsMode::SelfSigned,
         });
         let out = generate(&p).unwrap();
         let burrow = out.iter().find(|c| c.filename == "burrow.conf").unwrap();
@@ -659,6 +706,7 @@ mod tests {
         let mut p = default_params();
         p.relay = Some(RelayParams {
             host_port: "relay.example.com".into(), // default port 443
+            tls: TlsMode::SelfSigned,
         });
         let out = generate(&p).unwrap();
         let burrow = out.iter().find(|c| c.filename == "burrow.conf").unwrap();
@@ -676,6 +724,7 @@ mod tests {
         let mut p = default_params();
         p.relay = Some(RelayParams {
             host_port: "r:443".into(),
+            tls: TlsMode::SelfSigned,
         });
         let a = generate(&p).unwrap();
         let b = generate(&p).unwrap();
@@ -694,6 +743,7 @@ mod tests {
         let mut p = default_params();
         p.relay = Some(RelayParams {
             host_port: "127.0.0.1:8443".into(),
+            tls: TlsMode::SelfSigned,
         });
         let out = generate(&p).unwrap();
         let cert = out

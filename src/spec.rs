@@ -74,6 +74,36 @@ pub struct TransportSection {
     /// `host[:port]` burrow will dial via WSS. Required when
     /// `mode = "wss"`. Default port if omitted is 443.
     pub relay_host: Option<String>,
+    /// How the WSS-side TLS cert + key are obtained. `self-signed`
+    /// generates one in `gen` and bakes it in (with TlsSkipVerify=true
+    /// on burrow); `byo` expects the operator to drop cert.pem +
+    /// key.pem into `relay-bundle/` themselves (real cert, no skip);
+    /// `acme` is reserved for the Phase 4b auto-acquire.
+    /// Defaults to `self-signed`.
+    #[serde(default)]
+    pub tls: TlsStrategy,
+    /// Email address used for ACME registration. Required when
+    /// `tls = "acme"`. Ignored otherwise.
+    #[serde(default)]
+    pub acme_email: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsStrategy {
+    /// gen produces a fresh ECDSA P-256 self-signed cert; burrow
+    /// trusts it via TlsSkipVerify=true. Default — works without
+    /// operator-side trust glue.
+    #[default]
+    SelfSigned,
+    /// Operator drops `cert.pem` + `key.pem` into `relay-bundle/`
+    /// themselves (e.g. fullchain from certbot). gen validates the
+    /// files exist and skips its own cert generation; burrow gets
+    /// TlsSkipVerify=false.
+    Byo,
+    /// Phase 4b: gen runs ACME against `relay_host` to acquire a
+    /// real cert. Not yet implemented — errors out at gen time.
+    Acme,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -204,10 +234,25 @@ impl Spec {
                 if host.trim().is_empty() {
                     bail!("[transport] relay_host is required when mode = \"wss\"");
                 }
+                if self.transport.tls == TlsStrategy::Acme {
+                    let email = self.transport.acme_email.as_deref().unwrap_or("");
+                    if email.trim().is_empty() {
+                        bail!(
+                            "[transport] acme_email is required when tls = \"acme\" \
+                             (Let's Encrypt needs an account email)"
+                        );
+                    }
+                }
             }
             TransportMode::Udp => {
                 if self.transport.relay_host.is_some() {
                     bail!("[transport] relay_host has no meaning when mode = \"udp\"");
+                }
+                if self.transport.tls != TlsStrategy::SelfSigned {
+                    bail!(
+                        "[transport] tls is only meaningful when mode = \"wss\" \
+                         (defaults to \"self-signed\" otherwise)"
+                    );
                 }
             }
         }

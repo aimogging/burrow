@@ -11,9 +11,9 @@ use std::fs;
 use anyhow::{Context, Result};
 
 use crate::config::parse_ipv4_cidr;
-use crate::config_gen::{generate, GenParams, RelayParams};
+use crate::config_gen::{generate, GenParams, RelayParams, TlsMode};
 use crate::config::DEFAULT_CONTROL_PORT;
-use crate::spec::{Layout, Spec, TransportMode};
+use crate::spec::{Layout, Spec, TlsStrategy, TransportMode};
 
 /// Drive `gen` for the deployment named `name`. Reads
 /// `deployments/<name>/spec.toml`, writes the trio + (for WSS)
@@ -46,6 +46,11 @@ pub fn run_with_layout(layout: &Layout) -> Result<()> {
         relay: match (spec.transport.mode, &spec.transport.relay_host) {
             (TransportMode::Wss, Some(host)) => Some(RelayParams {
                 host_port: host.clone(),
+                tls: match spec.transport.tls {
+                    TlsStrategy::SelfSigned => TlsMode::SelfSigned,
+                    TlsStrategy::Byo => TlsMode::Byo,
+                    TlsStrategy::Acme => TlsMode::Acme,
+                },
             }),
             _ => None,
         },
