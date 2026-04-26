@@ -12,6 +12,7 @@
 
 mod editor;
 mod emit;
+mod ssh_alias;
 mod state;
 mod tui;
 

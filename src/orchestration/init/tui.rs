@@ -35,16 +35,27 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 // -----------------------------------------------------------------------------
-// Palette — Phosphor Green CRT aesthetic with amber focus accent. ratatui
-// degrades 24-bit colors gracefully on terminals that don't support them
-// (256-color or 16-color fallback), so explicit RGB is safe.
+// Palette — vaporwave on true-black: vibrant saturated text + faint border
+// lines. Roles from the old phosphor palette map 1:1; only the hex values
+// change. ratatui degrades 24-bit colors gracefully on terminals that don't
+// support them (256/16-color fallback), so explicit RGB is safe.
+//
+//   VAPOR_CYAN     focused values, title — the "wow" pop
+//   VAPOR_PINK     unfocused values
+//   VAPOR_PURPLE   unfocused labels (the dimmer of the two label states)
+//   VAPOR_MAGENTA  focused labels, cursor — focus accent
+//   VAPOR_RED      errors
+//   VAPOR_LINE     borders + disabled text — faint, recedes
+//   DEEP_BLACK     background, painted explicitly so terminals with grey
+//                  defaults still render the form on true black.
 // -----------------------------------------------------------------------------
-const PHOSPHOR_BRIGHT: Color = Color::Rgb(0x00, 0xff, 0x00);
-const PHOSPHOR_MED:    Color = Color::Rgb(0x00, 0xcc, 0x00);
-const PHOSPHOR_DIM:    Color = Color::Rgb(0x00, 0x99, 0x00);
-const AMBER_FOCUS:     Color = Color::Rgb(0xff, 0xb0, 0x00);
-const RED_ERR:         Color = Color::Rgb(0xff, 0x44, 0x44);
-const DIM_GRAY:        Color = Color::Rgb(0x55, 0x55, 0x55);
+const VAPOR_CYAN:    Color = Color::Rgb(0x00, 0xff, 0xff);
+const VAPOR_PINK:    Color = Color::Rgb(0xff, 0x71, 0xce);
+const VAPOR_PURPLE:  Color = Color::Rgb(0xb9, 0x67, 0xff);
+const VAPOR_MAGENTA: Color = Color::Rgb(0xff, 0x00, 0xff);
+const VAPOR_RED:     Color = Color::Rgb(0xff, 0x5e, 0x5e);
+const VAPOR_LINE:    Color = Color::Rgb(0x3a, 0x2a, 0x5a);
+const DEEP_BLACK:    Color = Color::Rgb(0x00, 0x00, 0x00);
 
 use super::state::{detect_host_triple, FormState};
 
@@ -77,7 +88,7 @@ fn help_text(f: Field) -> (&'static str, &'static str) {
             "  vpn.example.com:51820\n  159.65.218.242:51820",
         ),
         Field::Gateway => (
-            "Target triple for the burrow gateway binary. Pick the OS your gateway machine runs.",
+            "Target triple for the burrow gateway binary. Pick the OS your gateway machine runs. F2 pops a list modal with all presets and toolchain-installed markers (`[+]`).",
             "  Linux x86_64 (default on Linux hosts)\n  Windows x86_64 MSVC\n  Windows x86_64 mingw\n  macOS Apple Silicon\n  Other... (type your own triple)",
         ),
         Field::DeployToggle => (
@@ -85,7 +96,7 @@ fn help_text(f: Field) -> (&'static str, &'static str) {
             "  on / off",
         ),
         Field::DeployHost => (
-            "ssh-resolvable: alias from ~/.ssh/config, user@host, or bare host:port. Used by `burrowctl ship-server` and `burrowctl up`. Password authentication isn't supported (the relay-start step pipes a script over stdin, which collides with sshd's TTY-based password prompt) — use ssh-agent or set SSH_KEY below.",
+            "ssh-resolvable: alias from ~/.ssh/config, user@host, or bare host:port. Used by `burrowctl ship-server` and `burrowctl up`. F2 pops a picker of aliases parsed from your ssh config (recursive, follows Include). Password authentication isn't supported (the relay-start step pipes a script over stdin, which collides with sshd's TTY-based password prompt) — use ssh-agent or set SSH_KEY below.",
             "  vpn.example.com\n  root@vpn.example.com\n  do          (alias from ~/.ssh/config)",
         ),
         Field::SshKey => (
@@ -304,6 +315,12 @@ struct Model {
     /// Cached `rustup target list --installed` output. None until
     /// the gateway modal is first opened (lazy fetch).
     installed_targets: Option<Vec<String>>,
+    /// SSH alias picker modal state — same shape as gateway_modal_*.
+    ssh_modal_open: bool,
+    ssh_modal_idx: usize,
+    /// Cached aliases from ~/.ssh/config (recursive, follows Include).
+    /// None until the picker is first opened.
+    ssh_aliases: Option<Vec<String>>,
     /// User has manually touched these fields — once true, never auto-
     /// infer their value (e.g. from WG_ENDPOINT) again. Without this,
     /// toggling DEPLOY_VIA_SSH off/on or TRANSPORT WSS→UDP→WSS could
@@ -341,6 +358,9 @@ impl Model {
             gateway_modal_open: false,
             gateway_modal_idx: 0,
             installed_targets: None,
+            ssh_modal_open: false,
+            ssh_modal_idx: 0,
+            ssh_aliases: None,
             deploy_host_touched,
             relay_host_touched,
         }
@@ -468,6 +488,11 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
         return handle_gateway_modal(k, m);
     }
 
+    // SSH alias picker modal handles its own keys.
+    if m.ssh_modal_open {
+        return handle_ssh_modal(k, m);
+    }
+
     // If we're in command-bar mode (`:w` / `:q` / `:wq`), keystrokes
     // accumulate into the buffer until Enter executes or Esc cancels.
     if let Some(buf) = m.cmd_buffer.as_mut() {
@@ -548,8 +573,12 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
     match m.focus {
         Field::Endpoint => edit_text(&mut m.state.endpoint, k.code),
         Field::DeployHost => {
-            edit_text(&mut m.state.deploy_host, k.code);
-            m.deploy_host_touched = true;
+            if k.code == KeyCode::F(2) {
+                open_ssh_modal(m);
+            } else {
+                edit_text(&mut m.state.deploy_host, k.code);
+                m.deploy_host_touched = true;
+            }
         }
         Field::SshKey => edit_text(&mut m.state.deploy_ssh_key, k.code),
         Field::RelayHost => {
@@ -594,13 +623,13 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
         Field::RelayTarget => edit_optional(&mut m.state.relay_target, k.code),
         Field::ClientTarget => edit_optional(&mut m.state.client_target, k.code),
         Field::Gateway => match k.code {
-            KeyCode::Enter => {
+            KeyCode::F(2) => {
                 // Pop the list modal so the user can see all options
                 // (with toolchain-installed markers) at once.
                 open_gateway_modal(m);
             }
             KeyCode::Left => cycle_select(m, false),
-            KeyCode::Right | KeyCode::Char(' ') => cycle_select(m, true),
+            KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter => cycle_select(m, true),
             // When on "Other", let the user type to edit the triple.
             _ if m.gateway_idx >= TARGET_PRESETS.len() => {
                 edit_text(&mut m.state.gateway_target, k.code);
@@ -730,6 +759,67 @@ fn fetch_installed_targets() -> Vec<String> {
         .collect()
 }
 
+/// Open the SSH alias picker. Lazy-fetches `~/.ssh/config` (recursive,
+/// follows Include) on first open + caches for the session.
+fn open_ssh_modal(m: &mut Model) {
+    if m.ssh_aliases.is_none() {
+        m.ssh_aliases = Some(super::ssh_alias::fetch_ssh_aliases());
+    }
+    let aliases = m.ssh_aliases.as_deref().unwrap_or(&[]);
+    // Land on the row matching the current value if there is one,
+    // otherwise on the first alias (or "Other..." if no aliases).
+    m.ssh_modal_idx = aliases
+        .iter()
+        .position(|a| a == &m.state.deploy_host)
+        .unwrap_or(0);
+    m.ssh_modal_open = true;
+}
+
+/// Modal-mode key handling for the SSH alias picker.
+fn handle_ssh_modal(k: crossterm::event::KeyEvent, m: &mut Model) -> Outcome {
+    let aliases_len = m.ssh_aliases.as_deref().map(|a| a.len()).unwrap_or(0);
+    let other_idx = aliases_len; // last row is "Other..."
+    let max = other_idx;
+    match k.code {
+        KeyCode::Esc => {
+            m.ssh_modal_open = false;
+        }
+        KeyCode::Up => {
+            if m.ssh_modal_idx > 0 {
+                m.ssh_modal_idx -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if m.ssh_modal_idx < max {
+                m.ssh_modal_idx += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if m.ssh_modal_idx < aliases_len {
+                if let Some(name) = m
+                    .ssh_aliases
+                    .as_ref()
+                    .and_then(|a| a.get(m.ssh_modal_idx))
+                    .cloned()
+                {
+                    m.state.deploy_host = name;
+                    m.deploy_host_touched = true;
+                }
+            }
+            // "Other..." row: deploy_host already holds whatever the
+            // user typed inline; just close the modal.
+            m.ssh_modal_open = false;
+        }
+        // When on "Other..." let the user type to edit the host inline.
+        _ if m.ssh_modal_idx >= aliases_len => {
+            edit_text(&mut m.state.deploy_host, k.code);
+            m.deploy_host_touched = true;
+        }
+        _ => {}
+    }
+    Outcome::Continue
+}
+
 /// Modal-mode key handling. Up/Down navigate options; Enter selects
 /// + closes; Esc cancels. When focused on the "Other..." row, typing
 /// edits the custom triple.
@@ -850,11 +940,14 @@ fn render(f: &mut Frame, m: &Model) {
     let area = centered(f.area(), 80, dynamic_height(m));
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(Style::default().fg(PHOSPHOR_MED))
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(VAPOR_LINE))
+        // Paint the form on true black explicitly so terminals with a
+        // grey/off-white default background still render on black.
+        .style(Style::default().bg(DEEP_BLACK))
         .title(Span::styled(
             " BURROWCTL :: INIT ",
-            Style::default().fg(PHOSPHOR_BRIGHT).add_modifier(Modifier::BOLD),
+            Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::BOLD),
         ));
     f.render_widget(&block, area);
     let inner = block.inner(area);
@@ -905,7 +998,7 @@ fn render(f: &mut Frame, m: &Model) {
         .map(|e| {
             Line::from(Span::styled(
                 format!("[ERR] {e}"),
-                Style::default().fg(RED_ERR).add_modifier(Modifier::BOLD),
+                Style::default().fg(VAPOR_RED).add_modifier(Modifier::BOLD),
             ))
         })
         .unwrap_or_else(|| Line::from(""));
@@ -914,16 +1007,16 @@ fn render(f: &mut Frame, m: &Model) {
     let bottom = if let Some(buf) = &m.cmd_buffer {
         Line::from(Span::styled(
             format!(":{buf}_"),
-            Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD),
+            Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::BOLD),
         ))
     } else {
         let prefix = Span::styled(
             "[SYS] READY  ",
-            Style::default().fg(PHOSPHOR_BRIGHT).add_modifier(Modifier::BOLD),
+            Style::default().fg(VAPOR_CYAN).add_modifier(Modifier::BOLD),
         );
         let help = Span::styled(
-            "↑/↓:NAV  TAB:CYCLE  SPC:TOG  F1:HELP  ^S/:w COMMIT  ESC/:q ABORT",
-            Style::default().fg(PHOSPHOR_DIM),
+            "↑/↓:NAV  TAB:CYCLE  SPC:TOG  F1:HELP  F2:PICK  ^S/:w COMMIT  ESC/:q ABORT",
+            Style::default().fg(VAPOR_PURPLE),
         );
         Line::from(vec![prefix, help])
     };
@@ -931,6 +1024,9 @@ fn render(f: &mut Frame, m: &Model) {
 
     if m.gateway_modal_open {
         render_gateway_modal(f, m, area);
+    }
+    if m.ssh_modal_open {
+        render_ssh_modal(f, m, area);
     }
     if m.help_open {
         render_help_modal(f, m, area);
@@ -1017,10 +1113,11 @@ fn render_gateway_modal(f: &mut Frame, m: &Model, parent: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(AMBER_FOCUS))
+        .border_style(Style::default().fg(VAPOR_MAGENTA))
+        .style(Style::default().bg(DEEP_BLACK))
         .title(Span::styled(
             " GATEWAY TARGET ",
-            Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD),
+            Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::BOLD),
         ));
     f.render_widget(&block, area);
     let inner = block.inner(area);
@@ -1045,11 +1142,11 @@ fn render_gateway_modal(f: &mut Frame, m: &Model, parent: Rect) {
         let arrow = if highlighted { "▶ " } else { "  " };
         let line_text = format!(" {arrow}{sel_marker} {install_marker}  {label}  ({triple}) ");
         let style = if highlighted {
-            Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD)
+            Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::BOLD)
         } else if selected {
-            Style::default().fg(PHOSPHOR_BRIGHT)
+            Style::default().fg(VAPOR_CYAN)
         } else {
-            Style::default().fg(PHOSPHOR_MED)
+            Style::default().fg(VAPOR_PINK)
         };
         f.render_widget(Paragraph::new(Line::from(Span::styled(line_text, style))), rows[i]);
     }
@@ -1060,11 +1157,11 @@ fn render_gateway_modal(f: &mut Frame, m: &Model, parent: Rect) {
     let sel_marker = if selected { "[*]" } else { "   " };
     let arrow = if highlighted { "▶ " } else { "  " };
     let label_style_ = if highlighted {
-        Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD)
+        Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::BOLD)
     } else if selected {
-        Style::default().fg(PHOSPHOR_BRIGHT)
+        Style::default().fg(VAPOR_CYAN)
     } else {
-        Style::default().fg(PHOSPHOR_MED)
+        Style::default().fg(VAPOR_PINK)
     };
     let prefix = format!(" {arrow}{sel_marker}      Other...  ");
     let mut spans = vec![Span::styled(prefix, label_style_)];
@@ -1073,12 +1170,12 @@ fn render_gateway_modal(f: &mut Frame, m: &Model, parent: Rect) {
             spans.push(Span::styled("▏", cursor_style()));
             spans.push(Span::styled(
                 "type a custom triple",
-                Style::default().fg(DIM_GRAY),
+                Style::default().fg(VAPOR_LINE),
             ));
         } else {
             spans.push(Span::styled(
                 m.state.gateway_target.clone(),
-                Style::default().fg(PHOSPHOR_BRIGHT).add_modifier(Modifier::BOLD),
+                Style::default().fg(VAPOR_CYAN).add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled("▏", cursor_style()));
         }
@@ -1087,7 +1184,7 @@ fn render_gateway_modal(f: &mut Frame, m: &Model, parent: Rect) {
     {
         spans.push(Span::styled(
             m.state.gateway_target.clone(),
-            Style::default().fg(PHOSPHOR_MED),
+            Style::default().fg(VAPOR_PINK),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), rows[other_idx]);
@@ -1096,7 +1193,108 @@ fn render_gateway_modal(f: &mut Frame, m: &Model, parent: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(PHOSPHOR_DIM),
+            Style::default().fg(VAPOR_PURPLE),
+        ))),
+        rows[rows.len() - 1],
+    );
+}
+
+/// Render the SSH alias picker — same shape as the gateway modal but
+/// list of strings (no per-row install marker, no preset/triple split).
+fn render_ssh_modal(f: &mut Frame, m: &Model, parent: Rect) {
+    let aliases = m.ssh_aliases.as_deref().unwrap_or(&[]);
+    let other_idx = aliases.len();
+    let n_rows = aliases.len() + 1;
+    let w = parent.width.saturating_sub(8).min(60);
+    // 5 chrome lines + room for a (no aliases) note when empty.
+    let h = (n_rows as u16 + 5).min(parent.height.saturating_sub(4));
+    let area = centered(parent, w, h);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(VAPOR_MAGENTA))
+        .style(Style::default().bg(DEEP_BLACK))
+        .title(Span::styled(
+            " SSH HOST ",
+            Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(&block, area);
+    let inner = block.inner(area);
+
+    let mut constraints: Vec<Constraint> =
+        (0..n_rows).map(|_| Constraint::Length(1)).collect();
+    constraints.push(Constraint::Min(1));    // spacer
+    constraints.push(Constraint::Length(1)); // hint
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    for (i, name) in aliases.iter().enumerate() {
+        let highlighted = i == m.ssh_modal_idx;
+        let selected = name == &m.state.deploy_host;
+        let sel_marker = if selected { "[*]" } else { "   " };
+        let arrow = if highlighted { "▶ " } else { "  " };
+        let style = if highlighted {
+            Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::BOLD)
+        } else if selected {
+            Style::default().fg(VAPOR_CYAN)
+        } else {
+            Style::default().fg(VAPOR_PINK)
+        };
+        let line_text = format!(" {arrow}{sel_marker}  {name} ");
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(line_text, style))),
+            rows[i],
+        );
+    }
+
+    // Other... row — text input when highlighted; mirrors the
+    // gateway-modal behavior so users learn one pattern.
+    let highlighted = m.ssh_modal_idx == other_idx;
+    let arrow = if highlighted { "▶ " } else { "  " };
+    let label_style_ = if highlighted {
+        Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(VAPOR_PINK)
+    };
+    let prefix = format!(" {arrow}      Other...  ");
+    let mut spans = vec![Span::styled(prefix, label_style_)];
+    if highlighted {
+        if m.state.deploy_host.is_empty() {
+            spans.push(Span::styled("▏", cursor_style()));
+            spans.push(Span::styled(
+                "type a host or alias",
+                Style::default().fg(VAPOR_LINE),
+            ));
+        } else {
+            spans.push(Span::styled(
+                m.state.deploy_host.clone(),
+                Style::default().fg(VAPOR_CYAN).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled("▏", cursor_style()));
+        }
+    } else if !m.state.deploy_host.is_empty()
+        && !aliases.iter().any(|a| a == &m.state.deploy_host)
+    {
+        spans.push(Span::styled(
+            m.state.deploy_host.clone(),
+            Style::default().fg(VAPOR_PINK),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[other_idx]);
+
+    let hint = if aliases.is_empty() {
+        "↑/↓ MOVE  ENTER SELECT  ESC CANCEL    (no aliases found in ~/.ssh/config)"
+    } else {
+        "↑/↓ MOVE  ENTER SELECT  ESC CANCEL    [*]=current"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(VAPOR_PURPLE),
         ))),
         rows[rows.len() - 1],
     );
@@ -1117,10 +1315,11 @@ fn render_help_modal(f: &mut Frame, m: &Model, parent: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::default().fg(AMBER_FOCUS))
+        .border_style(Style::default().fg(VAPOR_MAGENTA))
+        .style(Style::default().bg(DEEP_BLACK))
         .title(Span::styled(
             format!(" ?  {} ", field_help_title(m.focus)),
-            Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD),
+            Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::BOLD),
         ));
     f.render_widget(&block, area);
     let inner = block.inner(area);
@@ -1132,7 +1331,7 @@ fn render_help_modal(f: &mut Frame, m: &Model, parent: Rect) {
     );
     f.render_widget(
         Paragraph::new(body)
-            .style(Style::default().fg(PHOSPHOR_BRIGHT))
+            .style(Style::default().fg(VAPOR_CYAN))
             .wrap(Wrap { trim: false }),
         inner,
     );
@@ -1288,26 +1487,26 @@ fn gateway_field(m: &Model) -> Paragraph<'_> {
 
 fn label_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD)
+        Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(PHOSPHOR_DIM)
+        Style::default().fg(VAPOR_PURPLE)
     }
 }
 
 fn value_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(PHOSPHOR_BRIGHT).add_modifier(Modifier::BOLD)
+        Style::default().fg(VAPOR_CYAN).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(PHOSPHOR_MED)
+        Style::default().fg(VAPOR_PINK)
     }
 }
 
 fn cursor_style() -> Style {
-    Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::SLOW_BLINK)
+    Style::default().fg(VAPOR_MAGENTA).add_modifier(Modifier::SLOW_BLINK)
 }
 
 fn disabled_style() -> Style {
-    Style::default().fg(DIM_GRAY)
+    Style::default().fg(VAPOR_LINE)
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
