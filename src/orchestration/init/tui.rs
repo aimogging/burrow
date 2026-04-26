@@ -100,7 +100,7 @@ enum Field {
     Gateway,
     DeployToggle,
     DeployHost,
-    WssToggle,
+    Transport,
     RelayHost,
     TlsChoice,
     CertPath,
@@ -122,7 +122,7 @@ const ALL_FIELDS: &[Field] = &[
     Field::Gateway,
     Field::DeployToggle,
     Field::DeployHost,
-    Field::WssToggle,
+    Field::Transport,
     Field::RelayHost,
     Field::TlsChoice,
     Field::CertPath,
@@ -216,9 +216,9 @@ impl Model {
     fn focusable(&self, f: Field) -> bool {
         match f {
             Field::DeployHost => self.state.deploy_enabled,
-            Field::RelayHost | Field::TlsChoice => self.state.wss_enabled,
+            Field::RelayHost | Field::TlsChoice => self.state.transport.is_wss(),
             Field::CertPath | Field::KeyPath => {
-                self.state.wss_enabled
+                self.state.transport.is_wss()
                     && self.state.tls_strategy == super::state::TlsChoice::Byo
             }
             Field::Subnet
@@ -337,10 +337,29 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
                 }
             }
         }
-        Field::WssToggle => {
-            if matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter) {
-                m.state.wss_enabled = !m.state.wss_enabled;
-                if m.state.wss_enabled && m.state.relay_host.is_empty() {
+        Field::Transport => {
+            // Cycle through TransportChoice::ALL.
+            use super::state::TransportChoice as T;
+            if matches!(
+                k.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Char(' ')
+                    | KeyCode::Enter
+            ) {
+                let cur = T::ALL.iter().position(|&t| t == m.state.transport).unwrap_or(0);
+                let dir = matches!(k.code, KeyCode::Left | KeyCode::Up);
+                let next = if dir {
+                    (cur + T::ALL.len() - 1) % T::ALL.len()
+                } else {
+                    (cur + 1) % T::ALL.len()
+                };
+                m.state.transport = T::ALL[next];
+                // Ergonomic: switching to WSS pre-fills relay_host
+                // from the endpoint host if we don't have one yet.
+                if m.state.transport.is_wss() && m.state.relay_host.is_empty() {
                     let host = endpoint_host(&m.state.endpoint);
                     if !host.is_empty() {
                         m.state.relay_host = format!("{host}:443");
@@ -526,10 +545,10 @@ fn render(f: &mut Frame, m: &Model) {
     f.render_widget(gateway_field(m), rows[i]); i += 1;
     f.render_widget(checkbox(m, Field::DeployToggle, "Deploy via SSH", m.state.deploy_enabled), rows[i]); i += 1;
     f.render_widget(sub_field(m, Field::DeployHost, "  SSH host         ", &m.state.deploy_host, m.state.deploy_enabled), rows[i]); i += 1;
-    f.render_widget(checkbox(m, Field::WssToggle, "WSS transport (only if egress UDP is blocked)", m.state.wss_enabled), rows[i]); i += 1;
-    f.render_widget(sub_field(m, Field::RelayHost, "  Relay host:port  ", &m.state.relay_host, m.state.wss_enabled), rows[i]); i += 1;
+    f.render_widget(transport_field(m), rows[i]); i += 1;
+    f.render_widget(sub_field(m, Field::RelayHost, "  Relay host:port  ", &m.state.relay_host, m.state.transport.is_wss()), rows[i]); i += 1;
     f.render_widget(tls_field(m), rows[i]); i += 1;
-    let byo = m.state.wss_enabled && m.state.tls_strategy == super::state::TlsChoice::Byo;
+    let byo = m.state.transport.is_wss() && m.state.tls_strategy == super::state::TlsChoice::Byo;
     f.render_widget(
         sub_field(m, Field::CertPath, "  Cert PEM path    ", &m.state.cert_path, byo),
         rows[i],
@@ -595,9 +614,17 @@ fn constraints_len(m: &Model) -> usize {
     11 + (if m.advanced_expanded { ADVANCED_FIELDS.len() } else { 0 }) + 3
 }
 
+fn transport_field(m: &Model) -> Paragraph<'_> {
+    let focused = m.focus == Field::Transport;
+    Paragraph::new(Line::from(vec![
+        Span::styled("Transport          ", label_style(focused)),
+        Span::styled(format!("[ {} ]", m.state.transport.label()), value_style(focused)),
+    ]))
+}
+
 fn tls_field(m: &Model) -> Paragraph<'_> {
     let focused = m.focus == Field::TlsChoice;
-    let enabled = m.state.wss_enabled;
+    let enabled = m.state.transport.is_wss();
     let label_style_ = if !enabled {
         Style::default().fg(Color::DarkGray)
     } else {

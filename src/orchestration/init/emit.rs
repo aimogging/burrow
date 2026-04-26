@@ -66,7 +66,7 @@ pub fn format_spec(state: &FormState) -> String {
     // [transport]
     let _ = writeln!(out);
     let _ = writeln!(out, "[transport]");
-    if state.wss_enabled {
+    if state.transport.is_wss() {
         let _ = writeln!(out, "mode       = \"wss\"");
         let _ = writeln!(out, "relay_host = {}", quote(&state.relay_host));
         // tls = "self-signed" is the default; emit only when overridden.
@@ -153,7 +153,7 @@ mod tests {
             gateway_target: "x86_64-unknown-linux-gnu".into(),
             deploy_enabled: false,
             deploy_host: String::new(),
-            wss_enabled: false,
+            transport: super::super::state::TransportChoice::Udp,
             relay_host: String::new(),
             tls_strategy: super::super::state::TlsChoice::SelfSigned,
             cert_path: String::new(),
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn wss_no_deploy_round_trips() {
         let mut s = base();
-        s.wss_enabled = true;
+        s.transport = super::super::state::TransportChoice::Wss;
         s.relay_host = "vpn.example.com:443".into();
         let body = format_spec(&s);
         let parsed = Spec::parse_str(&body).unwrap();
@@ -209,7 +209,7 @@ mod tests {
         let mut s = base();
         s.deploy_enabled = true;
         s.deploy_host = "vpn.example.com".into();
-        s.wss_enabled = true;
+        s.transport = super::super::state::TransportChoice::Wss;
         s.relay_host = "vpn.example.com:443".into();
         s.routes = "192.168.1.0/24, 10.50.0.0/24".into();
         let body = format_spec(&s);

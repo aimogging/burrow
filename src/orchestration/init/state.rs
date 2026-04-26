@@ -12,6 +12,44 @@
 
 use anyhow::{bail, Result};
 
+/// Transport mode in the wizard. Mirrors `crate::spec::TransportMode`
+/// but lives in the wizard layer so we can add UI hints without
+/// touching the spec schema. Add new variants here as new transports
+/// land in the spec; everything that conditions on "is WSS" goes
+/// through `is_wss()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportChoice {
+    #[default]
+    Udp,
+    Wss,
+}
+
+impl TransportChoice {
+    pub const ALL: &'static [TransportChoice] = &[
+        TransportChoice::Udp,
+        TransportChoice::Wss,
+    ];
+
+    pub fn from_cli(s: &str) -> Result<Self> {
+        match s {
+            "udp" => Ok(Self::Udp),
+            "wss" => Ok(Self::Wss),
+            other => bail!("--transport must be `udp` or `wss` (got `{other}`)"),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Udp => "UDP (native)",
+            Self::Wss => "WSS (HTTPS WebSocket — when egress UDP is blocked)",
+        }
+    }
+
+    pub fn is_wss(self) -> bool {
+        matches!(self, Self::Wss)
+    }
+}
+
 /// Mirror of `crate::spec::TlsStrategy` carried in FormState.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsChoice {
@@ -54,7 +92,7 @@ pub struct FormState {
     pub gateway_target: String,
     pub deploy_enabled: bool,
     pub deploy_host: String,
-    pub wss_enabled: bool,
+    pub transport: TransportChoice,
     pub relay_host: String,
     pub tls_strategy: TlsChoice,
     pub cert_path: String,
@@ -84,7 +122,7 @@ impl FormState {
             gateway_target: detect_host_triple().to_string(),
             deploy_enabled: true,
             deploy_host: String::new(),
-            wss_enabled: false,
+            transport: TransportChoice::Udp,
             relay_host: String::new(),
             tls_strategy: TlsChoice::SelfSigned,
             cert_path: String::new(),
@@ -106,7 +144,10 @@ impl FormState {
     /// only when they differ from the spec-side defaults so the user
     /// doesn't see Some everywhere.
     pub fn from_spec(spec: &crate::spec::Spec) -> Self {
-        let wss = spec.transport.mode == crate::spec::TransportMode::Wss;
+        let transport = match spec.transport.mode {
+            crate::spec::TransportMode::Udp => TransportChoice::Udp,
+            crate::spec::TransportMode::Wss => TransportChoice::Wss,
+        };
         let some_if = |v: String, default: &str| if v == default { None } else { Some(v) };
         let some_u16 = |v: u16, default: u16| if v == default { None } else { Some(v.to_string()) };
         Self {
@@ -118,7 +159,7 @@ impl FormState {
                 .as_ref()
                 .map(|d| d.server.host.clone())
                 .unwrap_or_default(),
-            wss_enabled: wss,
+            transport,
             relay_host: spec.transport.relay_host.clone().unwrap_or_default(),
             tls_strategy: match spec.transport.tls {
                 crate::spec::TlsStrategy::SelfSigned => TlsChoice::SelfSigned,
@@ -176,9 +217,12 @@ impl FormState {
             }
         };
 
-        let wss_enabled = matches!(args.transport.as_deref(), Some("wss"));
+        let transport = match &args.transport {
+            Some(s) => TransportChoice::from_cli(s)?,
+            None => TransportChoice::Udp,
+        };
         let relay_host = args.relay_host.clone().unwrap_or_else(|| {
-            if wss_enabled {
+            if transport.is_wss() {
                 // Default to endpoint host + :443.
                 let host = endpoint.split(':').next().unwrap_or("");
                 if host.is_empty() {
@@ -204,7 +248,7 @@ impl FormState {
             gateway_target,
             deploy_enabled,
             deploy_host,
-            wss_enabled,
+            transport,
             relay_host,
             tls_strategy,
             cert_path,
@@ -236,10 +280,10 @@ impl FormState {
         if self.deploy_enabled && self.deploy_host.trim().is_empty() {
             return Err("deploy-host".into());
         }
-        if self.wss_enabled && self.relay_host.trim().is_empty() {
+        if self.transport.is_wss() && self.relay_host.trim().is_empty() {
             return Err("relay-host".into());
         }
-        if self.wss_enabled && self.tls_strategy == TlsChoice::Byo {
+        if self.transport.is_wss() && self.tls_strategy == TlsChoice::Byo {
             if self.cert_path.trim().is_empty() {
                 return Err("cert-path".into());
             }
