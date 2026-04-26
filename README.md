@@ -86,13 +86,23 @@ Both recipes embed `burrow.conf` into the gateway binary — no
 Output set:
 
 ```
-target/min/burrow(.exe)         gateway, config embedded
-target/min/burrow-client(.exe)  companion CLI
-target/min/burrow-relay         only with gen-embed-wss; cert/key/token embedded
-burrow-configs/server.conf      kernel WG server config (wg-quick)
-burrow-configs/burrow.conf      same content that's embedded — keep around for reference
-burrow-configs/client1.conf     wg-quick config for the client peer
+target/min/burrow(.exe)             gateway, config embedded
+target/min/burrow-client(.exe)      companion CLI
+target/min/burrow-relay(.exe)       only with gen-embed-wss; cert/key/token embedded
+burrow-configs/server.conf          kernel WG server config (wg-quick)
+burrow-configs/burrow.conf          same content that's embedded — keep for reference
+burrow-configs/client1.conf         wg-quick config for the client peer
+burrow-configs/relay-bundle/        WSS only — collected deploy package:
+    burrow(.exe)                    copy of target/min/burrow
+    burrow-relay(.exe)              copy of target/min/burrow-relay
+    burrow-client(.exe)             copy of target/min/burrow-client
+    cert.pem / key.pem / token.txt  build inputs (already baked into burrow-relay)
+    listen.txt / forward.txt        build inputs (defaults baked in)
 ```
+
+`burrow-configs/relay-bundle/` is the "ship this directory" view —
+binaries plus their build-time materials in one place. `target/min/`
+remains the canonical build output (cargo's territory).
 
 Ship the binaries to the boxes that need them and run with no args:
 

@@ -136,6 +136,18 @@ embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
         cargo build --bin burrow-relay --profile min --features embedded-relay-bundle,silent $target_flag
     RUSTFLAGS="$remap" \
         cargo build --bin burrow-client --profile min --features silent $target_flag
+    # Collect the deploy artifacts into the bundle dir so the whole
+    # ship-this set is in one place. Match unix and .exe forms so
+    # cross-builds (e.g. --target x86_64-pc-windows-gnu from a unix
+    # host) land correctly.
+    if [ -n "{{TARGET}}" ]; then bin_dir="target/{{TARGET}}/min"; else bin_dir="target/min"; fi
+    for bin in burrow burrow-relay burrow-client; do
+        for variant in "$bin" "$bin.exe"; do
+            if [ -f "$bin_dir/$variant" ]; then
+                cp -f "$bin_dir/$variant" "$bundle/$variant"
+            fi
+        done
+    done
 
 [windows]
 embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
@@ -162,7 +174,14 @@ embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
     $env:BURROW_RELAY_EMBED_FORWARD = (Get-Content "$bundle\forward.txt" -Raw).Trim(); \
     cargo build --bin burrow-relay --profile min --features embedded-relay-bundle,silent @t; \
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
-    cargo build --bin burrow-client --profile min --features silent @t
+    cargo build --bin burrow-client --profile min --features silent @t; \
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
+    $binDir = if ('{{TARGET}}' -eq '') { 'target\min' } else { "target\{{TARGET}}\min" }; \
+    foreach ($bin in 'burrow','burrow-relay','burrow-client') { \
+        foreach ($variant in $bin, "$bin.exe") { \
+            if (Test-Path "$binDir\$variant") { Copy-Item -Force "$binDir\$variant" "$bundle\$variant" } \
+        } \
+    }
 
 # Generate the WSS deployment package + build the paired binaries.
 # Pass through the same gen args (--endpoint, --routes, --dns, ...) plus
