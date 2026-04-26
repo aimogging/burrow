@@ -127,6 +127,37 @@ if [ -d "$RELAY_BUNDLE_DIR" ]; then
     fi
 fi
 
+# If the relay needs to ship, scp the binary now so REMOTE_SCRIPT can
+# install it from /tmp in the same ssh round-trip as the WG bring-up.
+RELAY_REMOTE_SRC=""
+if [ "$DEPLOY_RELAY" = 1 ]; then
+    if is_local; then
+        # In LOCAL mode, just point at the local file; REMOTE_SCRIPT
+        # runs under sudo in this same shell so the path is fine.
+        RELAY_REMOTE_SRC="$(realpath "$RELAY_BIN")"
+    else
+        "${SCP[@]}" "$RELAY_BIN" "${TARGET}:/tmp/burrow-relay-new" >/dev/null
+        RELAY_REMOTE_SRC="/tmp/burrow-relay-new"
+    fi
+fi
+
+# Build the relay sub-script conditionally and splice it into the
+# main remote script. setsid -f guarantees ssh returns immediately;
+# nohup + disown turned out to be fragile across the
+# bash -c -> sudo -> ssh chain (sudo waits for inherited fds).
+RELAY_SETUP=""
+if [ "$DEPLOY_RELAY" = 1 ]; then
+    RELAY_SETUP=$(cat <<RELAY_EOS
+pkill -f /usr/local/bin/burrow-relay 2>/dev/null || true
+sleep 0.3
+install -m 0755 ${RELAY_REMOTE_SRC} /usr/local/bin/burrow-relay
+rm -f /tmp/burrow-relay-new
+setsid -f /usr/local/bin/burrow-relay >/var/log/burrow-relay.log 2>&1 </dev/null
+echo "burrow-relay started (PID via pgrep: \$(pgrep -f /usr/local/bin/burrow-relay | tr '\n' ' '))"
+RELAY_EOS
+)
+fi
+
 REMOTE_SCRIPT=$(cat <<EOS
 set -e
 
@@ -168,29 +199,15 @@ ip netns exec ${NAMESPACE} ip link set ${NAMESPACE} up
 echo
 echo "WG server up in netns ${NAMESPACE}:"
 ip netns exec ${NAMESPACE} wg show
+
+${RELAY_SETUP}
 EOS
 )
 
 exec_as_root_script <<< "$REMOTE_SCRIPT"
 
-# Deploy burrow-relay alongside kernel WG when the configs include a
-# relay-bundle. Replaces any prior instance (best-effort kill) and
-# starts the new one in the background; the binary itself contains
-# the cert/key/token, so no other state needs to land on the remote.
 RELAY_LINE=""
 if [ "$DEPLOY_RELAY" = 1 ]; then
-    if is_local; then
-        sudo install -m 0755 "$RELAY_BIN" /usr/local/bin/burrow-relay
-    else
-        "${SCP[@]}" "$RELAY_BIN" "${TARGET}:/tmp/burrow-relay-new" >/dev/null
-        "${SSH[@]}" "$TARGET" "sudo install -m 0755 /tmp/burrow-relay-new /usr/local/bin/burrow-relay && rm -f /tmp/burrow-relay-new"
-    fi
-    exec_as_root_oneliner '
-        pkill -f /usr/local/bin/burrow-relay 2>/dev/null || true
-        sleep 0.3
-        nohup /usr/local/bin/burrow-relay >/var/log/burrow-relay.log 2>&1 </dev/null &
-        disown $! 2>/dev/null || true
-    '
     RELAY_LINE="
   burrow-relay running in background; logs:
   $(if is_local; then echo "tail -f /var/log/burrow-relay.log"; \
