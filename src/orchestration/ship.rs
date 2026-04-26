@@ -178,7 +178,8 @@ fn build_server_script(ns: &str, remote_conf: &str, install_relay: bool) -> Stri
     let mut s = String::new();
     s.push_str("set -e\n");
     s.push_str(WG_INSTALL_BLOCK);
-    s.push_str(&netns_setup_block(ns, remote_conf, &[], /* enable_forward = */ true));
+    s.push_str(&netns_setup_block(ns, remote_conf, /* enable_forward = */ true));
+    s.push_str(&routes_from_allowed_ips_block(ns, remote_conf));
     s.push_str(&format!(
         "echo\necho \"WG server up in netns {ns}:\"\nip netns exec {ns} wg show\n"
     ));
@@ -192,20 +193,9 @@ fn build_client_script(ns: &str, conf_path: &str) -> String {
     let mut s = String::new();
     s.push_str("set -e\n");
     s.push_str(WG_INSTALL_BLOCK);
-    // Client-side: also install routes for AllowedIPs (excluding
-    // 0.0.0.0/0 and IPv6) — that's how kernel WG-as-wg-quick learns
-    // which destinations to send through the tunnel.
-    s.push_str(&netns_setup_block(ns, conf_path, &[], /* enable_forward = */ false));
+    s.push_str(&netns_setup_block(ns, conf_path, /* enable_forward = */ false));
+    s.push_str(&routes_from_allowed_ips_block(ns, conf_path));
     s.push_str(&format!(r#"
-allowed=$(awk -F'= *' '/^AllowedIPs[[:space:]]*=/{{gsub(/[, ]+/, " ", $2); print $2}}' {conf_path})
-for cidr in $allowed; do
-    case "$cidr" in
-        *:*) continue;;
-        0.0.0.0/0) continue;;
-    esac
-    ip netns exec {ns} ip route replace "$cidr" dev {ns}
-done
-
 echo
 echo "WG client up in netns {ns}:"
 ip netns exec {ns} wg show
@@ -214,6 +204,26 @@ echo "routes in netns:"
 ip netns exec {ns} ip route
 "#));
     s
+}
+
+/// Walk every `[Peer] AllowedIPs` line in `conf_path` and install a
+/// route inside the netns for each CIDR — kernel WG by itself only
+/// uses AllowedIPs to filter packets *from* peers; routing packets
+/// *to* the right peer is the kernel routing table's job, and
+/// `wg setconf` (unlike `wg-quick up`) doesn't add those routes for
+/// you. Skip 0.0.0.0/0 (would steal the netns default route) and any
+/// IPv6 entries.
+fn routes_from_allowed_ips_block(ns: &str, conf_path: &str) -> String {
+    format!(r#"
+allowed=$(awk -F'= *' '/^AllowedIPs[[:space:]]*=/{{gsub(/[, ]+/, " ", $2); print $2}}' {conf_path})
+for cidr in $allowed; do
+    case "$cidr" in
+        *:*) continue;;
+        0.0.0.0/0) continue;;
+    esac
+    ip netns exec {ns} ip route replace "$cidr" dev {ns} 2>/dev/null || true
+done
+"#)
 }
 
 fn build_teardown_script(ns: &str, kill_relay: bool) -> String {
@@ -249,7 +259,7 @@ fi
 /// then moved into the named netns. `wg-quick strip` filters out the
 /// wg-quick-only keys (Address, DNS, ...) so `wg setconf` doesn't
 /// gag.
-fn netns_setup_block(ns: &str, conf_path: &str, _routes: &[&str], enable_forward: bool) -> String {
+fn netns_setup_block(ns: &str, conf_path: &str, enable_forward: bool) -> String {
     let fwd = if enable_forward {
         format!("ip netns exec {ns} sysctl -wq net.ipv4.ip_forward=1\n\
                  ip netns exec {ns} iptables -A FORWARD -i {ns} -j ACCEPT 2>/dev/null || true\n\
