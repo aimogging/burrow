@@ -106,6 +106,12 @@ gen-embed *GEN_ARGS:
 embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
     #!/usr/bin/env bash
     set -eu
+    if [ ! -f "{{BUNDLE_DIR}}/cert.pem" ] || [ ! -f "{{BUNDLE_DIR}}/key.pem" ] || [ ! -f "{{BUNDLE_DIR}}/token.txt" ]; then
+        echo "embed-wss-pair: {{BUNDLE_DIR}} is missing cert.pem / key.pem / token.txt." >&2
+        echo "  Run \`burrow-client gen --relay HOST[:PORT] ...\` first, or use" >&2
+        echo "  \`just gen-embed-wss --relay HOST[:PORT] ...\` to do both in one shot." >&2
+        exit 2
+    fi
     cargo_home="${CARGO_HOME:-$HOME/.cargo}"
     rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
     repo="$(pwd)"
@@ -133,6 +139,10 @@ embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
 
 [windows]
 embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
+    if (-not ((Test-Path '{{BUNDLE_DIR}}\cert.pem') -and (Test-Path '{{BUNDLE_DIR}}\key.pem') -and (Test-Path '{{BUNDLE_DIR}}\token.txt'))) { \
+        Write-Error "embed-wss-pair: {{BUNDLE_DIR}} is missing cert.pem / key.pem / token.txt. Run ``burrow-client gen --relay HOST[:PORT] ...`` first, or use ``just gen-embed-wss --relay HOST[:PORT] ...`` to do both in one shot."; \
+        exit 2 \
+    }; \
     $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { "$env:USERPROFILE\.cargo" }; \
     $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { "$env:USERPROFILE\.rustup" }; \
     $repo = (Get-Location).Path; \
@@ -158,10 +168,29 @@ embed-wss-pair CONFIG BUNDLE_DIR TARGET=target:
 # Pass through the same gen args (--endpoint, --routes, --dns, ...) plus
 # --relay HOST[:PORT]. End result: target/min/{burrow,burrow-relay}
 # both runnable with no CLI args, plus server.conf + clientN.conf for
-# the kernel-WG side.
+# the kernel-WG side. --relay is required (use `just gen-embed` for the
+# UDP-only path); failing fast here saves a doomed cargo invocation.
+[unix]
 gen-embed-wss *GEN_ARGS:
+    #!/usr/bin/env bash
+    set -eu
+    if ! printf ' %s ' {{GEN_ARGS}} | grep -q -- ' --relay '; then
+        echo "gen-embed-wss requires --relay HOST[:PORT] in the gen args." >&2
+        echo "  (Use 'just gen-embed' for the UDP-only path.)" >&2
+        exit 2
+    fi
     cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs
-    @just embed-wss-pair ./burrow-configs/burrow.conf ./burrow-configs/relay-bundle {{target}}
+    just embed-wss-pair ./burrow-configs/burrow.conf ./burrow-configs/relay-bundle {{target}}
+
+[windows]
+gen-embed-wss *GEN_ARGS:
+    if ('{{GEN_ARGS}}' -notmatch '(^|\s)--relay(\s|$)') { \
+        Write-Error "gen-embed-wss requires --relay HOST[:PORT] in the gen args. (Use 'just gen-embed' for the UDP-only path.)"; \
+        exit 2 \
+    }; \
+    cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs; \
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; \
+    just embed-wss-pair ./burrow-configs/burrow.conf ./burrow-configs/relay-bundle {{target}}
 
 # Passthrough to `burrow-client gen`. Same args as the binary's gen subcommand.
 gen *ARGS:
