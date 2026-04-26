@@ -213,15 +213,20 @@ ip netns exec {ns} ip route
 /// uses AllowedIPs to filter packets *from* peers; routing packets
 /// *to* the right peer is the kernel routing table's job, and
 /// `wg setconf` (unlike `wg-quick up`) doesn't add those routes for
-/// you. Skip 0.0.0.0/0 (would steal the netns default route) and any
-/// IPv6 entries.
+/// you. Skip IPv6 entries (we're IPv4-only for now).
+///
+/// 0.0.0.0/0 is fine to install as the netns default: the netns has
+/// no existing default to clobber, and the WG socket lives in the
+/// *host* netns (the interface is created in host netns before
+/// `ip link set {ns} netns {ns}`), so encapsulated UDP egress doesn't
+/// recurse through the netns's routing table — none of the usual
+/// fwmark / policy-route gymnastics required.
 fn routes_from_allowed_ips_block(ns: &str, conf_path: &str) -> String {
     format!(r#"
 allowed=$(awk -F'= *' '/^AllowedIPs[[:space:]]*=/{{gsub(/[, ]+/, " ", $2); print $2}}' {conf_path})
 for cidr in $allowed; do
     case "$cidr" in
         *:*) continue;;
-        0.0.0.0/0) continue;;
     esac
     ip netns exec {ns} ip route replace "$cidr" dev {ns} 2>/dev/null || true
 done
