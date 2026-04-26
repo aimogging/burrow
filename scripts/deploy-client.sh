@@ -90,7 +90,9 @@ ip netns exec ${NAMESPACE} ip link set lo up
 # public IP from there), then moved into the target netns.
 ip link add ${NAMESPACE} type wireguard
 ip link set ${NAMESPACE} netns ${NAMESPACE}
-ip netns exec ${NAMESPACE} wg setconf ${NAMESPACE} ${CONF_PATH}
+# wg setconf only knows the kernel-WG keys; strip wg-quick-only ones
+# (Address, DNS, MTU, PreUp/PostUp, ...) so the parse doesn't blow up.
+ip netns exec ${NAMESPACE} wg setconf ${NAMESPACE} <(wg-quick strip ${CONF_PATH})
 
 addrs=\$(awk -F'= *' '/^Address[[:space:]]*=/{gsub(/[, ]+/, " ", \$2); print \$2; exit}' ${CONF_PATH})
 for a in \$addrs; do

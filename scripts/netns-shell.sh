@@ -35,6 +35,23 @@ while [ $# -gt 0 ]; do
     fi
 done
 
+# Pre-flight check: is the namespace actually there? `ip netns exec`'s
+# default error ("Cannot open network namespace") doesn't hint at how
+# to fix it.
+ns_exists() {
+    if is_local; then
+        sudo ip netns list | awk '{print $1}' | grep -qx "$1"
+    else
+        build_ssh_cmds
+        "${SSH[@]}" "$TARGET" "sudo ip netns list | awk '{print \$1}' | grep -qx '$1'"
+    fi
+}
+if ! ns_exists "$NAMESPACE"; then
+    echo "netns-shell: namespace '${NAMESPACE}' does not exist on $(target_label)." >&2
+    echo "  Run \`just deploy-client${TARGET:+ --target ${TARGET}}\` first to create it." >&2
+    exit 1
+fi
+
 if is_local; then
     sudo ip netns exec "$NAMESPACE" bash
 else
