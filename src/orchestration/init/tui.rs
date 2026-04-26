@@ -30,8 +30,20 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
+
+// -----------------------------------------------------------------------------
+// Palette — Phosphor Green CRT aesthetic with amber focus accent. ratatui
+// degrades 24-bit colors gracefully on terminals that don't support them
+// (256-color or 16-color fallback), so explicit RGB is safe.
+// -----------------------------------------------------------------------------
+const PHOSPHOR_BRIGHT: Color = Color::Rgb(0x00, 0xff, 0x00);
+const PHOSPHOR_MED:    Color = Color::Rgb(0x00, 0xcc, 0x00);
+const PHOSPHOR_DIM:    Color = Color::Rgb(0x00, 0x99, 0x00);
+const AMBER_FOCUS:     Color = Color::Rgb(0xff, 0xb0, 0x00);
+const RED_ERR:         Color = Color::Rgb(0xff, 0x44, 0x44);
+const DIM_GRAY:        Color = Color::Rgb(0x55, 0x55, 0x55);
 
 use super::state::{detect_host_triple, FormState};
 
@@ -509,7 +521,12 @@ fn render(f: &mut Frame, m: &Model) {
     let area = centered(f.area(), 80, height);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" burrowctl init ");
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(PHOSPHOR_MED))
+        .title(Span::styled(
+            " BURROWCTL :: INIT ",
+            Style::default().fg(PHOSPHOR_BRIGHT).add_modifier(Modifier::BOLD),
+        ));
     f.render_widget(&block, area);
     let inner = block.inner(area);
 
@@ -541,24 +558,24 @@ fn render(f: &mut Frame, m: &Model) {
         .split(inner);
 
     let mut i = 0;
-    f.render_widget(text_field(m, Field::Endpoint, "WireGuard endpoint", &m.state.endpoint), rows[i]); i += 1;
+    f.render_widget(text_field(m, Field::Endpoint, "WG_ENDPOINT       ", &m.state.endpoint), rows[i]); i += 1;
     f.render_widget(gateway_field(m), rows[i]); i += 1;
-    f.render_widget(checkbox(m, Field::DeployToggle, "Deploy via SSH", m.state.deploy_enabled), rows[i]); i += 1;
-    f.render_widget(sub_field(m, Field::DeployHost, "  SSH host         ", &m.state.deploy_host, m.state.deploy_enabled), rows[i]); i += 1;
+    f.render_widget(checkbox(m, Field::DeployToggle, "DEPLOY_VIA_SSH", m.state.deploy_enabled), rows[i]); i += 1;
+    f.render_widget(sub_field(m, Field::DeployHost, "  SSH_HOST         ", &m.state.deploy_host, m.state.deploy_enabled), rows[i]); i += 1;
     f.render_widget(transport_field(m), rows[i]); i += 1;
-    f.render_widget(sub_field(m, Field::RelayHost, "  Relay host:port  ", &m.state.relay_host, m.state.transport.is_wss()), rows[i]); i += 1;
+    f.render_widget(sub_field(m, Field::RelayHost, "  RELAY_HOSTPORT   ", &m.state.relay_host, m.state.transport.is_wss()), rows[i]); i += 1;
     f.render_widget(tls_field(m), rows[i]); i += 1;
     let byo = m.state.transport.is_wss() && m.state.tls_strategy == super::state::TlsChoice::Byo;
     f.render_widget(
-        sub_field(m, Field::CertPath, "  Cert PEM path    ", &m.state.cert_path, byo),
+        sub_field(m, Field::CertPath, "  CERT_PEM_PATH    ", &m.state.cert_path, byo),
         rows[i],
     ); i += 1;
     f.render_widget(
-        sub_field(m, Field::KeyPath,  "  Key PEM path     ", &m.state.key_path, byo),
+        sub_field(m, Field::KeyPath,  "  KEY_PEM_PATH     ", &m.state.key_path, byo),
         rows[i],
     ); i += 1;
-    f.render_widget(text_field(m, Field::Routes, "Routes (comma-separated CIDRs, optional)", &m.state.routes), rows[i]); i += 1;
-    f.render_widget(checkbox(m, Field::AdvancedToggle, "Advanced (subnet, namespaces, cross-targets, ...)", m.advanced_expanded), rows[i]); i += 1;
+    f.render_widget(text_field(m, Field::Routes, "ROUTES_CIDR       ", &m.state.routes), rows[i]); i += 1;
+    f.render_widget(checkbox(m, Field::AdvancedToggle, "ADVANCED (subnet, namespaces, cross-targets, ...)", m.advanced_expanded), rows[i]); i += 1;
 
     if m.advanced_expanded {
         for &(field, label, default) in ADVANCED_FIELD_META {
@@ -581,33 +598,43 @@ fn render(f: &mut Frame, m: &Model) {
     let err_line = m
         .error
         .as_deref()
-        .map(|e| Line::from(Span::styled(format!("error: {e}"), Style::default().fg(Color::Red))))
+        .map(|e| {
+            Line::from(Span::styled(
+                format!("[ERR] {e}"),
+                Style::default().fg(RED_ERR).add_modifier(Modifier::BOLD),
+            ))
+        })
         .unwrap_or_else(|| Line::from(""));
     f.render_widget(Paragraph::new(err_line), rows[constraints_len(m) - 2]);
 
     let bottom = if let Some(buf) = &m.cmd_buffer {
         Line::from(Span::styled(
             format!(":{buf}_"),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD),
         ))
     } else {
-        Line::from(Span::styled(
-            "Tab/Shift-Tab move • Space toggle • Ctrl-S or :w save • Esc or :q cancel",
-            Style::default().fg(Color::DarkGray),
-        ))
+        let prefix = Span::styled(
+            "[SYS] READY  ",
+            Style::default().fg(PHOSPHOR_BRIGHT).add_modifier(Modifier::BOLD),
+        );
+        let help = Span::styled(
+            "TAB:NAV  SPC:TOG  ^S/:w COMMIT  ESC/:q ABORT",
+            Style::default().fg(PHOSPHOR_DIM),
+        );
+        Line::from(vec![prefix, help])
     };
     f.render_widget(Paragraph::new(bottom), rows[constraints_len(m) - 1]);
 }
 
 const ADVANCED_FIELD_META: &[(Field, &str, &str)] = &[
-    (Field::Subnet,       "  Subnet              ", "10.0.0.0/24"),
-    (Field::Clients,      "  Clients             ", "1"),
-    (Field::ListenPort,   "  WG listen port      ", "51820"),
-    (Field::Dns,          "  DNS (csv)           ", "(empty)"),
-    (Field::ServerNs,     "  Server netns name   ", "burrow"),
-    (Field::ClientNs,     "  Client netns name   ", "burrow"),
-    (Field::RelayTarget,  "  Relay target triple ", "x86_64-unknown-linux-gnu"),
-    (Field::ClientTarget, "  Client target triple", "x86_64-unknown-linux-gnu"),
+    (Field::Subnet,       "  SUBNET              ", "10.0.0.0/24"),
+    (Field::Clients,      "  CLIENTS             ", "1"),
+    (Field::ListenPort,   "  WG_LISTEN_PORT      ", "51820"),
+    (Field::Dns,          "  DNS_CSV             ", "(empty)"),
+    (Field::ServerNs,     "  SRV_NETNS           ", "burrow"),
+    (Field::ClientNs,     "  CLIENT_NETNS        ", "burrow"),
+    (Field::RelayTarget,  "  RELAY_TARGET        ", "x86_64-unknown-linux-gnu"),
+    (Field::ClientTarget, "  CLIENT_TARGET       ", "x86_64-unknown-linux-gnu"),
 ];
 
 fn constraints_len(m: &Model) -> usize {
@@ -617,7 +644,7 @@ fn constraints_len(m: &Model) -> usize {
 fn transport_field(m: &Model) -> Paragraph<'_> {
     let focused = m.focus == Field::Transport;
     Paragraph::new(Line::from(vec![
-        Span::styled("Transport          ", label_style(focused)),
+        Span::styled("TRANSPORT         ", label_style(focused)),
         Span::styled(format!("[ {} ]", m.state.transport.label()), value_style(focused)),
     ]))
 }
@@ -625,15 +652,10 @@ fn transport_field(m: &Model) -> Paragraph<'_> {
 fn tls_field(m: &Model) -> Paragraph<'_> {
     let focused = m.focus == Field::TlsChoice;
     let enabled = m.state.transport.is_wss();
-    let label_style_ = if !enabled {
-        Style::default().fg(Color::DarkGray)
+    let (label_style_, value_style_) = if enabled {
+        (label_style(focused), value_style(focused))
     } else {
-        label_style(focused)
-    };
-    let value_style_ = if !enabled {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        value_style(focused)
+        (disabled_style(), disabled_style())
     };
     Paragraph::new(Line::from(vec![
         Span::styled("  TLS              ", label_style_),
@@ -647,7 +669,7 @@ fn adv_field<'a>(m: &Model, field: Field, label: &'a str, value: Option<&'a str>
         Some(v) => (v.to_string(), value_style(focused)),
         None => (
             format!("{default}  (default)"),
-            Style::default().fg(Color::DarkGray),
+            disabled_style(),
         ),
     };
     let cursor = if focused { Span::styled("▏", cursor_style()) } else { Span::raw("") };
@@ -660,7 +682,7 @@ fn adv_field<'a>(m: &Model, field: Field, label: &'a str, value: Option<&'a str>
 
 fn text_field<'a>(m: &Model, f: Field, label: &'a str, value: &'a str) -> Paragraph<'a> {
     let focused = m.focus == f;
-    let label_span = Span::styled(format!("{label}: "), label_style(focused));
+    let label_span = Span::styled(label.to_string(), label_style(focused));
     let value_span = Span::styled(value.to_string(), value_style(focused));
     let cursor = if focused { Span::styled("▏", cursor_style()) } else { Span::raw("") };
     Paragraph::new(Line::from(vec![label_span, value_span, cursor]))
@@ -700,29 +722,33 @@ fn gateway_field(m: &Model) -> Paragraph<'_> {
         format!("Other (custom): {}", m.state.gateway_target)
     };
     Paragraph::new(Line::from(vec![
-        Span::styled("Gateway runs on: ", label_style(focused)),
+        Span::styled("GW_TARGET         ", label_style(focused)),
         Span::styled(preset_label, value_style(focused)),
     ]))
 }
 
 fn label_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
+        Style::default().fg(PHOSPHOR_DIM)
     }
 }
 
 fn value_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default().fg(PHOSPHOR_BRIGHT).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(PHOSPHOR_MED)
     }
 }
 
 fn cursor_style() -> Style {
-    Style::default().fg(Color::Yellow).add_modifier(Modifier::SLOW_BLINK)
+    Style::default().fg(AMBER_FOCUS).add_modifier(Modifier::SLOW_BLINK)
+}
+
+fn disabled_style() -> Style {
+    Style::default().fg(DIM_GRAY)
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
