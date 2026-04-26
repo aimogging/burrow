@@ -153,7 +153,11 @@ ip netns exec ${NAMESPACE} ip link set lo up
 # the target netns. Standard pattern from wireguard.com/netns.
 ip link add ${NAMESPACE} type wireguard
 ip link set ${NAMESPACE} netns ${NAMESPACE}
-ip netns exec ${NAMESPACE} wg setconf ${NAMESPACE} ${CONF_PATH}
+# wg setconf only knows the kernel-WG keys (PrivateKey, ListenPort,
+# PublicKey, Endpoint, AllowedIPs, PresharedKey, PersistentKeepalive).
+# Address / DNS / PreUp / PostUp etc. are wg-quick concepts — pipe
+# through wg-quick strip so they don't blow up the parse.
+ip netns exec ${NAMESPACE} wg setconf ${NAMESPACE} <(wg-quick strip ${CONF_PATH})
 
 addrs=\$(awk -F'= *' '/^Address[[:space:]]*=/{gsub(/[, ]+/, " ", \$2); print \$2; exit}' ${CONF_PATH})
 for a in \$addrs; do
