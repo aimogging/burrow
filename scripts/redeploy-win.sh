@@ -14,7 +14,7 @@ set -euo pipefail
 
 TARGET="${TARGET:-10.2.10.11}"
 CREDS="${CREDS:-NORTH/robb.stark:sexywolfy}"
-BINARY="${BINARY:-deployments/dev/burrow.exe}"
+BINARY="${BINARY:-deployments/dev/relay-bundle/burrow.exe}"
 REMOTE="${REMOTE:-\\Windows\\Temp\\burrow.exe}"
 PROXY="${PROXY:-socks5h://127.0.0.1:9050}"
 
