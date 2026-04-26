@@ -41,6 +41,25 @@ impl FormState {
         }
     }
 
+    /// Populate from a parsed `Spec` — used by `burrowctl edit` so the
+    /// TUI starts on the existing values.
+    pub fn from_spec(spec: &crate::spec::Spec) -> Self {
+        let wss = spec.transport.mode == crate::spec::TransportMode::Wss;
+        Self {
+            endpoint: spec.wg.endpoint.clone(),
+            gateway_target: spec.build.gateway.target.clone(),
+            deploy_enabled: spec.deploy.is_some(),
+            deploy_host: spec
+                .deploy
+                .as_ref()
+                .map(|d| d.server.host.clone())
+                .unwrap_or_default(),
+            wss_enabled: wss,
+            relay_host: spec.transport.relay_host.clone().unwrap_or_default(),
+            routes: spec.wg.routes.join(", "),
+        }
+    }
+
     /// Build from CLI flags. Missing optional fields fall back to the
     /// same values `with_defaults()` uses; missing required fields
     /// stay empty so `require_complete` can flag them.
@@ -138,12 +157,14 @@ pub struct InitArgs {
     pub relay_host: Option<String>,
     pub routes: Option<String>,
     pub force: bool,
+    pub prefill: bool,
+    pub editor: bool,
 }
 
 impl InitArgs {
     /// True iff at least one field-flag is set (i.e. caller asked for
-    /// batch mode rather than the TUI). `force` doesn't count — it's
-    /// a modifier on the write step, not a value source.
+    /// batch mode rather than the TUI). `force` / `prefill` / `editor`
+    /// don't count — they're mode modifiers, not value sources.
     pub fn has_any_flag(&self) -> bool {
         self.endpoint.is_some()
             || self.gateway_target.is_some()

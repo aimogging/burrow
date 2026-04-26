@@ -66,6 +66,26 @@ enum Cmd {
         /// Overwrite an existing spec.
         #[arg(long)]
         force: bool,
+
+        /// Open the TUI even when CLI flags are set, with the flag
+        /// values pre-filled. Lets you tweak before saving.
+        #[arg(long)]
+        prefill: bool,
+
+        /// Skip the TUI; open the spec template in $VISUAL / $EDITOR
+        /// (falls back to `vi` on Unix, `notepad` on Windows). The
+        /// editor opens with placeholders + comments; on save the
+        /// content is re-validated, and on validation error you're
+        /// re-opened with the error annotated at the top.
+        #[arg(long)]
+        editor: bool,
+    },
+    /// Open the TUI populated from an existing
+    /// `deployments/<name>/spec.toml`. Save (Ctrl-S / `:w`) writes
+    /// back atomically.
+    Edit {
+        /// Deployment name.
+        name: String,
     },
     /// Parse + sanity-check `deployments/<name>/spec.toml`. Exits 0 on
     /// success and prints a one-line summary; exits 2 with the parse /
@@ -137,6 +157,8 @@ fn real_main() -> Result<()> {
             relay_host,
             routes,
             force,
+            prefill,
+            editor,
         } => {
             let args = InitArgs {
                 endpoint,
@@ -146,10 +168,13 @@ fn real_main() -> Result<()> {
                 relay_host,
                 routes,
                 force,
+                prefill,
+                editor,
             };
             args.validate_shape()?;
             init::run(&name, args)?;
         }
+        Cmd::Edit { name } => init::edit(&name)?,
         Cmd::Validate { name } => {
             let layout = Layout::for_name(&name)?;
             layout.require_spec()?;

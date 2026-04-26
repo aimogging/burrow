@@ -121,6 +121,10 @@ struct Model {
     /// Index into TARGET_PRESETS; >= len means "Other (custom)".
     gateway_idx: usize,
     error: Option<String>,
+    /// `Some(buf)` when the user is typing a `:w`/`:q`/`:wq` command.
+    /// `None` in normal form mode. Mutually exclusive with the
+    /// per-field key handling.
+    cmd_buffer: Option<String>,
 }
 
 impl Model {
@@ -134,7 +138,18 @@ impl Model {
             focus: Field::Endpoint,
             gateway_idx,
             error: None,
+            cmd_buffer: None,
         }
+    }
+
+    /// True iff the focused field is text-input (so a literal `:` is
+    /// part of valid input — host:port, host, CIDR list — rather than
+    /// the start of a vim-style command).
+    fn focus_is_text(&self) -> bool {
+        matches!(
+            self.focus,
+            Field::Endpoint | Field::DeployHost | Field::RelayHost | Field::Routes
+        ) || (self.focus == Field::Gateway && self.gateway_idx >= TARGET_PRESETS.len())
     }
 
     /// Fields skip themselves when their gating toggle is off.
@@ -187,6 +202,29 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
         return Outcome::Continue;
     }
 
+    // If we're in command-bar mode (`:w` / `:q` / `:wq`), keystrokes
+    // accumulate into the buffer until Enter executes or Esc cancels.
+    if let Some(buf) = m.cmd_buffer.as_mut() {
+        match k.code {
+            KeyCode::Esc => {
+                m.cmd_buffer = None;
+            }
+            KeyCode::Enter => {
+                let cmd = buf.clone();
+                m.cmd_buffer = None;
+                return run_command(m, &cmd);
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+            }
+            _ => {}
+        }
+        return Outcome::Continue;
+    }
+
     // Global keybinds first.
     match (k.code, k.modifiers) {
         (KeyCode::Esc, _) => return Outcome::Cancel,
@@ -200,6 +238,15 @@ fn handle(evt: Event, m: &mut Model) -> Outcome {
         }
         (KeyCode::BackTab, _) => {
             m.focus_prev();
+            return Outcome::Continue;
+        }
+        // `:` enters command-bar mode — but only when focus isn't on
+        // a text field, where `:` is a legitimate character (host:port,
+        // CIDR lists, etc.). From a text field, use Ctrl-S to save.
+        (KeyCode::Char(':'), KeyModifiers::NONE) | (KeyCode::Char(':'), KeyModifiers::SHIFT)
+            if !m.focus_is_text() =>
+        {
+            m.cmd_buffer = Some(String::new());
             return Outcome::Continue;
         }
         _ => {}
@@ -272,6 +319,21 @@ fn sync_gateway(m: &mut Model) {
 
 fn endpoint_host(endpoint: &str) -> String {
     endpoint.split(':').next().unwrap_or("").to_string()
+}
+
+fn run_command(m: &mut Model, cmd: &str) -> Outcome {
+    match cmd {
+        "w" => on_save(m),
+        "q" => Outcome::Cancel,
+        "wq" | "x" => match on_save(m) {
+            Outcome::Save => Outcome::Save,
+            other => other,
+        },
+        other => {
+            m.error = Some(format!("unknown command `:{other}` (try :w / :q / :wq)"));
+            Outcome::Continue
+        }
+    }
 }
 
 fn on_save(m: &mut Model) -> Outcome {
@@ -349,11 +411,20 @@ fn render(f: &mut Frame, m: &Model) {
         .unwrap_or_else(|| Line::from(""));
     f.render_widget(Paragraph::new(err_line), rows[8]);
 
-    let help = Line::from(Span::styled(
-        "Tab/Shift-Tab move • Space toggle • ↑/↓ on Gateway • Ctrl-S save • Esc cancel",
-        Style::default().fg(Color::DarkGray),
-    ));
-    f.render_widget(Paragraph::new(help), rows[9]);
+    // The bottom line doubles as the help bar OR the active command
+    // buffer when the user has hit `:`.
+    let bottom = if let Some(buf) = &m.cmd_buffer {
+        Line::from(Span::styled(
+            format!(":{buf}_"),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "Tab/Shift-Tab move • Space toggle • Ctrl-S or :w save • Esc or :q cancel",
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    f.render_widget(Paragraph::new(bottom), rows[9]);
 }
 
 fn text_field<'a>(m: &Model, f: Field, label: &'a str, value: &'a str) -> Paragraph<'a> {
