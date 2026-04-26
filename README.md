@@ -62,87 +62,83 @@ flowchart LR
 ## Quick start
 
 Three boxes — a public WG server, the burrow gateway behind NAT, and
-one or more clients. One command builds the binaries and writes the
-configs that pair them up.
+one or more clients. Decisions live in **one TOML file per
+deployment**, under `deployments/<name>/spec.toml`. `burrowctl`
+generates the kernel-WG configs + cert + token, then cross-builds
+each binary for whatever OS it lives on.
+
+**1. Write a spec.** `deployments/dev/spec.toml`:
+
+```toml
+[wg]
+endpoint = "vpn.example.com:51820"     # WG server's public host:port
+routes   = ["192.168.1.0/24"]          # CIDRs the gateway exposes
+
+[transport]
+mode       = "wss"                     # or "udp"
+relay_host = "vpn.example.com:443"     # required when mode = "wss"
+
+[build]
+gateway = "x86_64-pc-windows-msvc"     # required — pick the gateway host's OS
+# relay  defaults to x86_64-unknown-linux-gnu
+# client defaults to x86_64-unknown-linux-gnu
+```
+
+`burrowctl validate dev` parses + sanity-checks it.
+
+**2. Generate configs and bundle materials:**
 
 ```sh
-# Pick a transport. UDP is the default; WSS is for networks that
-# block egress UDP (corporate, hotel, captive-portal). Same args
-# either way; the WSS variant additionally takes --relay HOST[:PORT].
-
-# UDP transport — produces target/min/{burrow,burrow-client}
-just gen-embed     --endpoint vpn.example.com:51820 \
-                   --routes 192.168.1.0/24
-
-# WSS transport — produces all three binaries with cross-targets per
-# binary (gateway often Windows, relay/client almost always Linux).
-# BURROW_TARGET is required; the other two default to Linux.
-BURROW_TARGET=x86_64-pc-windows-msvc \
-just gen-embed-wss --endpoint vpn.example.com:51820 \
-                   --routes 192.168.1.0/24 \
-                   --relay vpn.example.com:443
+cargo run --bin burrowctl -- gen dev
+# produces deployments/dev/{server.conf, burrow.conf, client1.conf,
+# relay-bundle/{cert.pem, key.pem, token.txt, listen.txt, forward.txt}}
 ```
 
-Both recipes embed `burrow.conf` into the gateway binary — no
-`--config` flag at runtime, no shipping the config file alongside.
-
-Per-binary build targets for `gen-embed-wss`:
-
-| env var | what it controls | default |
-|---|---|---|
-| `BURROW_TARGET` | gateway binary's target triple | **required** |
-| `BURROW_RELAY_TARGET` | relay binary's target triple | `x86_64-unknown-linux-gnu` |
-| `BURROW_CLIENT_TARGET` | client binary's target triple | `x86_64-unknown-linux-gnu` |
-
-Each is a standard rustc triple (`x86_64-pc-windows-msvc`,
-`x86_64-pc-windows-gnu`, `x86_64-unknown-linux-gnu`,
-`aarch64-apple-darwin`, ...). You'll need `rustup target add <triple>`
-plus a working linker for each non-host target. `cross` is a drop-in
-cargo wrapper that handles the linker side via docker if you'd rather
-not set toolchains up by hand.
-
-Output set:
-
-```
-target/<gw-triple>/min/burrow(.exe)             gateway, config embedded
-target/<relay-triple>/min/burrow-relay          relay, cert/key/token embedded
-target/<client-triple>/min/burrow-client        companion CLI
-burrow-configs/server.conf                      kernel WG server config (wg-quick)
-burrow-configs/burrow.conf                      same content that's embedded — keep for reference
-burrow-configs/client1.conf                     wg-quick config for the client peer
-burrow-configs/relay-bundle/                    WSS only — collected deploy package:
-    burrow(.exe)                                copy of the gateway binary
-    burrow-relay(.exe)                          copy of the relay binary
-    burrow-client(.exe)                         copy of the client binary
-    cert.pem / key.pem / token.txt              build inputs (already baked into burrow-relay)
-    listen.txt / forward.txt                    build inputs (defaults baked in)
-```
-
-`burrow-configs/relay-bundle/` is the "ship this directory" view —
-binaries plus their build-time materials in one place. The per-target
-paths under `target/` remain the canonical cargo outputs.
-
-Ship the binaries to the boxes that need them and run with no args.
-After `gen-embed-wss`, everything lives in `burrow-configs/relay-bundle/`:
+**3. Cross-build the three binaries:**
 
 ```sh
-# WG server box (kernel WireGuard, plus burrow-relay when on WSS)
-scp burrow-configs/server.conf root@vpn.example.com:/etc/wireguard/wg0.conf
+cargo run --bin burrowctl -- build dev
+# invokes cargo three times with the right --target / --features
+# / embed env vars set internally; collects the binaries into
+# deployments/dev/relay-bundle/{burrow(.exe), burrow-relay, burrow-client}
+```
+
+You'll need each non-host target installed (`rustup target add
+<triple>`) plus a working linker. `cross` is a drop-in cargo wrapper
+that handles linkers via docker if you'd rather not set toolchains up
+by hand.
+
+**4. Ship + run** — everything you need is now in one directory:
+
+```sh
+# WG server box (kernel WireGuard + burrow-relay when on WSS)
+scp deployments/dev/server.conf root@vpn.example.com:/etc/wireguard/wg0.conf
 ssh root@vpn.example.com 'wg-quick up wg0'
-# WSS only — also ship burrow-relay and run it (foreground; nohup or tmux to detach):
-scp burrow-configs/relay-bundle/burrow-relay root@vpn.example.com: \
-    && ssh root@vpn.example.com ./burrow-relay
+scp deployments/dev/relay-bundle/burrow-relay root@vpn.example.com: \
+    && ssh root@vpn.example.com ./burrow-relay        # WSS only
 
 # burrow gateway, Linux host
-scp burrow-configs/relay-bundle/burrow gateway-host: && ssh gateway-host ./burrow
+scp deployments/dev/relay-bundle/burrow gateway-host: && ssh gateway-host ./burrow
 # burrow gateway, Windows host: SMB via the built-in C$ admin share
 # (or enable OpenSSH Server on the host and `scp` like Linux).
-Copy-Item burrow-configs\relay-bundle\burrow.exe \\gateway-host\c$\Users\Administrator\
+Copy-Item deployments\dev\relay-bundle\burrow.exe \\gateway-host\c$\Users\Administrator\
 # then RDP / Enter-PSSession gateway-host and run .\burrow.exe
 
 # connect peer client
-sudo wg-quick up ./burrow-configs/client1.conf
+sudo wg-quick up ./deployments/dev/client1.conf
 ```
+
+Multiple deployments coexist — `deployments/prod/`, `deployments/staging/`,
+each with its own spec + bundle. `burrowctl` always takes the
+deployment name as the last positional argument.
+
+### Legacy: `just gen-embed-wss`
+
+Pre-`burrowctl`, the same flow lived in `just gen-embed-wss` driven
+by `BURROW_TARGET` / `BURROW_RELAY_TARGET` / `BURROW_CLIENT_TARGET`
+env vars and wrote into `burrow-configs/`. That recipe still works
+for now, but `burrowctl` is the path forward — the env-var dance is
+strictly worse to maintain than a TOML file.
 
 ### Easy deployment
 

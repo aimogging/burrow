@@ -1,2 +1,9 @@
 /target
+# Legacy single-deployment dir from the pre-burrowctl era. Kept for
+# transition; remove after the legacy `gen-embed*` recipes go.
 /burrow-configs
+# burrowctl deployments. Everything is gitignored by default — `dev`
+# specs are typically scratch and the spec itself contains addressing
+# info we don't need to commit. Once we have an example/template
+# spec worth versioning, allow-list it explicitly via `!deployments/example/spec.toml`.
+/deployments/

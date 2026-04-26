@@ -54,6 +54,9 @@ rustls-pemfile = "2"
 # Certificate::pem()/KeyPair::serialize_pem() which is what the
 # generated relay-bundle files contain.
 rcgen = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
+# Spec parser for the burrowctl orchestrator. burrowctl is a dev-host
+# tool, never shipped, so the dep weight only affects developer builds.
+toml = "0.8"
 
 [[bin]]
 name = "burrow"
@@ -66,6 +69,13 @@ path = "src/bin/burrow-client.rs"
 [[bin]]
 name = "burrow-relay"
 path = "src/bin/burrow-relay.rs"
+
+# Dev-host orchestrator: drives gen + build (and eventually deploy)
+# from a single TOML spec under deployments/<name>/. Not part of any
+# release deploy — it never ships to a gateway/relay/client host.
+[[bin]]
+name = "burrowctl"
+path = "src/bin/burrowctl.rs"
 
 [features]
 # Bake the wg-quick config at $BURROW_EMBEDDED_CONFIG into the binary as a

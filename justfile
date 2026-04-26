@@ -104,6 +104,11 @@ gen-embed *GEN_ARGS:
     cargo run --release --bin burrow-client -- gen {{GEN_ARGS}} --out ./burrow-configs
     @just embed ./burrow-configs/burrow.conf {{target}}
 
+# LEGACY (pre-burrowctl). Kept working during the transition; new
+# deployments should use `cargo run --bin burrowctl -- {validate,gen,build}
+# <name>` driven by `deployments/<name>/spec.toml` instead — same
+# build outputs, no env-var dance, multi-deployment by default.
+#
 # Min-sized silent burrow + burrow-relay + burrow-client trio with their
 # respective configs/materials embedded. Each binary builds for its own
 # target triple — typically the gateway runs on a different OS from the
