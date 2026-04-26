@@ -60,15 +60,18 @@ enum Cmd {
         relay_host: Option<String>,
 
         /// TLS strategy when --transport wss: `self-signed` (default,
-        /// gen creates the cert), `byo` (operator drops cert.pem +
-        /// key.pem into relay-bundle/), `acme` (Let's Encrypt; Phase
-        /// 4b — not yet implemented).
+        /// gen generates the cert) or `byo` (gen reads cert + key
+        /// from --cert-path / --key-path).
         #[arg(long, value_name = "STRATEGY")]
         tls: Option<String>,
 
-        /// ACME account email. Required when --tls acme.
-        #[arg(long, value_name = "EMAIL")]
-        acme_email: Option<String>,
+        /// Path to the cert PEM. Required when --tls byo.
+        #[arg(long, value_name = "PATH")]
+        cert_path: Option<String>,
+
+        /// Path to the private key PEM. Required when --tls byo.
+        #[arg(long, value_name = "PATH")]
+        key_path: Option<String>,
 
         /// Routes as a comma-separated list of CIDRs.
         #[arg(long)]
@@ -188,7 +191,8 @@ fn real_main() -> Result<()> {
             transport,
             relay_host,
             tls,
-            acme_email,
+            cert_path,
+            key_path,
             routes,
             force,
             prefill,
@@ -209,7 +213,8 @@ fn real_main() -> Result<()> {
                 transport,
                 relay_host,
                 tls,
-                acme_email,
+                cert_path,
+                key_path,
                 routes,
                 force,
                 prefill,

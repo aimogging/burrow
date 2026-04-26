@@ -47,22 +47,10 @@ pub fn run(name: &str) -> Result<()> {
         for f in ["cert.pem", "key.pem"] {
             let p = layout.bundle_file(f);
             if !p.exists() {
-                let hint = match spec.transport.tls {
-                    crate::spec::TlsStrategy::SelfSigned => {
-                        format!("re-run `burrowctl gen {name}`")
-                    }
-                    crate::spec::TlsStrategy::Byo => format!(
-                        "tls = \"byo\" expects you to drop {} and {} into the bundle yourself \
-                         (e.g. `cp /etc/letsencrypt/live/host/fullchain.pem {0}`)",
-                        layout.bundle_file("cert.pem").display(),
-                        layout.bundle_file("key.pem").display(),
-                    ),
-                    crate::spec::TlsStrategy::Acme => format!(
-                        "tls = \"acme\" auto-acquire isn't implemented yet (Phase 4b); \
-                         use \"self-signed\" or \"byo\" for now"
-                    ),
-                };
-                bail!("relay-bundle missing {} — {}", p.display(), hint);
+                bail!(
+                    "relay-bundle missing {} — re-run `burrowctl gen {name}`",
+                    p.display()
+                );
             }
         }
     } else {

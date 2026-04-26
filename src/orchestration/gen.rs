@@ -48,8 +48,10 @@ pub fn run_with_layout(layout: &Layout) -> Result<()> {
                 host_port: host.clone(),
                 tls: match spec.transport.tls {
                     TlsStrategy::SelfSigned => TlsMode::SelfSigned,
-                    TlsStrategy::Byo => TlsMode::Byo,
-                    TlsStrategy::Acme => TlsMode::Acme,
+                    TlsStrategy::Byo => TlsMode::Byo {
+                        cert_path: spec.transport.cert_path.as_deref().unwrap().into(),
+                        key_path: spec.transport.key_path.as_deref().unwrap().into(),
+                    },
                 },
             }),
             _ => None,

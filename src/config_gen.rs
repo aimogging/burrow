@@ -75,20 +75,23 @@ pub struct RelayParams {
     /// SAN (DNS for hostnames, IP for literals); both halves are
     /// embedded into `burrow.conf`'s `Transport=` URL.
     pub host_port: String,
-    /// How `gen` should obtain the cert + key. `SelfSigned` produces
-    /// a fresh ECDSA P-256 cert and sets TlsSkipVerify=true on burrow;
-    /// `Byo` skips cert generation entirely (operator drops them in)
-    /// and sets TlsSkipVerify=false; `Acme` is reserved (errors).
+    /// How `gen` should obtain the cert + key.
     pub tls: TlsMode,
 }
 
 /// Mirror of `crate::spec::TlsStrategy`, decoupled from spec parsing
 /// so config_gen stays usable from tests / non-spec callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TlsMode {
+    /// gen generates a fresh ECDSA P-256 self-signed cert; burrow
+    /// gets TlsSkipVerify=true.
     SelfSigned,
-    Byo,
-    Acme,
+    /// gen reads cert + key from operator-supplied paths and copies
+    /// them into the bundle; burrow gets TlsSkipVerify=false.
+    Byo {
+        cert_path: std::path::PathBuf,
+        key_path: std::path::PathBuf,
+    },
 }
 
 impl Default for GenParams {
@@ -383,7 +386,7 @@ fn build_relay_artifacts(rp: &RelayParams, wg_listen_port: u16) -> Result<RelayA
     let host_port = format!("{host_only}:{port}");
 
     // Cert + key behaviour depends on the strategy:
-    let (cert_pem, key_pem, skip_verify) = match rp.tls {
+    let (cert_pem, key_pem, skip_verify) = match &rp.tls {
         TlsMode::SelfSigned => {
             // Single-SAN self-signed cert. rcgen picks a default
             // validity window + a fresh ECDSA P-256 key. With
@@ -395,19 +398,31 @@ fn build_relay_artifacts(rp: &RelayParams, wg_listen_port: u16) -> Result<RelayA
                 .map_err(|e| anyhow::anyhow!("rcgen self-signed: {e}"))?;
             (Some(certified.cert.pem()), Some(certified.key_pair.serialize_pem()), true)
         }
-        TlsMode::Byo => {
-            // Operator drops cert.pem + key.pem into relay-bundle/
-            // themselves. We emit nothing for those files; build
-            // step validates they exist before embedding. Burrow
-            // does real cert verification.
-            (None, None, false)
-        }
-        TlsMode::Acme => {
-            bail!(
-                "tls = \"acme\" is not yet implemented (Phase 4b). \
-                 Use \"self-signed\" or run certbot yourself + \
-                 \"byo\" with the resulting fullchain/privkey."
-            );
+        TlsMode::Byo { cert_path, key_path } => {
+            // Read operator's cert + key from disk. We re-emit them
+            // into relay-bundle/ so the build step's embed pipeline
+            // (which always reads from the bundle) works unchanged.
+            let cert = std::fs::read_to_string(cert_path).with_context(|| {
+                format!("reading cert_path {} (tls = \"byo\")", cert_path.display())
+            })?;
+            let key = std::fs::read_to_string(key_path).with_context(|| {
+                format!("reading key_path {} (tls = \"byo\")", key_path.display())
+            })?;
+            if !cert.contains("-----BEGIN CERTIFICATE-----") {
+                bail!(
+                    "{} doesn't look like a PEM cert chain (missing \
+                     BEGIN CERTIFICATE block)",
+                    cert_path.display()
+                );
+            }
+            if !key.contains("PRIVATE KEY") {
+                bail!(
+                    "{} doesn't look like a PEM private key (missing \
+                     PRIVATE KEY block)",
+                    key_path.display()
+                );
+            }
+            (Some(cert), Some(key), false)
         }
     };
 

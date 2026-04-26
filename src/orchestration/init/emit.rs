@@ -73,8 +73,9 @@ pub fn format_spec(state: &FormState) -> String {
         if state.tls_strategy != super::state::TlsChoice::SelfSigned {
             let _ = writeln!(out, "tls        = {}", quote(state.tls_strategy.as_toml()));
         }
-        if state.tls_strategy == super::state::TlsChoice::Acme {
-            let _ = writeln!(out, "acme_email = {}", quote(&state.acme_email));
+        if state.tls_strategy == super::state::TlsChoice::Byo {
+            let _ = writeln!(out, "cert_path  = {}", quote(&state.cert_path));
+            let _ = writeln!(out, "key_path   = {}", quote(&state.key_path));
         }
     } else {
         let _ = writeln!(out, "mode = \"udp\"");
@@ -155,7 +156,8 @@ mod tests {
             wss_enabled: false,
             relay_host: String::new(),
             tls_strategy: super::super::state::TlsChoice::SelfSigned,
-            acme_email: String::new(),
+            cert_path: String::new(),
+            key_path: String::new(),
             routes: String::new(),
             subnet: None,
             clients: None,

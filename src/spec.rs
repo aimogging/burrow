@@ -75,17 +75,21 @@ pub struct TransportSection {
     /// `mode = "wss"`. Default port if omitted is 443.
     pub relay_host: Option<String>,
     /// How the WSS-side TLS cert + key are obtained. `self-signed`
-    /// generates one in `gen` and bakes it in (with TlsSkipVerify=true
-    /// on burrow); `byo` expects the operator to drop cert.pem +
-    /// key.pem into `relay-bundle/` themselves (real cert, no skip);
-    /// `acme` is reserved for the Phase 4b auto-acquire.
+    /// generates a fresh ECDSA P-256 cert in `gen` and bakes it in
+    /// (with TlsSkipVerify=true on burrow); `byo` reads cert + key
+    /// from operator-supplied paths (real cert, TlsSkipVerify=false).
     /// Defaults to `self-signed`.
     #[serde(default)]
     pub tls: TlsStrategy,
-    /// Email address used for ACME registration. Required when
-    /// `tls = "acme"`. Ignored otherwise.
+    /// Path to the cert PEM. Required when `tls = "byo"`. Ignored
+    /// otherwise. Read by `gen` and copied into `relay-bundle/cert.pem`.
     #[serde(default)]
-    pub acme_email: Option<String>,
+    pub cert_path: Option<String>,
+    /// Path to the private key PEM. Required when `tls = "byo"`.
+    /// Ignored otherwise. Read by `gen` and copied into
+    /// `relay-bundle/key.pem`.
+    #[serde(default)]
+    pub key_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -96,14 +100,10 @@ pub enum TlsStrategy {
     /// operator-side trust glue.
     #[default]
     SelfSigned,
-    /// Operator drops `cert.pem` + `key.pem` into `relay-bundle/`
-    /// themselves (e.g. fullchain from certbot). gen validates the
-    /// files exist and skips its own cert generation; burrow gets
-    /// TlsSkipVerify=false.
+    /// Operator points at their own cert + key (e.g. Let's Encrypt
+    /// fullchain). gen reads from those paths and copies into the
+    /// bundle; burrow gets TlsSkipVerify=false.
     Byo,
-    /// Phase 4b: gen runs ACME against `relay_host` to acquire a
-    /// real cert. Not yet implemented — errors out at gen time.
-    Acme,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -234,12 +234,19 @@ impl Spec {
                 if host.trim().is_empty() {
                     bail!("[transport] relay_host is required when mode = \"wss\"");
                 }
-                if self.transport.tls == TlsStrategy::Acme {
-                    let email = self.transport.acme_email.as_deref().unwrap_or("");
-                    if email.trim().is_empty() {
+                if self.transport.tls == TlsStrategy::Byo {
+                    let cert = self.transport.cert_path.as_deref().unwrap_or("");
+                    let key = self.transport.key_path.as_deref().unwrap_or("");
+                    if cert.trim().is_empty() {
                         bail!(
-                            "[transport] acme_email is required when tls = \"acme\" \
-                             (Let's Encrypt needs an account email)"
+                            "[transport] cert_path is required when tls = \"byo\" \
+                             (point at your fullchain.pem)"
+                        );
+                    }
+                    if key.trim().is_empty() {
+                        bail!(
+                            "[transport] key_path is required when tls = \"byo\" \
+                             (point at your privkey.pem)"
                         );
                     }
                 }
@@ -252,6 +259,12 @@ impl Spec {
                     bail!(
                         "[transport] tls is only meaningful when mode = \"wss\" \
                          (defaults to \"self-signed\" otherwise)"
+                    );
+                }
+                if self.transport.cert_path.is_some() || self.transport.key_path.is_some() {
+                    bail!(
+                        "[transport] cert_path / key_path only apply when \
+                         mode = \"wss\" + tls = \"byo\""
                     );
                 }
             }
