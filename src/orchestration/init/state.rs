@@ -40,8 +40,8 @@ impl TransportChoice {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Udp => "UDP (native)",
-            Self::Wss => "WSS (HTTPS WebSocket — when egress UDP is blocked)",
+            Self::Udp => "UDP",
+            Self::Wss => "HTTPS WebSockets",
         }
     }
 
@@ -74,8 +74,8 @@ impl TlsChoice {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::SelfSigned => "self-signed (default; cert generated)",
-            Self::Byo => "bring your own (point at cert.pem + key.pem)",
+            Self::SelfSigned => "self-signed (auto generated)",
+            Self::Byo => "bring your own",
         }
     }
 }
